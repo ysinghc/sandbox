@@ -751,9 +751,111 @@ if (loaded_version != pool->expected_version) {
 
 **Sparse file note:** `memory.snap` should be created as a sparse file — Firecracker's snapshot writer already does this for zero pages. A 512MB guest with mostly-zero memory costs much less than 512MB on disk. The `manifest.bin` bitmap lets the fault handler skip reading zero-page regions entirely (served via `UFFDIO_ZEROPAGE` at no disk cost).
 
-### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
+### 10.12 Credential Brokering — HTTP Proxy + Session Tokens
 
-- Credential brokering design (§5 / §6 item 7)
+**Decision:** HTTP proxy on the tap network interface at link-local address `169.254.0.1:8080`. Guest→proxy leg is plain HTTP (link-local, never leaves host). Proxy→upstream leg is real HTTPS. Session tokens authenticate each request — no long-lived credentials ever enter the guest.
+
+**Network topology:**
+```
+Guest VM (tap0, 169.254.0.2)
+  │  plain HTTP  (link-local, internal only)
+  ▼
+Host broker process (169.254.0.1:8080)
+  │  validates session token
+  │  strips X-Sandbox-Token header
+  │  injects real credential (API key / Bearer token)
+  ▼  real HTTPS
+External service (api.openai.com, s3.amazonaws.com, etc.)
+```
+
+**Session token lifecycle:**
+```c
+// On sandbox_create(), engine daemon generates a session token:
+uint8_t token_bytes[32];
+getrandom(token_bytes, sizeof(token_bytes), 0);  // kernel CSPRNG, no /dev/urandom fd needed
+char token_hex[65];
+bytes_to_hex(token_bytes, 32, token_hex);  // 64-char hex string
+
+// Token is stored in broker's in-memory session table:
+typedef struct {
+    char     token_hex[65];
+    uint32_t sandbox_id;
+    time_t   created_at;
+    time_t   expires_at;       // = sandbox destroy time or hard TTL, whichever is first
+    char**   allowed_services; // e.g. ["openai", "s3-bucket-name"] — per-sandbox allowlist
+} session_entry_t;
+
+// Token is injected into the guest at boot via kernel cmdline:
+// "sandbox_token=<hex> sandbox_proxy=169.254.0.1:8080"
+// Guest agent reads from /proc/cmdline at startup — no vsock handshake needed
+```
+
+**Guest-side usage (agent code):**
+```python
+import os, requests
+
+PROXY   = os.environ.get("SANDBOX_PROXY", "http://169.254.0.1:8080")
+TOKEN   = open("/proc/cmdline").read().split("sandbox_token=")[1].split()[0]
+HEADERS = {"X-Sandbox-Token": TOKEN}
+
+# Agent calls the proxy over plain HTTP — proxy makes real HTTPS to OpenAI
+resp = requests.post(
+    "http://api.openai.com/v1/chat/completions",  # HTTP scheme — proxy rewrites to HTTPS
+    headers=HEADERS,
+    json={"model": "gpt-4o", "messages": [...]},
+    proxies={"http": PROXY, "https": PROXY},
+)
+```
+
+**Broker request handling (per incoming request):**
+```
+1. Parse X-Sandbox-Token header — if missing or malformed → 401
+2. Look up token in session table (O(1) hash map lookup)
+   → if not found or expired → 401
+   → if found: get sandbox_id, allowed_services, credential set
+3. Check target hostname against allowed_services allowlist
+   → if not allowed → 403
+4. Strip X-Sandbox-Token from request headers
+5. Inject real credential:
+   → Authorization: Bearer <real_api_key>  (looked up from broker's in-memory credential store)
+6. Rewrite request URL scheme: http:// → https://
+7. Forward request to upstream over real HTTPS (TLS verified, no MITM)
+8. Stream response back to guest — no buffering of response body
+9. Log: sandbox_id, target service, response status, latency (no request body logged)
+```
+
+**Broker process architecture:**
+- Separate process from the engine daemon — the broker holds credentials, the engine holds none. If the engine daemon has a bug reachable from the API, it cannot exfiltrate credentials it doesn't hold.
+- Broker communicates with engine daemon over a local Unix socket to validate session token→sandbox_id mappings and receive destroy notifications (for token revocation)
+- Broker listens only on `169.254.0.1:8080` — bound to the link-local address, not `0.0.0.0`. Not reachable from outside the host.
+- Credentials loaded at broker startup from a config file (not env vars — env vars leak into `/proc/<pid>/environ`). Config file is `chmod 600`, owned by the broker's uid.
+- Broker drops to an unprivileged uid after binding the port and loading credentials.
+
+**Token revocation on sandbox destroy:**
+```c
+// engine daemon sends destroy notification to broker over Unix socket
+broker_msg_t msg = {
+    .type       = BROKER_MSG_REVOKE,
+    .sandbox_id = vm->sandbox_id,
+};
+send(broker_sock_fd, &msg, sizeof(msg), 0);
+// broker removes session_entry from table — token immediately invalid
+```
+
+**Network policy integration:** `network_manager` configures an nftables rule that forces all guest TCP port 80/443 traffic through `169.254.0.1:8080` — the guest cannot bypass the proxy by connecting directly to external IPs. Direct outbound connections to non-proxy destinations are dropped at the host firewall level.
+
+```
+nftables rule (applied per-VM on tap interface):
+  table ip sandbox_policy {
+    chain forward {
+      type filter hook forward priority 0;
+      # Allow guest → proxy
+      iifname "tap-<vm_id>" ip daddr 169.254.0.1 tcp dport 8080 accept
+      # Drop all other outbound from guest (no direct internet access)
+      iifname "tap-<vm_id>" drop
+    }
+  }
+```
 
 --- (Context, Not Yet Resolved)
 
