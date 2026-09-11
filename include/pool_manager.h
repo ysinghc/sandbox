@@ -32,9 +32,7 @@ typedef struct {
     pthread_cond_t slot_available;  // Signaled when replenishment can start
     bool shutdown;
 
-    // Mechanical addition (not in LLD §5.1): owner of the replenishment
-    // thread so pool_manager_destroy() can join it. All LLD fields above
-    // are kept exact.
+    // Extra (not in LLD): owns the replenishment thread for join on destroy.
     pthread_t replenish_thread;
 } pool_manager_t;
 

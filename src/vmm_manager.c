@@ -1,7 +1,5 @@
-// VMM Manager — Phase 1 stub restore path.
-// restore_vm_from_snapshot() returns a dummy handle after usleep(83000),
-// simulating the ~83ms userfaultfd snapshot restore so pool concurrency
-// logic can be tested before the VMM/UFFD layers exist (Phase 5/6).
+// VMM Manager — Phase 1 stub: dummy handle after usleep(83000) to simulate
+// the ~83ms snapshot restore for pool testing (real restore in Phase 5/6).
 
 #define _DEFAULT_SOURCE  // expose usleep() under strict C11
 

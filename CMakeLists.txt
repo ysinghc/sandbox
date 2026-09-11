@@ -8,9 +8,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
-# Mechanical build addition (Phase 1): ThreadSanitizer variant for the pool
-# concurrency verification. Configure a separate build dir with
-# -DSANDBOX_TSAN=ON; the default build is unaffected.
+# Phase 1: ThreadSanitizer variant for pool concurrency verification.
+# Configure a separate dir with -DSANDBOX_TSAN=ON; default build unaffected.
 option(SANDBOX_TSAN "Build with ThreadSanitizer (pool concurrency verification)" OFF)
 if(SANDBOX_TSAN)
     add_compile_options(-fsanitize=thread -g)

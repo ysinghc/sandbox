@@ -1,17 +1,7 @@
-// Pool Manager (§5.1): fixed-size warm VM pool with overflow queue and
-// background replenishment thread.
-//
-// DEVIATION from LLD §5.1 fast-path pseudocode (flagged for review):
-// The LLD fast path does `pool->restoring_count++ // Reserve slot for
-// replenishment` after dequeuing a warm VM. The replenishment thread then
-// unconditionally does `restoring_count++` before each restore, so keeping
-// the fast-path increment double-counts: after one provision from a full
-// pool (warm=4, restoring=1, target=5) the replenishment wait condition
-// `warm + restoring >= target` is true forever and the pool never refills.
-// This implementation drops the fast-path increment; the replenishment
-// thread alone owns restoring_count (increment before restore, decrement
-// after). The invariant warm_count + restoring_count <= target_size holds
-// on every path (see comments below) and the pool refills to target.
+// Pool Manager (§5.1): fixed-size warm VM pool, overflow queue, replenishment thread.
+// NOTE: fast path omits the LLD's restoring_count++ reservation (it double-counts
+// with the replenishment thread's own increment and wedges the pool full).
+// See docs/IMPLEMENTATION_LOG.md (Phase 1).
 
 #include "pool_manager.h"
 #include "vmm_manager.h"
@@ -193,9 +183,6 @@ sandbox_error_t pool_provision(pool_manager_t* pool, const sandbox_spec_t* spec,
     while (!req.ready && !pool->shutdown) {
         int rc = pthread_cond_timedwait(&pool->vm_available, &pool->lock, &deadline);
         if (rc == ETIMEDOUT) {
-            // Still queued (ready can only be set under this lock, so a
-            // missing entry means handoff won the race — but then ready
-            // would be true; absence + !ready is impossible, still re-check).
             if (!req.ready) dequeue_overflow(pool, &req);
             pthread_mutex_unlock(&pool->lock);
             return SANDBOX_ERR_POOL_EXHAUSTED;
@@ -233,8 +220,7 @@ void* replenishment_thread(void* arg) {
         pthread_mutex_lock(&pool->lock);
         pool->restoring_count--;
         if (vm == NULL) {
-            // Mechanical completion: LLD assumes restore never fails. Hand
-            // NULL to a waiter (it maps to INTERNAL) or retry after backoff.
+            // LLD assumes restore never fails; hand NULL to a waiter or retry.
             if (pool->overflow_count > 0) {
                 pending_request_t* req = peek_overflow(pool);
                 req->result = NULL;

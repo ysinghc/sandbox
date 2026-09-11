@@ -5,10 +5,8 @@
 // never breaks, the pool refills to target, and the overflow slow path
 // (timeout + fail-immediate) behaves per §3.1.
 //
-// NOTE: Release builds define NDEBUG (per §8.1 flags), which compiles
-// assert() away entirely — including any call inside it. All
-// side-effecting calls below therefore store their return code first and
-// assert on the value, never assert(f(...)) directly.
+// NOTE: Release builds define NDEBUG, which strips assert() calls entirely.
+// Never put side-effecting calls inside assert — store rc first (CHECK_RC).
 
 #include <assert.h>
 #include <pthread.h>
