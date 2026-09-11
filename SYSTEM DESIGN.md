@@ -261,13 +261,102 @@ Regardless of isolation mechanism, a separable and arguably equally important de
 
 These are explicitly unresolved. The implementation session should make calls on these (ideally informed by real Dedalus engineering input — see §7) rather than inheriting an assumed answer from this document:
 
-1. **Single-backend or multi-backend?** (§3) — This is the highest-leverage scoping decision and should be made first, since it changes the shape of the API design.
-2. **If single-backend: namespaces or Firecracker+userfaultfd?** The case for namespaces: faster to build well in the available time, still demonstrates real systems depth, avoids the risk of a shallow/unfinished VMM implementation. The case for Firecracker: better matches what the research suggests Dedalus's actual security posture needs, and the userfaultfd fault-handler is a higher-signal "hard problem debugged" portfolio artifact.
-3. **Default seccomp action** (if namespaces are used, anywhere including the Jailer layer): `SCMP_ACT_KILL_PROCESS` (max security, may break less-cooperative binaries) vs. `SCMP_ACT_ERRNO` (softer failure, marginally larger attack surface via error-handling code paths). Not decided.
+1. **Single-backend or multi-backend?** — **DECIDED: Single-backend. See §3.**
+2. **Which backend?** — **DECIDED: Firecracker + userfaultfd snapshot/restore. See §10.**
+3. **Default seccomp action** (for the Jailer layer): `SCMP_ACT_KILL_PROCESS` (max security, may break less-cooperative binaries) vs. `SCMP_ACT_ERRNO` (softer failure, marginally larger attack surface via error-handling code paths). Not decided.
 4. **Rootless vs. rootful daemon** — running the engine's control process fully rootless (via `newuidmap`/`newgidmap` delegation) is more secure but constrains available namespace features without a setuid helper. Not decided.
-5. **IPC transport for daemon mode** — `SOCK_SEQPACKET` + protobuf was proposed as a low-overhead local IPC choice avoiding HTTP/gRPC transport overhead, but this hasn't been validated against real latency requirements once a backend is chosen. Worth re-examining once §6.1/6.2 are resolved, since IPC overhead matters more or less depending on whether the hot path is microseconds (namespace pool) or tens of milliseconds (Firecracker restore) — the IPC overhead is proportionally much more significant in the former case.
-6. **How much of the multi-tier vision to actually build vs. document** — even if multi-backend is the architectural direction, is it better to build one backend deeply and document the others as "designed for, future work," or attempt a thinner implementation across more tiers? Not decided — this is a portfolio-optics question as much as a technical one.
+5. **IPC transport for daemon mode** — `SOCK_SEQPACKET` + protobuf was proposed as a low-overhead local IPC choice avoiding HTTP/gRPC transport overhead. With Firecracker as backend, the hot path latency is ~83ms restore — IPC overhead is proportionally less critical than it would be for a namespace pool, but still worth deciding deliberately. Not decided.
+6. **How much of the multi-tier vision to actually build vs. document** — **RESOLVED by §3: nothing is stubbed; the one backend is built to full depth.**
 7. **Credential brokering implementation** (§5) — essentially unscoped; needs its own research pass before any implementation decision.
+
+---
+
+## 10. Finalized Architecture — Firecracker + userfaultfd
+
+**Decision:** Firecracker + userfaultfd snapshot/restore as the sole isolation backend.
+
+**Rationale:** Firecracker provides a true hardware VM isolation boundary (KVM) — a guest kernel compromise is contained to that guest and cannot reach the host kernel or sibling guests. The userfaultfd-based lazy restore solves the core hard problem of sub-100ms VM provisioning without eager memory loading. For a portfolio targeting Dedalus (persistent compute for AI agents, where fast VM resume is the central technical challenge), this path directly demonstrates the relevant skill. The `uffd_handler` is kernel-adjacent code that is rare in portfolios and hard to fake.
+
+**Why not namespaces:** Namespace isolation shares the host kernel. A kernel-level vulnerability (in namespace code, seccomp code, or an allowed syscall's implementation) has a blast radius across all sandboxes. For AI agent workloads where prompt injection can direct "trusted" code to take adversarial actions at runtime, hardware isolation is the correct default posture. Namespaces remain relevant as the hardening mechanism for the Jailer layer around the Firecracker VMM process itself (§4).
+
+### 10.1 Component Map
+
+```
+SandboxEngine (C library + C++ RAII wrapper)
+│
+├── vmm_manager         — Firecracker process lifecycle; spawns Firecracker via Jailer;
+│                         communicates via REST API over Unix domain socket; owns the
+│                         per-VM socket path and process handle
+│
+├── snapshot_manager    — guest vCPU pause; state serialization to disk (memory snapshot +
+│                         microVM state file); snapshot versioning and integrity checksums;
+│                         template VM lifecycle (boot once, snapshot, reuse N times)
+│
+├── uffd_handler        — registers guest physical memory region with userfaultfd;
+│                         owns the fault-handling thread; dispatches UFFDIO_COPY (copy
+│                         page from snapshot file) and UFFDIO_ZEROPAGE (map zero page
+│                         for empty pages) on page faults; races safely with vCPU resume
+│
+├── prefault_worker     — background thread pool that streams remaining snapshot pages
+│                         into guest memory after vCPU resume; prevents long-tail latency
+│                         spikes when guest touches memory the uffd_handler hasn't served yet
+│
+├── network_manager     — tap device creation per VM; IP allocation from a managed pool;
+│                         iptables/nftables rules for network policy; CNI-style cleanup on destroy
+│
+├── jailer              — wraps every Firecracker invocation: cgroup placement of VMM process,
+│                         chroot into minimal jail (only /dev/kvm, /dev/net/tun, snapshot files),
+│                         privilege drop (root → unprivileged uid), seccomp-bpf filter on the
+│                         VMM process itself
+│
+├── pool_manager        — maintains N pre-restored warm VMs (restored from snapshot, vCPUs
+│                         paused, uffd_handler armed); on provision request, unpauses a pool
+│                         VM and hands off; asynchronously replenishes the pool
+│
+├── lifecycle           — state machine per VM: COLD → SNAPSHOTTED → RESTORING →
+│                         RUNNING → PAUSED → DESTROYED; owns transitions and error paths
+│
+└── telemetry           — per-restore latency breakdown (uffd fault rate, pages faulted,
+                          prefault progress, time-to-first-instruction); resource accounting
+                          per VM; structured logging for pool health
+```
+
+### 10.2 Critical Path: Provisioning a Sandbox (from warm pool)
+
+```
+Client calls sandbox_create()
+  → pool_manager dequeues a pre-restored VM (vCPUs paused, uffd armed)
+  → network_manager assigns IP, configures tap device
+  → vmm_manager sends "resume vCPUs" command via Firecracker API socket
+  → guest resumes at the exact paused instruction
+  → page faults served on-demand by uffd_handler (UFFDIO_COPY from snapshot)
+  → prefault_worker begins streaming remaining pages in background
+  → pool_manager asynchronously boots + snapshots a replacement VM
+  → sandbox_create() returns handle to caller
+Target: < 100ms end-to-end from call to guest-running
+```
+
+### 10.3 Critical Path: Snapshot Template Creation (done once, reused N times)
+
+```
+vmm_manager spawns Firecracker via jailer (full cold boot ~125ms)
+  → guest OS boots, application init completes (Python runtime loaded, etc.)
+  → snapshot_manager issues pause-vCPUs via Firecracker API
+  → snapshot_manager serializes: microVM state file + guest memory snapshot to disk
+  → snapshot_manager checksums both files and writes manifest
+  → vmm_manager tears down the template VM
+Template is now on disk. All future provisions restore from this snapshot.
+```
+
+### 10.4 Open LLD Questions (to be resolved in subsequent decisions)
+
+- Seccomp policy for the Jailer (§6 item 3)
+- Rootless vs. rootful daemon (§6 item 4)
+- IPC transport (§6 item 5)
+- Credential brokering design (§5 / §6 item 7)
+- uffd_handler threading model (single fault thread vs. per-VM fault thread)
+- Pool size policy (static N vs. demand-driven auto-scaling)
+- Snapshot storage layout (single flat file vs. content-addressed page store)
 
 ---
 
