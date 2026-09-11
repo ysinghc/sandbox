@@ -1,0 +1,21 @@
+[Unit]
+Description=Sandbox Engine Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandboxd
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sandbox-engine /var/run/sandbox-engine
+
+[Install]
+WantedBy=multi-user.target

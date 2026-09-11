@@ -1,0 +1,69 @@
+syntax = "proto3";
+package sandbox;
+
+// Client → Daemon
+message ClientMessage {
+  oneof payload {
+    CreateRequest  create  = 1;
+    DestroyRequest destroy = 2;
+    PauseRequest   pause   = 3;
+    ResumeRequest  resume  = 4;
+    InspectRequest inspect = 5;
+  }
+}
+
+message CreateRequest {
+  uint64 memory_mib = 1;
+  uint32 vcpu_count = 2;
+  string template_name = 3;
+  repeated string env_vars = 4;  // "KEY=VALUE"
+  uint32 pool_wait_ms = 5;
+}
+
+message DestroyRequest {
+  uint32 sandbox_id = 1;
+}
+
+message PauseRequest {
+  uint32 sandbox_id = 1;
+}
+
+message ResumeRequest {
+  uint32 sandbox_id = 1;
+}
+
+message InspectRequest {
+  uint32 sandbox_id = 1;
+}
+
+// Daemon → Client
+message ServerMessage {
+  oneof payload {
+    CreateResponse  create  = 1;
+    DestroyResponse destroy = 2;
+    ErrorResponse   error   = 3;
+    InspectResponse inspect = 4;
+  }
+}
+
+message CreateResponse {
+  uint32 sandbox_id = 1;
+  string session_token = 2;  // Hex-encoded 256-bit token
+}
+
+message DestroyResponse {
+  uint32 sandbox_id = 1;
+}
+
+message ErrorResponse {
+  int32 error_code = 1;       // Maps to sandbox_error_t
+  string error_message = 2;
+}
+
+message InspectResponse {
+  uint32 sandbox_id = 1;
+  bool is_running = 2;
+  uint64 uptime_ms = 3;
+  uint64 memory_rss_mib = 4;
+  uint32 page_faults = 5;
+}
