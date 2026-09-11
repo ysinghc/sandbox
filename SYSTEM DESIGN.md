@@ -265,7 +265,7 @@ These are explicitly unresolved. The implementation session should make calls on
 2. **Which backend?** — **DECIDED: Firecracker + userfaultfd snapshot/restore. See §10.**
 3. **Default seccomp action** — **DECIDED: Build-time toggle. `SCMP_ACT_KILL_PROCESS` in release builds, `SCMP_ACT_ERRNO(EPERM)` in debug builds. See §10.7.**
 4. **Rootless vs. rootful daemon** — **DECIDED: Rootful daemon. See §10.5.**
-5. **IPC transport for daemon mode** — `SOCK_SEQPACKET` + protobuf was proposed as a low-overhead local IPC choice avoiding HTTP/gRPC transport overhead. With Firecracker as backend, the hot path latency is ~83ms restore — IPC overhead is proportionally less critical than it would be for a namespace pool, but still worth deciding deliberately. Not decided.
+5. **IPC transport for daemon mode** — **DECIDED: `SOCK_SEQPACKET` + protobuf, persistent per-client-session connections. See §10.8.**
 6. **How much of the multi-tier vision to actually build vs. document** — **RESOLVED by §3: nothing is stubbed; the one backend is built to full depth.**
 7. **Credential brokering implementation** (§5) — essentially unscoped; needs its own research pass before any implementation decision.
 
@@ -407,9 +407,90 @@ The Jailer's seccomp filter applies to the Firecracker process itself, not to th
 
 **Lifecycle consequence:** When `SCMP_ACT_KILL_PROCESS` triggers in production, the Firecracker process dies instantly. The `lifecycle` manager detects this via `pidfd_open` + `epoll` watching the VMM's pidfd — no polling, immediate notification. On VMM death: mark the VM as `DESTROYED`, trigger `network_manager` cleanup of the tap device, and signal `pool_manager` to replenish the pool slot.
 
+### 10.8 IPC Transport — Daemon ↔ Client
+
+**Decision:** Unix domain socket (`SOCK_SEQPACKET`) + length-prefixed protobuf, persistent per-client-session connections.
+
+**Socket path:** `/var/run/sandbox-engine/engine.sock` — compile-time constant, overridable via `SANDBOX_ENGINE_SOCKET` environment variable (useful for tests running as non-root).
+
+**Why `SOCK_SEQPACKET`:**
+- Message boundaries are preserved by the kernel — no framing code needed on top, no partial-read handling
+- Reliable, ordered, connection-oriented — same guarantees as `SOCK_STREAM` but with datagram semantics
+- Each `send()` maps to exactly one `recv()` on the other end — clean request/response pairing
+
+**Wire format:**
+```
+[ 4 bytes: uint32 message length (big-endian) ][ N bytes: serialized protobuf message ]
+```
+All messages are framed with a 4-byte length prefix. The protobuf schema owns the message type field (a `oneof` at the top level covering all request and response types).
+
+**Protobuf schema (top-level message types):**
+```protobuf
+syntax = "proto3";
+
+message ClientMessage {
+  oneof payload {
+    CreateSandboxRequest  create  = 1;
+    DestroySandboxRequest destroy = 2;
+    PauseSandboxRequest   pause   = 3;
+    ResumeSandboxRequest  resume  = 4;
+    InspectSandboxRequest inspect = 5;
+  }
+}
+
+message ServerMessage {
+  oneof payload {
+    CreateSandboxResponse  create  = 1;
+    DestroySandboxResponse destroy = 2;
+    ErrorResponse          error   = 3;
+    InspectSandboxResponse inspect = 4;
+  }
+}
+
+message SandboxSpec {
+  uint64 memory_mib        = 1;  // guest memory in MiB
+  uint32 vcpu_count        = 2;  // number of vCPUs
+  string rootfs_path       = 3;  // path to guest rootfs image
+  string snapshot_path     = 4;  // path to memory snapshot (empty = cold boot)
+  NetworkSpec network      = 5;
+  repeated string env      = 6;  // KEY=VALUE pairs injected via vsock or kernel cmdline
+}
+```
+
+**Daemon-side event loop (epoll-based):**
+```
+epoll instance owns:
+  - listen socket fd          → accept new client connections
+  - per-client connection fds → read requests, write responses
+  - per-VM pidfd fds          → detect VMM process death (SCMP_ACT_KILL_PROCESS trigger)
+  - eventfd for internal wakeup (pool_manager signals pool replenishment needed)
+
+On client connect:
+  → accept(), add client fd to epoll with EPOLLIN
+  → allocate per-client session state (pending request, sandbox handle map)
+
+On client fd readable:
+  → read 4-byte length prefix
+  → read N bytes of protobuf body
+  → dispatch to request handler (create/destroy/pause/resume/inspect)
+  → write response synchronously on same fd
+
+On client fd hangup (EPOLLHUP):
+  → destroy all sandboxes owned by this session
+  → free session state, remove fd from epoll
+
+On VM pidfd readable (VMM died):
+  → lifecycle: transition VM to DESTROYED
+  → network_manager: clean up tap device
+  → pool_manager: signal slot available for replenishment
+```
+
+**Caller authentication:** `SO_PEERCRED` on accept — the kernel provides the caller's uid/pid/gid without any possibility of spoofing. The daemon checks uid == 0 or uid is in a configured allowlist before processing any request. This is enforced at connection time, not per-request.
+
+**Session ownership model:** All sandboxes created within a session are owned by that session. If the client disconnects (clean close or crash), the daemon destroys all owned sandboxes. No orphaned VMs.
+
 ### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
 
-- IPC transport between client and daemon (§6 item 5)
 - Credential brokering design (§5 / §6 item 7)
 - `uffd_handler` threading model (single fault thread vs. per-VM fault thread)
 - Pool size policy (static N vs. demand-driven auto-scaling)
