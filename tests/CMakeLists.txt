@@ -4,3 +4,16 @@ target_include_directories(test_pool PRIVATE ../include)
 target_link_libraries(test_pool sandbox)
 add_test(NAME pool COMMAND test_pool)
 set_tests_properties(pool PROPERTIES TIMEOUT 120)
+
+# Phase 2: jailer + seccomp tests. The probe must be fully static: it runs
+# inside an empty chroot with no loader or shared libs.
+find_library(SECCOMP_STATIC_LIB libseccomp.a PATHS /usr/lib/x86_64-linux-gnu REQUIRED)
+add_executable(jailer_probe jailer_probe.c ../src/seccomp.c)
+target_include_directories(jailer_probe PRIVATE ../include)
+target_link_libraries(jailer_probe ${SECCOMP_STATIC_LIB})
+target_link_options(jailer_probe PRIVATE -static)
+add_executable(test_jailer test_jailer.c)
+target_include_directories(test_jailer PRIVATE ../include)
+target_link_libraries(test_jailer sandbox)
+add_test(NAME jailer COMMAND test_jailer)
+set_tests_properties(jailer PROPERTIES TIMEOUT 120)

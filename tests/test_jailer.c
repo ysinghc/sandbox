@@ -1,0 +1,240 @@
+// Phase 2 verification: seccomp enforcement (always runs) plus the full
+// jailer sequence under a user namespace when id-mapping is available
+// (SKIPs where the environment forbids it, e.g. AppArmor without sudo).
+#define _GNU_SOURCE  // unshare, CLONE_NEWUSER
+
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sched.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "jailer.h"
+#include "sandbox_seccomp.h"
+
+#define CHECK_RC(rc, what) do { int _rc = (rc); if (_rc != 0) { \
+    fprintf(stderr, "FAIL %s: rc=%d (%s:%d)\n", (what), _rc, __FILE__, __LINE__); \
+    abort(); } } while (0)
+
+#define SKIP_CODE 77
+
+static void probe_path(char* out, size_t n) {
+    ssize_t len = readlink("/proc/self/exe", out, n - 32);
+    if (len <= 0 || (size_t)len >= n - 32) { strcpy(out, "./jailer_probe"); return; }
+    out[len] = '\0';
+    char* slash = strrchr(out, '/');
+    strcpy(slash ? slash + 1 : out, "jailer_probe");
+}
+
+// Fork+exec the probe directly (no jail): checks pre-filter assertions,
+// loads the real filter, then must die by SIGSYS on the fatal call.
+static int run_probe_bare(const char* mode) {
+    char probe[PATH_MAX];
+    probe_path(probe, sizeof(probe));
+    char missing[PATH_MAX], uid[16];
+    snprintf(missing, sizeof(missing), "/tmp/jailer-bare-%d-missing", (int)getpid());
+    snprintf(uid, sizeof(uid), "%d", (int)getuid());
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); abort(); }
+    if (pid == 0) {
+        char* const argv[] = { probe, missing, uid, (char*)mode, NULL };
+        execv(probe, argv);
+        _exit(127);
+    }
+    int status = 0;
+    CHECK_RC(waitpid(pid, &status, 0) < 0 ? -1 : 0, "waitpid");
+    return status;
+}
+
+// Release (KILL_PROCESS): child must die by SIGSYS. Debug (ERRNO): child
+// exits with EPERM from the fatal call. Anything else is a failure.
+static void check_filter_death(int status, const char* what) {
+    if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS) {
+        printf("[test] %s: PASS (SIGSYS)\n", what);
+        return;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == EPERM) {
+        printf("[test] %s: PASS (EPERM, debug filter mode)\n", what);
+        return;
+    }
+    if (WIFEXITED(status))
+        fprintf(stderr, "FAIL %s: probe exit=%d\n", what, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        fprintf(stderr, "FAIL %s: signal=%d\n", what, WTERMSIG(status));
+    else
+        fprintf(stderr, "FAIL %s: status=%d\n", what, status);
+    abort();
+}
+
+static void test_seccomp_socket(void) {
+    printf("[test] seccomp_socket...\n");
+    fflush(stdout);
+    check_filter_death(run_probe_bare((char*)"socket"), "seccomp_socket");
+}
+
+static void test_seccomp_ioctl_args(void) {
+    printf("[test] seccomp_ioctl_args...\n");
+    fflush(stdout);
+    check_filter_death(run_probe_bare((char*)"ioctl"), "seccomp_ioctl_args");
+}
+
+static void test_helpers(void) {
+    printf("[test] helpers...\n");
+    fflush(stdout);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/jailtest-%d", (int)getpid());
+    char nested[PATH_MAX];
+    snprintf(nested, sizeof(nested), "%s/a/b/c", tmp);
+    CHECK_RC(mkdir_recursive(nested, 0755), "mkdir_recursive");
+    struct stat st;
+    CHECK_RC(stat(nested, &st) < 0 ? -1 : 0, "stat nested");
+    char cg[PATH_MAX];
+    snprintf(cg, sizeof(cg), "%s/cgroup.procs", tmp);
+    int fd = open(cg, O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) abort();
+    close(fd);
+    CHECK_RC(write_cgroup_procs(cg, getpid()), "write_cgroup_procs");
+    char buf[32] = {0};
+    fd = open(cg, O_RDONLY);
+    if (fd < 0) abort();
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0 || atoi(buf) != (int)getpid()) abort();
+    if (write_cgroup_procs("/nonexistent/cgroup.procs", getpid()) == 0) abort();
+    if (mkdir_recursive(NULL, 0755) == 0) abort();
+    if (geteuid() != 0 && mount_jail_devices(tmp) == 0) abort();  // no privs: must fail
+    printf("[test] helpers: PASS\n");
+    fflush(stdout);
+}
+
+// --- privileged sequence: userns + full spawn_jailed + static probe ---
+
+static int write_file(const char* path, const char* content) {
+    int fd = open(path, O_WRONLY);
+    if (fd < 0) return -1;
+    size_t n = strlen(content);
+    ssize_t w = write(fd, content, n);
+    close(fd);
+    return (w == (ssize_t)n) ? 0 : -1;
+}
+
+static int copy_file(const char* src, const char* dst) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) { close(in); return -1; }
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, (size_t)n) != n) { close(in); close(out); return -1; }
+    }
+    close(in);
+    close(out);
+    return (n < 0) ? -1 : 0;
+}
+
+// Child A: enter userns, map ids, run the jailed probe. _exit(SKIP_CODE) when
+// the environment forbids id-mapping.
+static void userns_sequence_child(const char* jail, const char* probe_in_jail,
+                                  const char* sentinel, int out_fd) {
+    if (unshare(CLONE_NEWUSER) < 0) _exit(SKIP_CODE);
+    char map[64];
+    snprintf(map, sizeof(map), "0 %d 65536", (int)geteuid());
+    if (write_file("/proc/self/setgroups", "deny") < 0) _exit(SKIP_CODE);
+    if (write_file("/proc/self/uid_map", map) < 0) _exit(SKIP_CODE);
+    if (write_file("/proc/self/gid_map", map) < 0) _exit(SKIP_CODE);
+
+    // Reap the jailer grandchild and relay its result.
+    int pipefd[2];
+    if (pipe(pipefd) < 0) _exit(2);
+    pid_t inner = fork();
+    if (inner < 0) _exit(2);
+    if (inner == 0) {
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);  // stdout now holds the only write end in this process
+        jailer_config_t cfg = { .jailer_uid = 65534, .jailer_gid = 65534, .cgroup_path = NULL };
+        char* const argv[] = { (char*)probe_in_jail, (char*)sentinel, (char*)"65534",
+                               (char*)"socket", NULL };
+        // Same steps as production, seccomp deferred to the probe (a static
+        // binary cannot start under the filter: arch_prctl is not whitelisted).
+        pid_t jailed = spawn_jailed(jail, &cfg, probe_in_jail, argv, false, false);
+        int st = 0;
+        if (jailed < 0 || waitpid(jailed, &st, 0) < 0) _exit(3);
+        close(STDOUT_FILENO);  // last writer (grandchild is dead) -> EOF
+        char out[256] = {0};
+        size_t off = 0;
+        ssize_t n;
+        while (off < sizeof(out) - 1 &&
+               (n = read(pipefd[0], out + off, sizeof(out) - 1 - off)) > 0)
+            off += (size_t)n;
+        if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGSYS) _exit(4);
+        if (!strstr(out, "PROBE ok uid=65534")) _exit(5);
+        _exit(0);
+    }
+    close(pipefd[1]);
+    int st = 0;
+    if (waitpid(inner, &st, 0) < 0) _exit(2);
+    if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+        const char msg[] = "SEQUENCE ok\n";
+        (void)write(out_fd, msg, sizeof(msg) - 1);
+        _exit(0);
+    }
+    _exit(WIFEXITED(st) ? (100 + WEXITSTATUS(st)) : 6);
+}
+
+static void test_jailer_sequence(void) {
+    printf("[test] jailer_sequence...\n");
+    fflush(stdout);
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), "/tmp/jailseq-%d", (int)getpid());
+    CHECK_RC(mkdir_recursive(tmp, 0755), "tmpdir");
+    char jail[PATH_MAX], sentinel[PATH_MAX], probe_src[PATH_MAX], probe_dst[PATH_MAX];
+    snprintf(jail, sizeof(jail), "%s/j/vmid-001", tmp);
+    snprintf(sentinel, sizeof(sentinel), "%s/sentinel", tmp);
+    CHECK_RC(mkdir_recursive(jail, 0755), "jail dir");
+    probe_path(probe_src, sizeof(probe_src));
+    snprintf(probe_dst, sizeof(probe_dst), "%s/probe", jail);
+    CHECK_RC(copy_file(probe_src, probe_dst), "copy probe");
+    CHECK_RC(chmod(probe_dst, 0755), "chmod probe");
+    int fd = open(sentinel, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) abort();
+    if (write(fd, "secret", 6) != 6) abort();
+    close(fd);
+
+    pid_t pid = fork();
+    if (pid < 0) abort();
+    if (pid == 0) {
+        userns_sequence_child(jail, "/probe", sentinel, STDOUT_FILENO);
+        _exit(6);
+    }
+    int status = 0;
+    CHECK_RC(waitpid(pid, &status, 0) < 0 ? -1 : 0, "waitpid");
+    if (WIFEXITED(status) && WEXITSTATUS(status) == SKIP_CODE) {
+        printf("[test] jailer_sequence: SKIP (no userns id-mapping in this environment)\n");
+        fflush(stdout);
+        return;
+    }
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        printf("[test] jailer_sequence: PASS\n");
+        fflush(stdout);
+        return;
+    }
+    fprintf(stderr, "FAIL jailer_sequence: status=%d\n", status);
+    abort();
+}
+
+int main(void) {
+    test_seccomp_socket();
+    test_seccomp_ioctl_args();
+    test_helpers();
+    test_jailer_sequence();
+    printf("ALL JAILER TESTS PASSED\n");
+    return 0;
+}
