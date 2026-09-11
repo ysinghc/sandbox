@@ -569,10 +569,123 @@ void* prefault_worker_fn(void* arg) {
 - Per-fault resolution (page cold): ~50–200µs (mmap fault → disk read → `UFFDIO_COPY`)
 - `prefault_worker` races to warm cache: most pages cached within 50–200ms depending on snapshot size and NVMe throughput
 
+### 10.10 Pool Manager — Static Pool with Overflow Queue
+
+**Decision:** Static target pool size, runtime-configurable, with a pending-request overflow queue and a configurable drain timeout.
+
+**Configuration (read at daemon startup from config file or env vars):**
+```
+SANDBOX_POOL_SIZE=5              # target number of warm VMs to maintain
+SANDBOX_POOL_WAIT_TIMEOUT_MS=500 # max time a queued request waits before POOL_EXHAUSTED
+SANDBOX_POOL_MAX_QUEUE_DEPTH=50  # max pending requests before immediate rejection
+```
+
+**Data structures:**
+```c
+typedef struct {
+    // Warm VMs ready to hand off — restored from snapshot, vCPUs paused, uffd armed
+    vm_handle_t  warm_queue[POOL_MAX_SIZE];
+    int          warm_head, warm_tail, warm_count;
+
+    // Pending requests waiting for a warm VM to become available
+    pending_req_t overflow_queue[POOL_MAX_QUEUE_DEPTH];
+    int           overflow_head, overflow_tail, overflow_count;
+
+    pthread_mutex_t lock;
+    pthread_cond_t  vm_available;   // signaled when a warm VM is enqueued
+    pthread_cond_t  slot_available; // signaled when replenishment can start
+
+    int  target_size;
+    int  restoring_count;  // VMs currently being restored (in flight)
+    bool shutdown;
+} pool_manager_t;
+```
+
+**Critical invariant:**
+```
+warm_count + restoring_count <= target_size
+```
+The pool never starts more restore operations than needed to reach `target_size`. This prevents runaway memory consumption if restores pile up while the pool is draining fast.
+
+**`sandbox_create()` fast path (warm VM available):**
+```c
+pthread_mutex_lock(&pool->lock);
+if (pool->warm_count > 0) {
+    vm = dequeue_warm(pool);          // O(1)
+    pool->restoring_count++;          // account for replenishment about to start
+    pthread_cond_signal(&pool->slot_available);
+    pthread_mutex_unlock(&pool->lock);
+    // hand vm to caller — network setup, vCPU resume happen outside the lock
+    return vm;
+}
+```
+
+**`sandbox_create()` slow path (pool exhausted — overflow queue):**
+```c
+if (pool->overflow_count >= POOL_MAX_QUEUE_DEPTH) {
+    pthread_mutex_unlock(&pool->lock);
+    return SANDBOX_ERR_POOL_EXHAUSTED;  // immediate rejection, queue full
+}
+pending_req_t req = { .result = NULL, .ready = false };
+enqueue_overflow(pool, &req);
+struct timespec deadline = now_plus_ms(pool->wait_timeout_ms);
+while (!req.ready && !pool->shutdown) {
+    int rc = pthread_cond_timedwait(&pool->vm_available, &pool->lock, &deadline);
+    if (rc == ETIMEDOUT) {
+        dequeue_overflow(pool, &req);
+        pthread_mutex_unlock(&pool->lock);
+        return SANDBOX_ERR_POOL_EXHAUSTED;  // timed out waiting
+    }
+}
+vm = req.result;
+pthread_mutex_unlock(&pool->lock);
+return vm;
+```
+
+**Replenishment thread (runs continuously in background):**
+```c
+void* replenishment_fn(void* arg) {
+    pool_manager_t* pool = arg;
+    for (;;) {
+        pthread_mutex_lock(&pool->lock);
+        // Wait until we're below target and not already restoring enough
+        while ((pool->warm_count + pool->restoring_count >= pool->target_size)
+               && !pool->shutdown) {
+            pthread_cond_wait(&pool->slot_available, &pool->lock);
+        }
+        if (pool->shutdown) break;
+        pool->restoring_count++;
+        pthread_mutex_unlock(&pool->lock);
+
+        // Restore a VM from snapshot (blocking, outside the lock)
+        vm_handle_t vm = restore_vm_from_snapshot();  // ~83ms
+
+        pthread_mutex_lock(&pool->lock);
+        pool->restoring_count--;
+        if (pool->overflow_count > 0) {
+            // Hand directly to a waiting caller — don't re-pool
+            pending_req_t* req = peek_overflow(pool);
+            req->result = vm;
+            req->ready  = true;
+            dequeue_overflow(pool, req);
+            pthread_cond_broadcast(&pool->vm_available);
+        } else {
+            enqueue_warm(pool, vm);
+        }
+        pthread_mutex_unlock(&pool->lock);
+    }
+}
+```
+
+**On VM destroy:** the destroyed VM's memory is reclaimed; `restoring_count` does not change (the destroyed VM was already handed off and is no longer counted); `slot_available` is signaled so replenishment can fill the gap.
+
+**On daemon shutdown:** `pool->shutdown = true`, broadcast both condition variables, join the replenishment thread, destroy all warm VMs in the queue.
+
+**Observability:** `telemetry` tracks `pool_warm_count`, `pool_restoring_count`, `pool_overflow_depth`, and `pool_exhaustion_count` as live metrics — these are the primary operational health signals for the pool.
+
 ### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
 
 - Credential brokering design (§5 / §6 item 7)
-- Pool size policy (static N vs. demand-driven auto-scaling)
 - Snapshot storage layout (single flat file vs. content-addressed page store)
 
 --- (Context, Not Yet Resolved)
