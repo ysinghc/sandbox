@@ -263,8 +263,8 @@ These are explicitly unresolved. The implementation session should make calls on
 
 1. **Single-backend or multi-backend?** — **DECIDED: Single-backend. See §3.**
 2. **Which backend?** — **DECIDED: Firecracker + userfaultfd snapshot/restore. See §10.**
-3. **Default seccomp action** (for the Jailer layer): `SCMP_ACT_KILL_PROCESS` (max security, may break less-cooperative binaries) vs. `SCMP_ACT_ERRNO` (softer failure, marginally larger attack surface via error-handling code paths). Not decided.
-4. **Rootless vs. rootful daemon** — running the engine's control process fully rootless (via `newuidmap`/`newgidmap` delegation) is more secure but constrains available namespace features without a setuid helper. Not decided.
+3. **Default seccomp action** — **DECIDED: Build-time toggle. `SCMP_ACT_KILL_PROCESS` in release builds, `SCMP_ACT_ERRNO(EPERM)` in debug builds. See §10.7.**
+4. **Rootless vs. rootful daemon** — **DECIDED: Rootful daemon. See §10.5.**
 5. **IPC transport for daemon mode** — `SOCK_SEQPACKET` + protobuf was proposed as a low-overhead local IPC choice avoiding HTTP/gRPC transport overhead. With Firecracker as backend, the hot path latency is ~83ms restore — IPC overhead is proportionally less critical than it would be for a namespace pool, but still worth deciding deliberately. Not decided.
 6. **How much of the multi-tier vision to actually build vs. document** — **RESOLVED by §3: nothing is stubbed; the one backend is built to full depth.**
 7. **Credential brokering implementation** (§5) — essentially unscoped; needs its own research pass before any implementation decision.
@@ -348,19 +348,74 @@ vmm_manager spawns Firecracker via jailer (full cold boot ~125ms)
 Template is now on disk. All future provisions restore from this snapshot.
 ```
 
-### 10.4 Open LLD Questions (to be resolved in subsequent decisions)
+### 10.5 Privilege Model — Rootful Daemon
 
-- Seccomp policy for the Jailer (§6 item 3)
-- Rootless vs. rootful daemon (§6 item 4)
-- IPC transport (§6 item 5)
+**Decision:** The engine daemon runs as root. Firecracker VMM processes are privilege-dropped by the Jailer after setup.
+
+**Rationale:** The Jailer already handles the most critical privilege reduction — Firecracker (the process with the largest attack surface from guest-provided input) runs as an unprivileged uid inside a chroot with a seccomp-bpf filter, regardless of what the engine daemon's own privilege level is. A rootful daemon with a correctly implemented Jailer is a defensible, production-like choice (this is the same model Docker Engine uses). Rootless adds meaningful security depth but also meaningful implementation complexity that is better spent on the `uffd_handler` and Jailer correctness.
+
+**Privilege flow:**
+```
+Engine daemon (root)
+  → writes cgroup hierarchy for VMM process (requires root)
+  → creates tap device via TUNSETIFF (requires CAP_NET_ADMIN, held by root)
+  → spawns Firecracker via Jailer binary (root → Jailer setups chroot + seccomp → drops to unprivileged uid)
+  → Firecracker VMM process runs as unprivileged uid, confined in chroot, seccomp-filtered
+  → guest kernel and guest workload run entirely inside KVM hardware boundary
+```
+
+**Security boundary this establishes:**
+- Guest workload is isolated by KVM hardware virtualization — cannot reach host kernel directly
+- Firecracker VMM (the guest's only reach into host userspace) runs unprivileged + chrooted + seccomp-filtered via Jailer
+- Engine daemon itself is root but has no guest-controlled input paths — all guest interaction is mediated through Firecracker's API socket, which the daemon owns
+
+**What this does NOT protect against:** A bug in the engine daemon itself reachable from the public API (e.g., a path traversal in snapshot file handling, a format-string bug in the REST handler) lands an attacker in a root process. Mitigations: strict input validation on all API inputs, no user-controlled data in file paths without sanitization, daemon runs with `PR_SET_NO_NEW_PRIVS` set after startup, seccomp filter on the daemon process itself (whitelist of syscalls the daemon legitimately needs).
+
+### 10.7 Jailer Seccomp Policy
+
+**Decision:** Build-time toggle for the seccomp default action on the Firecracker VMM process.
+
+```c
+// jailer/seccomp.h
+#ifdef NDEBUG
+  // Release build: unwhitelisted syscall kills the VMM process immediately.
+  // No error return, no signal handler, no timing oracle for attackers.
+  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_KILL_PROCESS
+#else
+  // Debug build: unwhitelisted syscall returns EPERM.
+  // Allows iterative whitelist development — missing syscalls surface as
+  // error returns rather than silent process deaths.
+  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_ERRNO(EPERM)
+#endif
+```
+
+**Whitelist scope (Firecracker VMM process — not the guest):**
+The Jailer's seccomp filter applies to the Firecracker process itself, not to the guest kernel. The guest runs its own syscalls through KVM — those never reach the host kernel's seccomp filter. The Firecracker VMM process's legitimate syscall needs are narrow and known:
+
+| Syscall category | Specific calls | Reason |
+|---|---|---|
+| KVM interaction | `ioctl` (filtered to `KVM_*` ioctls only) | Core VMM operation |
+| Memory management | `mmap`, `munmap`, `mprotect`, `mremap` | Guest memory region management |
+| File I/O | `read`, `write`, `open`, `close`, `fstat`, `lseek` | Snapshot files, serial console, API socket |
+| Signaling | `signalfd`, `sigprocmask`, `rt_sigaction` | VMM shutdown handling |
+| Epoll/event | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `eventfd` | Virtio device event loops |
+| Threading | `clone` (filtered flags), `futex`, `set_robust_list` | VMM internal threads |
+| Process | `exit_group`, `getpid`, `tgkill` | Normal process lifecycle |
+| Time | `clock_gettime`, `clock_nanosleep` | Metrics, rate limiting |
+
+`ioctl` gets argument filtering (only `KVM_*` command numbers allowed) — not just presence on the whitelist — because `ioctl` is the highest-surface syscall and blanket-allowing it would undermine the filter entirely.
+
+**Lifecycle consequence:** When `SCMP_ACT_KILL_PROCESS` triggers in production, the Firecracker process dies instantly. The `lifecycle` manager detects this via `pidfd_open` + `epoll` watching the VMM's pidfd — no polling, immediate notification. On VMM death: mark the VM as `DESTROYED`, trigger `network_manager` cleanup of the tap device, and signal `pool_manager` to replenish the pool slot.
+
+### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
+
+- IPC transport between client and daemon (§6 item 5)
 - Credential brokering design (§5 / §6 item 7)
-- uffd_handler threading model (single fault thread vs. per-VM fault thread)
+- `uffd_handler` threading model (single fault thread vs. per-VM fault thread)
 - Pool size policy (static N vs. demand-driven auto-scaling)
 - Snapshot storage layout (single flat file vs. content-addressed page store)
 
----
-
-## 7. Real-World Validation In Progress (Context, Not Yet Resolved)
+--- (Context, Not Yet Resolved)
 
 The author is planning outreach to a Dedalus Labs engineer with a specific technical question before finalizing architecture, roughly:
 
