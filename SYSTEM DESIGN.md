@@ -1,888 +1,1332 @@
-# Sandbox Engine — Technical Handoff for Implementation Session
+# Sandbox Engine — Low-Level Design Document
 
-**Project:** A sandboxing engine for isolating AI agent execution, built as a portfolio piece targeting Dedalus Labs (YC S25) — a company building persistent compute infrastructure for AI agents.
-
-**Author's stated project intent (in their words):** A lightweight and extremely secure engine that interacts with and manages namespace calls directly, provisioning sandboxes according to requirements from a frontend, usable within milli- or microseconds. The engine exposes an API to programmatically provision sandboxes and all functionality in C and C++. A simple desktop layer bundles the engine (like Docker Desktop bundles Docker Engine), but the engine itself is separately installable and usable.
-
----
-
-## 1. The Core Tension This Project Must Resolve
-
-Every decision below flows from one unresolved tension, stated plainly:
-
-**Isolation strength and provisioning latency trade against each other, and the "right" point on that curve depends entirely on what you assume about the workload's trust level — and AI agents complicate that assumption in a specific way.**
-
-- Traditional sandboxing assumes you can classify workloads as "trusted" (code you wrote/reviewed) or "untrusted" (arbitrary user-submitted code), and pick isolation strength accordingly.
-- AI agents break this classification because an agent's *runtime behavior* is decided by an LLM at inference time, based on inputs (documents, web pages, tool outputs) that were never reviewed. Prompt injection means author-trusted code can still take attacker-directed actions. This pushes toward treating agent execution as adversarial by default, which argues for hardware isolation (VMs) rather than shared-kernel isolation (namespaces) — even for "internal" agents.
-- **This is a real, unresolved debate, not a settled fact.** A reasonable engineer could argue the opposite: that namespace + seccomp + cgroups is sufficient defense-in-depth for the actual blast radius of a compromised agent (bounded by capability drop, resource limits, and credential brokering), and that VM-grade isolation is overengineering for a threat that mostly manifests as "unwanted actions within granted permissions" rather than "kernel escape." **The implementation session should not treat the microVM direction as settled — it should treat it as the leading hypothesis, pending validation against real Dedalus practice (see §7).**
+**Project:** Firecracker-based sandboxing engine for AI agent isolation  
+**Target:** Production-grade implementation, portfolio piece for Dedalus Labs (YC S25)  
+**Language:** C (core engine) + C++ (RAII wrapper)  
+**Deployment:** Standalone daemon with Unix socket IPC
 
 ---
 
-## 2. Option Space: Isolation Backends
+## 1. System Overview
 
-These are the isolation mechanisms researched, presented as options with their actual trade-offs — not ranked as a recommendation.
+### 1.1 Purpose
 
-### 2.1 Linux Namespaces (unshare + seccomp-bpf + cgroups v2)
+A sandboxing engine that provisions isolated execution environments for AI agents in sub-100ms using Firecracker microVMs with userfaultfd-based snapshot restore. The engine provides hardware-level isolation (KVM) with minimal provisioning latency via a warm VM pool and lazy memory loading.
 
-**Mechanism:** `CLONE_NEWPID/NEWNS/NEWNET/NEWIPC/NEWUTS/NEWUSER` for process/filesystem/network/IPC/hostname isolation; seccomp-bpf whitelist for syscall filtering; cgroups v2 for CPU/memory/PID/IO limits.
+### 1.2 Key Requirements
 
-**Measured/documented characteristics:**
-- Cold start: ~20ms baseline (unoptimized)
-- Memory overhead: ~3MB per sandbox
-- Isolation boundary: shared host kernel
-
-**Known strengths:**
-- Fastest possible provisioning at native process-creation speed
-- Smallest memory footprint of any option
-- Direct, well-documented kernel APIs (`man 7 namespaces`, `man 2 seccomp`, `cgroups(7)`)
-- Battle-tested (namespaces since Linux 2.4/2.6, seccomp-bpf since 2012, cgroups v2 since 2015) — underlies Docker, systemd-nspawn, runc/crun
-- Full compatibility with arbitrary Linux binaries — no compilation constraint on the workload
-
-**Known limitations:**
-- Shared kernel means a kernel-level vulnerability (in namespace code, seccomp code, or an allowed syscall's implementation) has a blast radius across all sandboxes on the host, not just the compromised one
-- Vulnerable to hardware side-channels (Spectre/Meltdown-class, cache-timing) since sandboxes share physical CPU cache/TLB/branch predictor state
-- Mandatory user namespace (the single highest-leverage escape mitigation) is frequently skipped in practice for implementation simplicity — a documented pitfall to avoid
-- Historical real-world escapes exist (Dirty COW 2016, OverlayFS+SETNS 2016, various CVEs) — always via kernel bugs, not "design flaws" in the sandbox's whitelist logic per se
-
-**Research sources to read:**
-- `man 7 namespaces`, `man 2 unshare`, `man 2 clone`, `man 2 seccomp`, `man 7 cgroups`
-- LWN "Namespaces in operation" series (https://lwn.net/Articles/531114/ through /531819/)
-- libseccomp documentation (https://github.com/seccomp/libseccomp)
-- Linux kernel cgroup v2 docs (https://docs.kernel.org/admin-guide/cgroup-v2.html)
-- Docker/runc/crun source for real-world seccomp policy examples
-
----
-
-### 2.2 gVisor (Userspace Kernel / "Sentry")
-
-**Mechanism:** Intercepts syscalls from a container and reimplements their logic in a userspace process ("Sentry," written in Go), passing only a small, heavily-audited subset of calls to the real host kernel.
-
-**Documented characteristics:**
-- Boot/init latency: 50–100ms
-- Memory overhead: ~20–30MB per sandbox (non-shareable floor)
-- Network throughput penalty: up to 33% reduction vs. native, due to syscall interception overhead
-
-**Known strengths:**
-- Meaningfully shrinks the host kernel's exposed attack surface (hundreds of syscalls down to a small audited set)
-- Memory-safe implementation language (Go) closes some vulnerability classes common in C
-- Production-proven at scale (backs Google Cloud Run, GKE Sandbox)
-
-**Known limitations:**
-- Still no true hardware isolation boundary — a Sentry vulnerability or an exploitable path through the reduced syscall set can still reach the host kernel
-- Significant I/O and network throughput penalty makes it a poor fit for data-heavy or I/O-heavy agent workloads (e.g., agents streaming large tool outputs or model weights)
-- Larger memory floor than namespaces or microVMs
-- Boot latency alone (50-100ms) consumes most or all of a sub-100ms budget before any application-level init
-
-**Research sources to read:**
-- gVisor architecture guide (https://gvisor.dev/docs/architecture_guide/)
-- gVisor GitHub (runsc implementation)
-
----
-
-### 2.3 Firecracker MicroVM (KVM-backed, minimal device model)
-
-**Mechanism:** A minimal Virtual Machine Monitor (VMM) written in Rust, using KVM for hardware-accelerated virtualization. Deliberately strips legacy device emulation (no full PCI bus, no BIOS, no USB/floppy emulation) down to a small device set: virtio-net, virtio-block, virtio-vsock, entropy source, serial console, minimal keyboard controller for reset signals.
-
-**Documented characteristics:**
-- Cold boot to userspace: ~125ms (note: some benchmarking methodologies measure a narrower slice of "boot" than true end-to-end readiness — worth scrutinizing any specific number's methodology)
-- Memory overhead: <5MB per instance
-- Guest compatibility: full, unmodified Linux kernel/userspace — arbitrary binaries run normally inside
-
-**Known strengths:**
-- True hardware isolation boundary (KVM) — a guest kernel compromise is contained to that guest, doesn't reach the host kernel or sibling guests
-- Memory-safe implementation (Rust) eliminates entire classes of VMM-level bugs (buffer overflows, use-after-free) that have historically affected C-based VMMs (QEMU)
-- Full Linux compatibility means arbitrary agent code (Python, arbitrary tool binaries) runs unmodified — no compilation constraint
-- Production-proven at extreme scale (powers AWS Lambda, Fargate)
-- Independent academic benchmarking found Cloud Hypervisor (a close architectural cousin) actually outperforming Firecracker on rigorous end-to-end measurement in at least one replication study — worth reading before assuming Firecracker's numbers are definitively best-in-class
-
-**Known limitations:**
-- Cold boot alone (~125ms) exceeds a strict <100ms target — the latency win requires an additional technique (snapshot/restore, see §2.3.1)
-- VMM process itself runs in host userspace and is a potential attack surface if compromised (addressed via the "Jailer" pattern, see §4)
-- Requires `/dev/kvm` access — doesn't work in deeply nested virtualization environments where KVM access is restricted
-- Some cited numbers (e.g., the commonly-quoted ~125ms) come from benchmarks measuring guest-kernel-writes-to-a-special-device mid-boot with a patched kernel — not full end-to-end process creation to termination time. Worth independently verifying before quoting.
-
-**Research sources to read:**
-- Firecracker design document and GitHub (https://github.com/firecracker-microvm/firecracker)
-- Firecracker's own published design/security docs
-- AWS's original Firecracker paper ("Firecracker: Lightweight Virtualization for Serverless Applications," NSDI 2020) — primary source for the architecture's original performance claims
-- Independent academic benchmarking of microVM cold-start (search for recent NSDI/OSDI/EuroSys papers comparing Firecracker/Cloud Hypervisor/gVisor — at least one known replication study challenges the "Firecracker is always fastest" narrative)
-
-#### 2.3.1 Snapshot + Restore (required to hit sub-100ms with Firecracker)
-
-**The problem:** Cold boot (~125ms) plus application-level initialization (loading a Python interpreter, importing AI libraries, establishing network connections) can add hundreds of milliseconds to seconds — this dominates over the raw VMM boot time and must be solved separately.
-
-**The technique:** Boot a "template" VM in the background, let it fully complete OS boot and application initialization, pause its vCPUs, and dump the exact machine state (vCPU registers, virtio device state, guest physical memory) to disk. New requests "restore" from this snapshot instead of booting from scratch, resuming execution at the exact paused instruction.
-
-**The remaining bottleneck — eager vs. lazy memory loading:**
-- **Eager loading** (naive restore): read the entire memory snapshot from disk into RAM before resuming. Documented cost: ~7,140ms to restore a 2GB guest — completely non-viable for sub-100ms targets, and the cost scales linearly with guest memory size.
-- **Lazy loading via `userfaultfd`:** register the guest's memory region with the kernel's `userfaultfd` mechanism so that page faults on unpopulated memory are delegated to a userspace handler thread instead of being silently resolved by the kernel. The VMM resumes vCPUs immediately without reading any snapshot data; the guest's first memory access triggers a page fault, which a dedicated handler thread resolves on-demand via `UFFDIO_COPY` (inject the correct page from the snapshot file) or `UFFDIO_ZEROPAGE` (map an efficient zero page if the snapshot metadata says the page is empty). Documented cost: ~83ms restore-to-resume for a 2GB guest (vs. ~7,140ms eager), with per-page-fault overhead of ~1-10µs (vs. ~1µs for an ordinary kernel-resolved fault).
-- **The throughput trade-off:** lazy loading trades upfront latency for a runtime tax — if the guest immediately touches large swaths of memory (e.g., a garbage collection sweep, hashing a large buffer), it pays many sequential micro-penalties. Mitigation: background pre-faulting threads asynchronously stream the remainder of the snapshot into memory after resume, so the on-demand cost is only paid for pages touched before the background stream catches up.
-
-**Research sources to read:**
-- `man 2 userfaultfd`
-- Linux kernel documentation on userfaultfd (Documentation/admin-guide/mm/userfaultfd.rst)
-- Firecracker's own snapshot/restore documentation and any published benchmarks on their implementation
-- AWS Lambda's published engineering blog posts on Firecracker snapshot optimization (if available — search for these directly, not from training data)
-
----
-
-### 2.4 Cloud Hypervisor (KVM-backed, PCI-based device model)
-
-**Mechanism:** A close architectural cousin to Firecracker — Rust-based, KVM-backed — but supports full PCI device emulation, VFIO passthrough, and vhost-user device backends, at the cost of paying full PCI bus enumeration during guest boot (versus Firecracker/virtio-mmio designs that skip this).
-
-**Documented characteristics:**
-- Boot time: commonly cited ~200ms (vs. Firecracker's ~125ms) — though see the caveat below and in §2.3, since at least one independent benchmark found Cloud Hypervisor faster than Firecracker on a different measurement methodology; the "Firecracker is faster" claim is not uniformly settled in the literature
-- Memory overhead: ~5MB
-- The PCI vs. MMIO transport difference is substantial at the code level: virtio-mmio requires roughly 538 lines of kernel code across 1 file, versus virtio-pci's roughly 78,000+ lines across 161 files — this is the likely mechanical source of most of the boot-time gap between Cloud Hypervisor and Firecracker, not an efficiency difference in the hypervisors themselves.
-
-**Known strengths:**
-- GPU passthrough (VFIO) — relevant if agent workloads need direct hardware access for local model inference/training rather than calling out to external LLM APIs
-- Broader guest OS/hardware compatibility than Firecracker's deliberately minimal model
-- Shares Firecracker's Rust memory-safety and KVM hardware-isolation properties
-
-**Known limitations:**
-- PCI-only transport (no virtio-mmio support in the current device model, as of research date) structurally costs tens of milliseconds of boot time that Firecracker avoids by design — there was a public GitHub issue proposing MMIO as a build option, unclear if/when it landed
-- Same snapshot/restore + userfaultfd considerations as Firecracker apply (this is a KVM-level technique, not VMM-specific), but less publicly documented for Cloud Hypervisor specifically — worth verifying whether their snapshot/restore implementation supports lazy loading as maturely as Firecracker's
-
-**Research sources to read:**
-- Cloud Hypervisor GitHub and documentation (https://github.com/cloud-hypervisor/cloud-hypervisor)
-- rust-vmm project docs (Cloud Hypervisor is built on shared rust-vmm crates with Firecracker — worth understanding the shared foundation)
-- Search for the specific GitHub issue/PR history on virtio-mmio support for Cloud Hypervisor to get current status (this is very likely to have changed since initial research — verify freshly)
-
----
-
-### 2.5 Unikraft (Unikernel)
-
-**Mechanism:** Compiles the application (agent code) together with only the specific OS micro-libraries it actually needs into a single specialized bootable binary — no general-purpose OS, no user/kernel space separation, single address space. Uses a ported musl libc and POSIX-compatible interfaces (via the `kraft` toolchain) to allow largely unmodified applications (Python runtimes, C++ engines, SQLite) to be compiled into unikernel images.
-
-**Documented characteristics:**
-- Cold boot: <10ms
-- Image/memory size: ~1MB image, <10MB RAM at runtime
-- Boots atop KVM (retains hardware isolation boundary)
-
-**Known strengths:**
-- An order of magnitude faster boot than Firecracker's standard path, without needing userfaultfd/snapshot complexity to get there
-- No user/kernel space context-switch overhead (single address space) — significant throughput gains for I/O-heavy workloads
-- Enables "stateful scale-to-zero": an idle agent (e.g., blocked on an external API call) can be fully suspended at effectively zero cost and resumed in milliseconds when a response arrives
-- Retains KVM hardware isolation — not a weaker security model than Firecracker, just a different execution model
-
-**Known limitations:**
-- Requires compiling the target application into a unikernel image ahead of time via `kraft` — not suitable for open-ended, arbitrary agent code where the shape of what needs to run isn't known until runtime
-- Best fit is a narrow, fixed-shape component (e.g., a specific tool-execution microservice), not a general "run whatever the agent decides to run" sandbox
-- Smaller ecosystem/community than Firecracker; fewer production war stories to learn from
-
-**Research sources to read:**
-- Unikraft project site and docs (https://unikraft.org)
-- Unikraft's papers (it's a Linux Foundation project with published academic work — search for "Unikraft: Fast, Specialized Unikernels the Easy Way," EuroSys 2021, as a starting primary source)
-- `kraft` toolchain documentation for the actual compilation workflow
-
----
-
-### 2.6 WebAssembly / WasmEdge (WASI-NN)
-
-**Mechanism:** Executes code in a memory-safe, stack-based virtual machine with mathematically-provable fault isolation — the runtime controls all memory access and restricts execution to validated bytecode, independent of Linux kernel namespaces or cgroups entirely.
-
-**Documented characteristics:**
-- Cold start: <1ms
-- Memory footprint: <1MB
-- WASI-NN (WebAssembly System Interface for Neural Networks): allows a sandboxed Wasm module to request hardware-accelerated inference (PyTorch/TensorFlow/OpenVINO/llama.cpp backends) from the host, without the sandboxed code ever getting direct GPU/memory access — the host retains control of the actual model weights and returns only requested tensors/tokens
-
-**Known strengths:**
-- Fastest and smallest option by a wide margin
-- Isolation boundary is independent of Linux kernel security state entirely — sidesteps namespace/seccomp vulnerability classes altogether
-- WASI-NN's brokered-inference model is architecturally distinct from GPU passthrough (Cloud Hypervisor) in an important way: the device never leaves host control, only results cross the boundary — a meaningfully different trust model worth considering on its own merits, not just as a speed option
-
-**Known limitations:**
-- Cannot run arbitrary, unmodified Linux binaries — requires a Wasm compilation target
-- Only suitable for the subset of "agent actions" that are narrow, deterministic functions (e.g., a calculator tool, a JSON validator, a scoped API-calling shim) — not a general-purpose "run whatever code the agent decides to run" sandbox
-- Least mature option for running full agent orchestration loops as opposed to individual tool calls
-
-**Research sources to read:**
-- WasmEdge documentation (https://wasmedge.org)
-- WASI-NN specification (https://github.com/WebAssembly/wasi-nn)
-- WebAssembly Component Model documentation (WASI 0.2+) for current state of the ecosystem
-
----
-
-## 3. Architecture Shape — DECIDED: Single-Backend, Maximum Depth
-
-**Decision:** Single-backend design. The entire engine is built around one isolation mechanism, with no abstraction layer between the public API and the isolation primitives.
-
-**Rationale:** Depth over breadth. A shallow multi-backend abstraction that only honestly supports one backend is architecturally worse than a single-backend design that owns its surface area cleanly. For a portfolio targeting Dedalus, a deeply correct, secure, and performant single-backend implementation with a well-reasoned API demonstrates more engineering judgment than a multi-backend skeleton with one real backend and two stubs.
-
-**LLD consequences of this decision:**
-- `SandboxSpec` is the public API struct — it expresses mechanism-level configuration directly (memory limits, seccomp policy, rootfs path, capability set, network config). No intent/mechanism indirection layer.
-- The component graph is flat: `Public API → LifecycleManager → [backend-specific managers]`. No `BackendRegistry`, no `IsolationDriver` interface.
-- Every component in the design is built to production depth for the chosen backend. Nothing is stubbed.
-- The chosen backend's constraints (e.g., kernel version requirements, KVM availability, specific syscall requirements) are first-class documented requirements, not footnotes.
-
-**What this decision does not foreclose:** The Jailer pattern (§4) and credential brokering (§5) are still in scope as separate workstreams — they are orthogonal to backend choice and remain fully valid under a single-backend design.
-
-**Backend decision:** Firecracker + userfaultfd snapshot/restore — resolved below in §2.3 and §6.
-
----
-
-## 4. The "Jailer" Pattern (Applies Regardless of Backend Choice)
-
-Independent of which isolation backend is primary, there's a separable design pattern worth implementing: hardening the isolation mechanism's own host-side process, not just the workload it isolates.
-
-**The problem it solves:** A VMM (Firecracker/Cloud Hypervisor) or a namespace-setup process runs as a host userspace process. If that process itself has a vulnerability (e.g., a bug in how it parses guest-provided data, like a virtio ring buffer), an attacker who compromises the isolation mechanism from inside the guest/sandbox could potentially reach the host if the isolation mechanism's own process is unconfined.
-
-**The pattern (documented for Firecracker's actual production "Jailer" component):**
-1. Cgroup placement for the VMM/isolation-setup process itself (CPU/memory/PID limits, applied before the guest/sandbox boots)
-2. Filesystem confinement via chroot/pivot_root into a minimal jail containing only strictly necessary device nodes (e.g., `/dev/kvm`, `/dev/net/tun`)
-3. Privilege dropping (setuid/setgid transition from root to unprivileged identity once setup completes)
-4. A restrictive seccomp-bpf filter on the VMM/setup process itself, whitelisting only the syscalls it legitimately needs, with complex calls like `ioctl` argument-filtered to specific safe operations
-
-**Why this matters for scoping:** this pattern reuses namespace + seccomp + cgroup mechanics regardless of which backend is primary — meaning implementing this well is valuable even if the final decision is "Firecracker is the primary agent-execution backend," because the Jailer around that Firecracker process is itself a namespace-sandboxing problem.
-
-**Research sources to read:**
-- Firecracker's own Jailer documentation and source (part of the Firecracker GitHub repo)
-- Look specifically for how Firecracker's Jailer handles the cgroup v1 vs v2 compatibility question, since that's a real-world detail worth matching
-
----
-
-## 5. Secure Data/Credential Brokering (Orthogonal to Isolation Backend)
-
-Regardless of isolation mechanism, a separable and arguably equally important design question: how does a sandboxed agent get access to credentials/APIs/storage it needs, without holding anything valuable enough to be worth exfiltrating if compromised?
-
-**The pattern discussed (not yet decided/scoped in detail):**
-- No long-lived credentials inside any sandbox — only short-lived, narrowly-scoped session tokens
-- Outbound calls to external services proxied through a host-side control-plane component that validates the session token and injects real credentials (held only on the host) before forwarding
-- Storage access via scoped, pre-signed URLs rather than direct cloud IAM roles
-
-**Why this is listed as orthogonal:** this is a control-plane/API design question, not an isolation-mechanism question — it applies identically whether the backend is namespaces, Firecracker, or anything else. Worth scoping as a distinct workstream rather than conflating with the isolation-backend decision.
-
-**Research needed (not yet done):** how existing serverless/agent platforms actually implement this pattern in practice (e.g., how AWS Lambda's execution role model or various "agent sandbox as a service" startups handle credential scoping) — this hasn't been researched yet and is a genuine gap.
-
----
-
-## 6. Open Questions for the Implementation Session to Resolve
-
-These are explicitly unresolved. The implementation session should make calls on these (ideally informed by real Dedalus engineering input — see §7) rather than inheriting an assumed answer from this document:
-
-1. **Single-backend or multi-backend?** — **DECIDED: Single-backend. See §3.**
-2. **Which backend?** — **DECIDED: Firecracker + userfaultfd snapshot/restore. See §10.**
-3. **Default seccomp action** — **DECIDED: Build-time toggle. `SCMP_ACT_KILL_PROCESS` in release builds, `SCMP_ACT_ERRNO(EPERM)` in debug builds. See §10.7.**
-4. **Rootless vs. rootful daemon** — **DECIDED: Rootful daemon. See §10.5.**
-5. **IPC transport for daemon mode** — **DECIDED: `SOCK_SEQPACKET` + protobuf, persistent per-client-session connections. See §10.8.**
-6. **How much of the multi-tier vision to actually build vs. document** — **RESOLVED by §3: nothing is stubbed; the one backend is built to full depth.**
-7. **Credential brokering implementation** (§5) — essentially unscoped; needs its own research pass before any implementation decision.
-
----
-
-## 10. Finalized Architecture — Firecracker + userfaultfd
-
-**Decision:** Firecracker + userfaultfd snapshot/restore as the sole isolation backend.
-
-**Rationale:** Firecracker provides a true hardware VM isolation boundary (KVM) — a guest kernel compromise is contained to that guest and cannot reach the host kernel or sibling guests. The userfaultfd-based lazy restore solves the core hard problem of sub-100ms VM provisioning without eager memory loading. For a portfolio targeting Dedalus (persistent compute for AI agents, where fast VM resume is the central technical challenge), this path directly demonstrates the relevant skill. The `uffd_handler` is kernel-adjacent code that is rare in portfolios and hard to fake.
-
-**Why not namespaces:** Namespace isolation shares the host kernel. A kernel-level vulnerability (in namespace code, seccomp code, or an allowed syscall's implementation) has a blast radius across all sandboxes. For AI agent workloads where prompt injection can direct "trusted" code to take adversarial actions at runtime, hardware isolation is the correct default posture. Namespaces remain relevant as the hardening mechanism for the Jailer layer around the Firecracker VMM process itself (§4).
-
-### 10.1 Component Map
-
-```
-SandboxEngine (C library + C++ RAII wrapper)
-│
-├── vmm_manager         — Firecracker process lifecycle; spawns Firecracker via Jailer;
-│                         communicates via REST API over Unix domain socket; owns the
-│                         per-VM socket path and process handle
-│
-├── snapshot_manager    — guest vCPU pause; state serialization to disk (memory snapshot +
-│                         microVM state file); snapshot versioning and integrity checksums;
-│                         template VM lifecycle (boot once, snapshot, reuse N times)
-│
-├── uffd_handler        — registers guest physical memory region with userfaultfd;
-│                         owns the fault-handling thread; dispatches UFFDIO_COPY (copy
-│                         page from snapshot file) and UFFDIO_ZEROPAGE (map zero page
-│                         for empty pages) on page faults; races safely with vCPU resume
-│
-├── prefault_worker     — background thread pool that streams remaining snapshot pages
-│                         into guest memory after vCPU resume; prevents long-tail latency
-│                         spikes when guest touches memory the uffd_handler hasn't served yet
-│
-├── network_manager     — tap device creation per VM; IP allocation from a managed pool;
-│                         iptables/nftables rules for network policy; CNI-style cleanup on destroy
-│
-├── jailer              — wraps every Firecracker invocation: cgroup placement of VMM process,
-│                         chroot into minimal jail (only /dev/kvm, /dev/net/tun, snapshot files),
-│                         privilege drop (root → unprivileged uid), seccomp-bpf filter on the
-│                         VMM process itself
-│
-├── pool_manager        — maintains N pre-restored warm VMs (restored from snapshot, vCPUs
-│                         paused, uffd_handler armed); on provision request, unpauses a pool
-│                         VM and hands off; asynchronously replenishes the pool
-│
-├── lifecycle           — state machine per VM: COLD → SNAPSHOTTED → RESTORING →
-│                         RUNNING → PAUSED → DESTROYED; owns transitions and error paths
-│
-└── telemetry           — per-restore latency breakdown (uffd fault rate, pages faulted,
-                          prefault progress, time-to-first-instruction); resource accounting
-                          per VM; structured logging for pool health
-```
-
-### 10.2 Critical Path: Provisioning a Sandbox (from warm pool)
-
-```
-Client calls sandbox_create()
-  → pool_manager dequeues a pre-restored VM (vCPUs paused, uffd armed)
-  → network_manager assigns IP, configures tap device
-  → vmm_manager sends "resume vCPUs" command via Firecracker API socket
-  → guest resumes at the exact paused instruction
-  → page faults served on-demand by uffd_handler (UFFDIO_COPY from snapshot)
-  → prefault_worker begins streaming remaining pages in background
-  → pool_manager asynchronously boots + snapshots a replacement VM
-  → sandbox_create() returns handle to caller
-Target: < 100ms end-to-end from call to guest-running
-```
-
-### 10.3 Critical Path: Snapshot Template Creation (done once, reused N times)
-
-```
-vmm_manager spawns Firecracker via jailer (full cold boot ~125ms)
-  → guest OS boots, application init completes (Python runtime loaded, etc.)
-  → snapshot_manager issues pause-vCPUs via Firecracker API
-  → snapshot_manager serializes: microVM state file + guest memory snapshot to disk
-  → snapshot_manager checksums both files and writes manifest
-  → vmm_manager tears down the template VM
-Template is now on disk. All future provisions restore from this snapshot.
-```
-
-### 10.5 Privilege Model — Rootful Daemon
-
-**Decision:** The engine daemon runs as root. Firecracker VMM processes are privilege-dropped by the Jailer after setup.
-
-**Rationale:** The Jailer already handles the most critical privilege reduction — Firecracker (the process with the largest attack surface from guest-provided input) runs as an unprivileged uid inside a chroot with a seccomp-bpf filter, regardless of what the engine daemon's own privilege level is. A rootful daemon with a correctly implemented Jailer is a defensible, production-like choice (this is the same model Docker Engine uses). Rootless adds meaningful security depth but also meaningful implementation complexity that is better spent on the `uffd_handler` and Jailer correctness.
-
-**Privilege flow:**
-```
-Engine daemon (root)
-  → writes cgroup hierarchy for VMM process (requires root)
-  → creates tap device via TUNSETIFF (requires CAP_NET_ADMIN, held by root)
-  → spawns Firecracker via Jailer binary (root → Jailer setups chroot + seccomp → drops to unprivileged uid)
-  → Firecracker VMM process runs as unprivileged uid, confined in chroot, seccomp-filtered
-  → guest kernel and guest workload run entirely inside KVM hardware boundary
-```
-
-**Security boundary this establishes:**
-- Guest workload is isolated by KVM hardware virtualization — cannot reach host kernel directly
-- Firecracker VMM (the guest's only reach into host userspace) runs unprivileged + chrooted + seccomp-filtered via Jailer
-- Engine daemon itself is root but has no guest-controlled input paths — all guest interaction is mediated through Firecracker's API socket, which the daemon owns
-
-**What this does NOT protect against:** A bug in the engine daemon itself reachable from the public API (e.g., a path traversal in snapshot file handling, a format-string bug in the REST handler) lands an attacker in a root process. Mitigations: strict input validation on all API inputs, no user-controlled data in file paths without sanitization, daemon runs with `PR_SET_NO_NEW_PRIVS` set after startup, seccomp filter on the daemon process itself (whitelist of syscalls the daemon legitimately needs).
-
-### 10.7 Jailer Seccomp Policy
-
-**Decision:** Build-time toggle for the seccomp default action on the Firecracker VMM process.
-
-```c
-// jailer/seccomp.h
-#ifdef NDEBUG
-  // Release build: unwhitelisted syscall kills the VMM process immediately.
-  // No error return, no signal handler, no timing oracle for attackers.
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_KILL_PROCESS
-#else
-  // Debug build: unwhitelisted syscall returns EPERM.
-  // Allows iterative whitelist development — missing syscalls surface as
-  // error returns rather than silent process deaths.
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_ERRNO(EPERM)
-#endif
-```
-
-**Whitelist scope (Firecracker VMM process — not the guest):**
-The Jailer's seccomp filter applies to the Firecracker process itself, not to the guest kernel. The guest runs its own syscalls through KVM — those never reach the host kernel's seccomp filter. The Firecracker VMM process's legitimate syscall needs are narrow and known:
-
-| Syscall category | Specific calls | Reason |
+| Requirement | Target | Rationale |
 |---|---|---|
-| KVM interaction | `ioctl` (filtered to `KVM_*` ioctls only) | Core VMM operation |
-| Memory management | `mmap`, `munmap`, `mprotect`, `mremap` | Guest memory region management |
-| File I/O | `read`, `write`, `open`, `close`, `fstat`, `lseek` | Snapshot files, serial console, API socket |
-| Signaling | `signalfd`, `sigprocmask`, `rt_sigaction` | VMM shutdown handling |
-| Epoll/event | `epoll_create1`, `epoll_ctl`, `epoll_wait`, `eventfd` | Virtio device event loops |
-| Threading | `clone` (filtered flags), `futex`, `set_robust_list` | VMM internal threads |
-| Process | `exit_group`, `getpid`, `tgkill` | Normal process lifecycle |
-| Time | `clock_gettime`, `clock_nanosleep` | Metrics, rate limiting |
+| Provisioning latency | < 100ms from API call to guest-running | Agent interaction feels synchronous |
+| Isolation strength | Hardware VM boundary (KVM) | Prompt injection makes agent code adversarial |
+| Guest compatibility | Arbitrary unmodified Linux binaries | Python/Node agents run without recompilation |
+| Memory overhead | < 10MB per idle VM | Pool of 10–20 warm VMs is economically viable |
+| Credential safety | Zero long-lived credentials in guest | Guest compromise cannot exfiltrate API keys |
 
-`ioctl` gets argument filtering (only `KVM_*` command numbers allowed) — not just presence on the whitelist — because `ioctl` is the highest-surface syscall and blanket-allowing it would undermine the filter entirely.
+### 1.3 Non-Goals (Explicit Scope Limits)
 
-**Lifecycle consequence:** When `SCMP_ACT_KILL_PROCESS` triggers in production, the Firecracker process dies instantly. The `lifecycle` manager detects this via `pidfd_open` + `epoll` watching the VMM's pidfd — no polling, immediate notification. On VMM death: mark the VM as `DESTROYED`, trigger `network_manager` cleanup of the tap device, and signal `pool_manager` to replenish the pool slot.
+- Multi-backend abstraction (namespaces/gVisor/etc.) — single backend only, Firecracker
+- Dynamic pool auto-scaling — static pool size, runtime-configurable
+- GUI/TUI control plane — API-only; CLI for ops, no desktop UI in scope
+- Windows/macOS host support — Linux-only (KVM dependency)
 
-### 10.8 IPC Transport — Daemon ↔ Client
+---
 
-**Decision:** Unix domain socket (`SOCK_SEQPACKET`) + length-prefixed protobuf, persistent per-client-session connections.
+## 2. Architecture Decisions
 
-**Socket path:** `/var/run/sandbox-engine/engine.sock` — compile-time constant, overridable via `SANDBOX_ENGINE_SOCKET` environment variable (useful for tests running as non-root).
+### 2.1 Isolation Backend: Firecracker + userfaultfd
 
-**Why `SOCK_SEQPACKET`:**
-- Message boundaries are preserved by the kernel — no framing code needed on top, no partial-read handling
-- Reliable, ordered, connection-oriented — same guarantees as `SOCK_STREAM` but with datagram semantics
-- Each `send()` maps to exactly one `recv()` on the other end — clean request/response pairing
+**Decision:** Firecracker microVM with userfaultfd-based lazy snapshot restore.
 
-**Wire format:**
+**Why Firecracker:**
+- KVM hardware boundary — guest kernel compromise is contained to that guest
+- Rust VMM — memory-safe, no buffer overflow / use-after-free class
+- Production-proven at AWS Lambda scale
+- Full Linux guest compatibility (no compilation constraint on agent code)
+
+**Why userfaultfd:**
+- Cold boot ~125ms + app init (seconds) is non-viable for < 100ms target
+- Eager snapshot restore (read all memory from disk) costs ~7,140ms for 2GB guest
+- Lazy restore via userfaultfd: ~83ms to vCPU resume, pages loaded on-demand
+- Prefault worker streams remaining pages in background (50–200ms full warm)
+
+**Why not namespaces:**
+- Shared kernel — kernel vuln has blast radius across all sandboxes on host
+- Prompt injection → treat agent code as adversarial → hardware boundary correct default
+
+### 2.2 Privilege Model: Rootful Daemon, Jailed VMM
+
+**Decision:** Engine daemon runs as root. Each Firecracker VMM process runs unprivileged inside a Jailer (chroot + seccomp + cgroup + capability drop).
+
+**Daemon privilege flow:**
 ```
-[ 4 bytes: uint32 message length (big-endian) ][ N bytes: serialized protobuf message ]
-```
-All messages are framed with a 4-byte length prefix. The protobuf schema owns the message type field (a `oneof` at the top level covering all request and response types).
-
-**Protobuf schema (top-level message types):**
-```protobuf
-syntax = "proto3";
-
-message ClientMessage {
-  oneof payload {
-    CreateSandboxRequest  create  = 1;
-    DestroySandboxRequest destroy = 2;
-    PauseSandboxRequest   pause   = 3;
-    ResumeSandboxRequest  resume  = 4;
-    InspectSandboxRequest inspect = 5;
-  }
-}
-
-message ServerMessage {
-  oneof payload {
-    CreateSandboxResponse  create  = 1;
-    DestroySandboxResponse destroy = 2;
-    ErrorResponse          error   = 3;
-    InspectSandboxResponse inspect = 4;
-  }
-}
-
-message SandboxSpec {
-  uint64 memory_mib        = 1;  // guest memory in MiB
-  uint32 vcpu_count        = 2;  // number of vCPUs
-  string rootfs_path       = 3;  // path to guest rootfs image
-  string snapshot_path     = 4;  // path to memory snapshot (empty = cold boot)
-  NetworkSpec network      = 5;
-  repeated string env      = 6;  // KEY=VALUE pairs injected via vsock or kernel cmdline
-}
+Engine daemon (root, PID 1000)
+  → creates tap device (requires CAP_NET_ADMIN)
+  → writes cgroup hierarchy (requires root)
+  → spawns Jailer binary (root → Jailer does privilege drop)
+    Jailer (PID 1001, root initially)
+      → chroot into /var/lib/sandbox-engine/jail/<vm-id>/
+      → write cgroup files, place self in cgroup
+      → setuid/setgid to unprivileged uid (e.g., 65534)
+      → apply seccomp-bpf filter
+      → exec Firecracker binary
+        Firecracker VMM (PID 1001, uid 65534, chrooted, seccomp-filtered)
+          → opens /dev/kvm inside jail
+          → guest runs inside KVM hardware boundary
 ```
 
-**Daemon-side event loop (epoll-based):**
+**Security boundary established:**
+- Guest workload: isolated by KVM hardware (cannot touch host kernel directly)
+- Firecracker VMM: unprivileged + chrooted + seccomp (guest's only reach into host userspace)
+- Engine daemon: root but has no guest-controlled input paths (all guest I/O via Firecracker's API socket)
+
+### 2.3 IPC: Unix Socket + Protobuf
+
+**Decision:** `SOCK_SEQPACKET` Unix domain socket at `/var/run/sandbox-engine/engine.sock`, length-prefixed protobuf, persistent per-client-session connections.
+
+**Why SEQPACKET:** Message boundaries preserved by kernel — no framing code, no partial reads.
+
+**Why protobuf:** Formal schema, backward-compatible versioning, strongly-typed client bindings.
+
+**Why persistent connections:** Daemon already needs epoll loop for pidfd watching — connection multiplexing is free. Lower per-call overhead than reconnect-per-request.
+
+### 2.4 Credential Brokering: HTTP Proxy + Session Tokens
+
+**Decision:** Separate broker process, HTTP proxy at link-local `169.254.0.1:8080`, session tokens only in guest.
+
+**Flow:**
 ```
-epoll instance owns:
-  - listen socket fd          → accept new client connections
-  - per-client connection fds → read requests, write responses
-  - per-VM pidfd fds          → detect VMM process death (SCMP_ACT_KILL_PROCESS trigger)
-  - eventfd for internal wakeup (pool_manager signals pool replenishment needed)
-
-On client connect:
-  → accept(), add client fd to epoll with EPOLLIN
-  → allocate per-client session state (pending request, sandbox handle map)
-
-On client fd readable:
-  → read 4-byte length prefix
-  → read N bytes of protobuf body
-  → dispatch to request handler (create/destroy/pause/resume/inspect)
-  → write response synchronously on same fd
-
-On client fd hangup (EPOLLHUP):
-  → destroy all sandboxes owned by this session
-  → free session state, remove fd from epoll
-
-On VM pidfd readable (VMM died):
-  → lifecycle: transition VM to DESTROYED
-  → network_manager: clean up tap device
-  → pool_manager: signal slot available for replenishment
+Guest agent (169.254.0.2)
+  → HTTP request to proxy with X-Sandbox-Token: <session-token>
+  → plain HTTP on link-local tap interface (never leaves host)
+Broker (169.254.0.1:8080)
+  → validates token, checks allowlist
+  → strips token, injects real credential (API key)
+  → makes real HTTPS call to upstream (api.openai.com)
+  → streams response back to guest
 ```
 
-**Caller authentication:** `SO_PEERCRED` on accept — the kernel provides the caller's uid/pid/gid without any possibility of spoofing. The daemon checks uid == 0 or uid is in a configured allowlist before processing any request. This is enforced at connection time, not per-request.
+**Why separate process:** Broker holds credentials, engine holds none — if engine has bug, credentials never reachable.
 
-**Session ownership model:** All sandboxes created within a session are owned by that session. If the client disconnects (clean close or crash), the daemon destroys all owned sandboxes. No orphaned VMs.
+**Why session tokens:** Guest never holds long-lived credentials. Token is 256-bit random value, valid only for sandbox lifetime, worthless outside broker's validation context.
 
-### 10.9 `uffd_handler` — Threading Model and Page Resolution
+---
 
-**Decision:** One dedicated fault-handler thread per VM. Snapshot file is `mmap`'d into the daemon's address space at restore time. Faults are resolved by `UFFDIO_COPY` from the mmap region. A separate `prefault_worker` thread per VM streams the snapshot into page cache in the background.
+## 3. Public API
 
-**Why one thread per VM:** At pool sizes of 5–20 VMs, linear thread scaling is trivially cheap. Each thread blocks silently on `read(uffd_fd)` when idle. A slow page resolution for one VM blocks only that VM's thread — zero cross-VM interference. No locks, no shared state between fault handlers.
+### 3.1 C API Surface
 
-**Full restore sequence for one VM:**
+**Header:** `libsandbox.h`
 
 ```c
-// 1. snapshot_manager maps the snapshot into daemon address space at restore time
-void* snap_base = mmap(NULL, snap_size, PROT_READ, MAP_SHARED, snap_fd, 0);
-// snap_base is now the source for all UFFDIO_COPY operations
+#ifndef LIBSANDBOX_H
+#define LIBSANDBOX_H
 
-// 2. Register guest physical memory region with userfaultfd
-struct uffdio_register reg = {
-    .range = { .start = (uint64_t)guest_mem_base, .len = guest_mem_size },
-    .mode  = UFFDIO_REGISTER_MODE_MISSING,
+#include <stdint.h>
+#include <stdbool.h>
+
+// Opaque handle to a running sandbox
+typedef struct sandbox_handle_t sandbox_handle_t;
+
+// Configuration for sandbox creation
+typedef struct {
+    uint64_t memory_mib;        // Guest memory in MiB (e.g., 512)
+    uint32_t vcpu_count;        // Number of vCPUs (e.g., 1)
+    const char* template_name;  // Snapshot template to restore from (e.g., "python-agent")
+    const char** env_vars;      // NULL-terminated array of "KEY=VALUE" strings
+    uint32_t pool_wait_ms;      // Max time to wait if pool exhausted, 0 = fail immediately
+} sandbox_spec_t;
+
+// Error codes
+typedef enum {
+    SANDBOX_OK = 0,
+    SANDBOX_ERR_POOL_EXHAUSTED  = -1,  // Pool empty and wait timed out
+    SANDBOX_ERR_INVALID_SPEC    = -2,  // Bad config (unknown template, invalid memory size)
+    SANDBOX_ERR_DAEMON_UNREACHABLE = -3,
+    SANDBOX_ERR_PERMISSION_DENIED  = -4,
+    SANDBOX_ERR_INTERNAL           = -5,
+} sandbox_error_t;
+
+// Initialize client connection to daemon
+// Returns 0 on success, error code on failure
+sandbox_error_t sandbox_init(const char* socket_path);
+
+// Create a new sandbox from the specified template
+// On success, returns SANDBOX_OK and writes handle to *out_handle
+// On failure, returns error code
+sandbox_error_t sandbox_create(const sandbox_spec_t* spec, sandbox_handle_t** out_handle);
+
+// Pause vCPU execution (guest state frozen, memory preserved)
+sandbox_error_t sandbox_pause(sandbox_handle_t* handle);
+
+// Resume vCPU execution
+sandbox_error_t sandbox_resume(sandbox_handle_t* handle);
+
+// Destroy sandbox and reclaim resources
+// After this call, handle is invalid
+sandbox_error_t sandbox_destroy(sandbox_handle_t* handle);
+
+// Query sandbox status
+typedef struct {
+    uint32_t sandbox_id;
+    bool is_running;          // false if paused
+    uint64_t uptime_ms;       // Time since vCPU resume
+    uint64_t memory_rss_mib;  // Resident set size
+    uint32_t page_faults;     // Cumulative uffd page faults served
+} sandbox_status_t;
+
+sandbox_error_t sandbox_inspect(sandbox_handle_t* handle, sandbox_status_t* out_status);
+
+// Disconnect from daemon (destroys all sandboxes owned by this session)
+void sandbox_cleanup(void);
+
+#endif // LIBSANDBOX_H
+```
+
+### 3.2 C++ RAII Wrapper
+
+**Header:** `libsandbox.hpp`
+
+```cpp
+#ifndef LIBSANDBOX_HPP
+#define LIBSANDBOX_HPP
+
+#include "libsandbox.h"
+#include <string>
+#include <vector>
+#include <memory>
+#include <stdexcept>
+
+namespace sandbox {
+
+class SandboxError : public std::runtime_error {
+public:
+    explicit SandboxError(sandbox_error_t code)
+        : std::runtime_error(error_string(code)), code_(code) {}
+    sandbox_error_t code() const { return code_; }
+private:
+    static const char* error_string(sandbox_error_t code);
+    sandbox_error_t code_;
 };
-ioctl(uffd_fd, UFFDIO_REGISTER, &reg);
 
-// 3. Resume vCPUs via Firecracker API — guest starts executing immediately,
-//    page faults on unmapped pages are delegated to uffd_fd instead of SIGSEGV
-
-// 4. uffd_handler thread (one per VM):
-void* uffd_thread_fn(void* arg) {
-    vm_t* vm = arg;
-    struct uffd_msg msg;
-    for (;;) {
-        read(vm->uffd_fd, &msg, sizeof(msg));  // blocks until fault
-        if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
-
-        uint64_t fault_addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
-        uint64_t offset     = fault_addr - (uint64_t)vm->guest_mem_base;
-
-        // Check snapshot page map: is this page non-zero in the snapshot?
-        if (snapshot_page_is_present(vm->snap_manifest, offset)) {
-            struct uffdio_copy copy = {
-                .dst  = fault_addr,
-                .src  = (uint64_t)(vm->snap_base + offset),  // from mmap region
-                .len  = PAGE_SIZE,
-                .mode = 0,
-            };
-            ioctl(vm->uffd_fd, UFFDIO_COPY, &copy);
-        } else {
-            struct uffdio_zeropage zero = {
-                .range = { .start = fault_addr, .len = PAGE_SIZE },
-                .mode  = 0,
-            };
-            ioctl(vm->uffd_fd, UFFDIO_ZEROPAGE, &zero);
-        }
+class Spec {
+public:
+    Spec(uint64_t memory_mib, const std::string& template_name)
+        : memory_mib_(memory_mib), vcpu_count_(1), template_name_(template_name), pool_wait_ms_(500) {}
+    
+    Spec& vcpus(uint32_t count) { vcpu_count_ = count; return *this; }
+    Spec& env(const std::string& key, const std::string& value) {
+        env_vars_.push_back(key + "=" + value);
+        return *this;
     }
-}
+    Spec& pool_wait(uint32_t ms) { pool_wait_ms_ = ms; return *this; }
+    
+    sandbox_spec_t to_c_struct() const;
+private:
+    uint64_t memory_mib_;
+    uint32_t vcpu_count_;
+    std::string template_name_;
+    std::vector<std::string> env_vars_;
+    uint32_t pool_wait_ms_;
+};
 
-// 5. prefault_worker thread (one per VM, starts concurrently with vCPU resume):
-void* prefault_worker_fn(void* arg) {
-    vm_t* vm = arg;
-    // Advise kernel: sequential access pattern, read-ahead aggressively
-    madvise(vm->snap_base, vm->snap_size, MADV_SEQUENTIAL);
-    // Stream through all pages — pulls them into page cache so uffd_handler
-    // hits cache (~1-10µs) instead of disk (~50-200µs) for subsequent faults
-    for (size_t off = 0; off < vm->snap_size; off += PAGE_SIZE) {
-        volatile uint8_t* p = (uint8_t*)vm->snap_base + off;
-        (void)*p;  // touch page to fault it into page cache
-        if (vm->destroyed) break;  // VM was destroyed, stop streaming
-    }
-}
+class Sandbox {
+public:
+    explicit Sandbox(const Spec& spec);
+    ~Sandbox();
+    
+    // Move-only (no copy — handle is unique)
+    Sandbox(Sandbox&& other) noexcept;
+    Sandbox& operator=(Sandbox&& other) noexcept;
+    Sandbox(const Sandbox&) = delete;
+    Sandbox& operator=(const Sandbox&) = delete;
+    
+    void pause();
+    void resume();
+    sandbox_status_t inspect() const;
+    
+    uint32_t id() const;
+    
+private:
+    sandbox_handle_t* handle_;
+};
+
+class Engine {
+public:
+    explicit Engine(const std::string& socket_path = "/var/run/sandbox-engine/engine.sock");
+    ~Engine();
+    
+    std::unique_ptr<Sandbox> create(const Spec& spec);
+    
+private:
+    bool initialized_;
+};
+
+} // namespace sandbox
+
+#endif // LIBSANDBOX_HPP
 ```
 
-**Snapshot page manifest:** The `snapshot_manager` writes a compact bitmap alongside the memory snapshot — one bit per 4KB page, 1 = page has non-zero content in snapshot, 0 = page was zero. The fault handler uses this to dispatch `UFFDIO_COPY` vs `UFFDIO_ZEROPAGE` without reading the page content. `UFFDIO_ZEROPAGE` is significantly cheaper than `UFFDIO_COPY` (kernel zeroes in place vs. copying from mmap) and zero pages are common in a freshly booted guest.
+---
 
-**Race safety:** vCPUs resume before the fault handler thread starts — this is safe because the kernel holds faulting vCPUs blocked on the uffd fd until a handler resolves them. There is no window where the guest can access unmapped memory and get a crash rather than a handled fault. The `uffdio_register` call must complete before vCPU resume for this guarantee to hold.
+## 4. Component Design
 
-**Teardown:** On VM destroy, `vm->destroyed` flag is set, the uffd fd is closed (this unblocks the `read()` in the fault handler with an error), and both threads are `pthread_join`'d before the mmap region is unmapped.
+### 4.1 Component Graph
 
-**Latency profile with warm page cache (from pool):**
-- vCPU resume to first guest instruction: ~1ms (Firecracker API call overhead)
-- Per-fault resolution (page in cache): ~1–10µs (`UFFDIO_COPY` from mmap, page already in page cache)
-- Per-fault resolution (page cold): ~50–200µs (mmap fault → disk read → `UFFDIO_COPY`)
-- `prefault_worker` races to warm cache: most pages cached within 50–200ms depending on snapshot size and NVMe throughput
-
-### 10.10 Pool Manager — Static Pool with Overflow Queue
-
-**Decision:** Static target pool size, runtime-configurable, with a pending-request overflow queue and a configurable drain timeout.
-
-**Configuration (read at daemon startup from config file or env vars):**
 ```
-SANDBOX_POOL_SIZE=5              # target number of warm VMs to maintain
-SANDBOX_POOL_WAIT_TIMEOUT_MS=500 # max time a queued request waits before POOL_EXHAUSTED
-SANDBOX_POOL_MAX_QUEUE_DEPTH=50  # max pending requests before immediate rejection
+┌─────────────────────────────────────────────────────────────┐
+│  Client Process (uses libsandbox.so)                        │
+│    ↓  SOCK_SEQPACKET + protobuf                             │
+├─────────────────────────────────────────────────────────────┤
+│  Sandbox Engine Daemon (sandboxd)                           │
+│                                                              │
+│  ┌──────────────┐        ┌──────────────┐                  │
+│  │ IPC Server   │───────→│ Session Mgr  │                  │
+│  │ (epoll loop) │        │ (per-client  │                  │
+│  └──────────────┘        │  state)      │                  │
+│         ↓                └──────────────┘                   │
+│  ┌──────────────────────────────────────────┐              │
+│  │         Pool Manager                     │              │
+│  │  - warm VM queue                         │              │
+│  │  - overflow request queue                │              │
+│  │  - replenishment thread                  │              │
+│  └──────────────────────────────────────────┘              │
+│         ↓                       ↓                           │
+│  ┌──────────────┐        ┌──────────────┐                  │
+│  │ VMM Manager  │        │ Snapshot Mgr │                  │
+│  │ (Firecracker │        │ (template    │                  │
+│  │  lifecycle)  │        │  creation)   │                  │
+│  └──────────────┘        └──────────────┘                  │
+│         ↓                       ↓                           │
+│  ┌──────────────┐        ┌──────────────┐                  │
+│  │ Jailer       │        │ UFFD Handler │                  │
+│  │ (chroot +    │        │ (page fault  │                  │
+│  │  seccomp)    │        │  resolution) │                  │
+│  └──────────────┘        └──────────────┘                  │
+│         ↓                       ↓                           │
+│  ┌──────────────┐        ┌──────────────┐                  │
+│  │ Network Mgr  │        │ Prefault Wkr │                  │
+│  │ (tap devices)│        │ (background  │                  │
+│  └──────────────┘        │  streaming)  │                  │
+│                          └──────────────┘                  │
+└─────────────────────────────────────────────────────────────┘
+         ↓                              ↓
+┌──────────────────┐         ┌──────────────────┐
+│ Firecracker VMM  │         │ Credential Broker│
+│ (per VM, uid     │         │ (separate proc,  │
+│  65534, jailed)  │         │  holds API keys) │
+└──────────────────┘         └──────────────────┘
+         ↓                              ↑
+┌──────────────────┐                    │
+│ Guest VM         │                    │
+│ (KVM boundary)   │────────────────────┘
+│                  │  HTTP to 169.254.0.1:8080
+└──────────────────┘
 ```
+
+### 4.2 Threading Model
+
+| Thread | Lifecycle | Purpose |
+|---|---|---|
+| Main (IPC server) | Daemon lifetime | `epoll_wait()` on client connections + pidfd events |
+| Replenishment thread | Daemon lifetime | Blocks on condition variable, restores VMs from snapshot when pool drains |
+| Per-VM uffd_handler | VM restore → destroy | Blocks on `read(uffd_fd)`, serves page faults synchronously |
+| Per-VM prefault_worker | VM restore → destroy | Streams snapshot pages into page cache in background |
+
+---
+
+## 5. Detailed Component Specifications
+
+### 5.1 Pool Manager
+
+**Responsibility:** Maintain a fixed-size pool of warm VMs, serve provision requests from the pool, queue overflow requests.
 
 **Data structures:**
+
 ```c
 typedef struct {
-    // Warm VMs ready to hand off — restored from snapshot, vCPUs paused, uffd armed
-    vm_handle_t  warm_queue[POOL_MAX_SIZE];
-    int          warm_head, warm_tail, warm_count;
-
-    // Pending requests waiting for a warm VM to become available
-    pending_req_t overflow_queue[POOL_MAX_QUEUE_DEPTH];
-    int           overflow_head, overflow_tail, overflow_count;
-
+    vm_handle_t* warm_queue[POOL_MAX_SIZE];  // Circular buffer
+    int warm_head, warm_tail, warm_count;
+    
+    pending_request_t* overflow_queue[POOL_MAX_QUEUE_DEPTH];
+    int overflow_head, overflow_tail, overflow_count;
+    
+    int target_size;        // Runtime-configurable (from config file)
+    int restoring_count;    // VMs currently being restored (not yet warm)
+    
     pthread_mutex_t lock;
-    pthread_cond_t  vm_available;   // signaled when a warm VM is enqueued
-    pthread_cond_t  slot_available; // signaled when replenishment can start
-
-    int  target_size;
-    int  restoring_count;  // VMs currently being restored (in flight)
+    pthread_cond_t vm_available;    // Signaled when warm VM enqueued
+    pthread_cond_t slot_available;  // Signaled when replenishment can start
     bool shutdown;
 } pool_manager_t;
 ```
 
-**Critical invariant:**
-```
+**Invariant:**
+```c
 warm_count + restoring_count <= target_size
 ```
-The pool never starts more restore operations than needed to reach `target_size`. This prevents runaway memory consumption if restores pile up while the pool is draining fast.
 
-**`sandbox_create()` fast path (warm VM available):**
+**Critical paths:**
+
+1. **Provision from warm pool (fast path):**
 ```c
 pthread_mutex_lock(&pool->lock);
 if (pool->warm_count > 0) {
-    vm = dequeue_warm(pool);          // O(1)
-    pool->restoring_count++;          // account for replenishment about to start
+    vm = pool->warm_queue[pool->warm_head];
+    pool->warm_head = (pool->warm_head + 1) % POOL_MAX_SIZE;
+    pool->warm_count--;
+    pool->restoring_count++;  // Reserve slot for replenishment
     pthread_cond_signal(&pool->slot_available);
     pthread_mutex_unlock(&pool->lock);
-    // hand vm to caller — network setup, vCPU resume happen outside the lock
-    return vm;
+    return vm;  // < 1ms if pool hit
 }
 ```
 
-**`sandbox_create()` slow path (pool exhausted — overflow queue):**
+2. **Provision with overflow queue (slow path):**
 ```c
 if (pool->overflow_count >= POOL_MAX_QUEUE_DEPTH) {
-    pthread_mutex_unlock(&pool->lock);
-    return SANDBOX_ERR_POOL_EXHAUSTED;  // immediate rejection, queue full
+    return SANDBOX_ERR_POOL_EXHAUSTED;  // Immediate rejection
 }
-pending_req_t req = { .result = NULL, .ready = false };
+pending_request_t req = { .result = NULL, .ready = false };
 enqueue_overflow(pool, &req);
-struct timespec deadline = now_plus_ms(pool->wait_timeout_ms);
+struct timespec deadline = now_plus_ms(spec->pool_wait_ms);
 while (!req.ready && !pool->shutdown) {
     int rc = pthread_cond_timedwait(&pool->vm_available, &pool->lock, &deadline);
     if (rc == ETIMEDOUT) {
         dequeue_overflow(pool, &req);
-        pthread_mutex_unlock(&pool->lock);
-        return SANDBOX_ERR_POOL_EXHAUSTED;  // timed out waiting
+        return SANDBOX_ERR_POOL_EXHAUSTED;
     }
 }
-vm = req.result;
-pthread_mutex_unlock(&pool->lock);
-return vm;
+return req.result;  // Handed off by replenishment thread
 ```
 
-**Replenishment thread (runs continuously in background):**
+3. **Replenishment thread:**
 ```c
-void* replenishment_fn(void* arg) {
+void* replenishment_thread(void* arg) {
     pool_manager_t* pool = arg;
     for (;;) {
         pthread_mutex_lock(&pool->lock);
-        // Wait until we're below target and not already restoring enough
-        while ((pool->warm_count + pool->restoring_count >= pool->target_size)
-               && !pool->shutdown) {
+        while (pool->warm_count + pool->restoring_count >= pool->target_size) {
             pthread_cond_wait(&pool->slot_available, &pool->lock);
         }
-        if (pool->shutdown) break;
         pool->restoring_count++;
         pthread_mutex_unlock(&pool->lock);
-
-        // Restore a VM from snapshot (blocking, outside the lock)
-        vm_handle_t vm = restore_vm_from_snapshot();  // ~83ms
-
+        
+        // Restore VM from snapshot (blocking, ~83ms)
+        vm_handle_t* vm = restore_vm_from_snapshot();
+        
         pthread_mutex_lock(&pool->lock);
         pool->restoring_count--;
         if (pool->overflow_count > 0) {
-            // Hand directly to a waiting caller — don't re-pool
-            pending_req_t* req = peek_overflow(pool);
+            // Hand directly to waiting caller
+            pending_request_t* req = peek_overflow(pool);
             req->result = vm;
-            req->ready  = true;
+            req->ready = true;
             dequeue_overflow(pool, req);
             pthread_cond_broadcast(&pool->vm_available);
         } else {
-            enqueue_warm(pool, vm);
+            // Enqueue to warm pool
+            pool->warm_queue[pool->warm_tail] = vm;
+            pool->warm_tail = (pool->warm_tail + 1) % POOL_MAX_SIZE;
+            pool->warm_count++;
         }
         pthread_mutex_unlock(&pool->lock);
     }
 }
 ```
 
-**On VM destroy:** the destroyed VM's memory is reclaimed; `restoring_count` does not change (the destroyed VM was already handed off and is no longer counted); `slot_available` is signaled so replenishment can fill the gap.
-
-**On daemon shutdown:** `pool->shutdown = true`, broadcast both condition variables, join the replenishment thread, destroy all warm VMs in the queue.
-
-**Observability:** `telemetry` tracks `pool_warm_count`, `pool_restoring_count`, `pool_overflow_depth`, and `pool_exhaustion_count` as live metrics — these are the primary operational health signals for the pool.
-
-### 10.11 Snapshot Storage Layout
-
-**Decision:** Flat file pair per template, with a versioned binary manifest. No content-addressed deduplication.
-
-**On-disk layout:**
-```
-/var/lib/sandbox-engine/
-  snapshots/
-    <template-name>/          # e.g. "python-agent", "node-agent"
-      vmstate                 # Firecracker microVM state file (~KB, JSON+binary)
-      memory.snap             # raw guest memory dump (memory_mib × 1MiB, sparse file)
-      manifest.bin            # page bitmap + metadata (see format below)
-  config/
-    engine.conf               # daemon configuration (pool size, timeouts, etc.)
+**Configuration (runtime):**
+```ini
+# /var/lib/sandbox-engine/config/engine.conf
+[pool]
+target_size = 5
+max_queue_depth = 50
+pool_wait_timeout_ms = 500
 ```
 
-**`manifest.bin` format:**
+---
+
+### 5.2 UFFD Handler
+
+**Responsibility:** Serve guest page faults on-demand from mmap'd snapshot file. One thread per VM.
+
+**Setup sequence (on restore):**
+
 ```c
-typedef struct {
-    uint32_t magic;           // 0x534E4150 ("SNAP")
-    uint32_t version;         // incremented on every template rebuild
-    uint64_t guest_mem_size;  // total guest memory in bytes
-    uint32_t page_size;       // always 4096
-    uint32_t page_count;      // guest_mem_size / page_size
-    uint8_t  page_bitmap[];   // 1 bit per page: 1=present in snapshot, 0=zero page
-                               // packed, ceil(page_count / 8) bytes
-} snap_manifest_t;
+// 1. mmap snapshot into daemon address space
+void* snap_base = mmap(NULL, snap_size, PROT_READ, MAP_SHARED, snap_fd, 0);
+
+// 2. Register guest memory region with userfaultfd
+int uffd_fd = syscall(SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK);
+struct uffdio_api api = { .api = UFFD_API, .features = 0 };
+ioctl(uffd_fd, UFFDIO_API, &api);
+
+struct uffdio_register reg = {
+    .range = { .start = (uint64_t)guest_mem_base, .len = guest_mem_size },
+    .mode = UFFDIO_REGISTER_MODE_MISSING,
+};
+ioctl(uffd_fd, UFFDIO_REGISTER, &reg);
+
+// 3. Spawn fault handler thread BEFORE vCPU resume
+pthread_create(&vm->uffd_thread, NULL, uffd_thread_fn, vm);
+
+// 4. Resume vCPUs — guest starts executing, faults delegated to uffd_fd
+vmm_resume_vcpus(vm);
 ```
 
-**Version check at pool startup:**
+**Fault handler loop:**
+
 ```c
-// pool_manager reads manifest version on startup and after any template rebuild
-uint32_t loaded_version = read_manifest_version(snap_dir);
-if (loaded_version != pool->expected_version) {
-    // Drain warm queue, destroy all warm VMs, restart replenishment
-    // from the new snapshot. Prevents restoring stale VMs after a
-    // template rebuild without a daemon restart.
-    pool_flush_and_rebuild(pool, loaded_version);
+void* uffd_thread_fn(void* arg) {
+    vm_handle_t* vm = arg;
+    struct uffd_msg msg;
+    
+    for (;;) {
+        ssize_t nread = read(vm->uffd_fd, &msg, sizeof(msg));
+        if (nread <= 0) break;  // fd closed (VM destroyed) or error
+        
+        if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
+        
+        uint64_t fault_addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
+        uint64_t offset = fault_addr - (uint64_t)vm->guest_mem_base;
+        
+        if (snapshot_page_present(vm->manifest, offset)) {
+            // Non-zero page: copy from snapshot
+            struct uffdio_copy copy = {
+                .dst = fault_addr,
+                .src = (uint64_t)(vm->snap_base + offset),
+                .len = PAGE_SIZE,
+                .mode = 0,
+            };
+            ioctl(vm->uffd_fd, UFFDIO_COPY, &copy);
+        } else {
+            // Zero page: kernel maps zero page (cheaper than copy)
+            struct uffdio_zeropage zero = {
+                .range = { .start = fault_addr, .len = PAGE_SIZE },
+                .mode = 0,
+            };
+            ioctl(vm->uffd_fd, UFFDIO_ZEROPAGE, &zero);
+        }
+    }
+    return NULL;
 }
 ```
 
-**Snapshot write path (template creation):**
-```
-1. snapshot_manager calls Firecracker API: pause vCPUs
-2. snapshot_manager calls Firecracker API: create_snapshot
-     → Firecracker writes vmstate + memory.snap atomically to a temp directory
-3. snapshot_manager scans memory.snap page-by-page, builds page_bitmap
-4. snapshot_manager increments version, writes manifest.bin
-5. snapshot_manager atomically renames temp directory to final path (rename(2))
-     → rename is atomic on Linux for same-filesystem moves — no partial snapshot visible
-6. snapshot_manager signals pool_manager: new version available
-```
+**Race safety:** The `uffdio_register` call must complete before `vmm_resume_vcpus()`. The kernel holds faulting vCPUs blocked until the handler serves the fault — no window for unhandled guest page access.
 
-**Snapshot read path (restore):**
-```
-1. snapshot_manager opens vmstate, memory.snap, manifest.bin from template directory
-2. memory.snap is mmap(MAP_SHARED | MAP_POPULATE=false) into daemon address space
-     → MAP_POPULATE omitted intentionally: we want on-demand faulting, not eager load
-3. manifest.bin is read fully into heap (small — 128MB guest = 32768 pages = 4KB bitmap)
-4. vmstate path + mmap base + manifest pointer passed to uffd_handler and vmm_manager
-5. vmm_manager calls Firecracker API: load_snapshot(vmstate_path, mem_file_path)
-6. Firecracker maps guest memory region — this is the region registered with userfaultfd
-7. uffd_handler thread starts, registers guest region, arms uffd
-8. vmm_manager calls Firecracker API: resume vCPUs
-```
+**Latency profile:**
+- Page in page cache: ~1–10µs (`UFFDIO_COPY` from mmap, no disk I/O)
+- Page cold (not in cache): ~50–200µs (mmap fault triggers disk read, then `UFFDIO_COPY`)
+- `prefault_worker` races to warm cache within 50–200ms post-resume
 
-**Sparse file note:** `memory.snap` should be created as a sparse file — Firecracker's snapshot writer already does this for zero pages. A 512MB guest with mostly-zero memory costs much less than 512MB on disk. The `manifest.bin` bitmap lets the fault handler skip reading zero-page regions entirely (served via `UFFDIO_ZEROPAGE` at no disk cost).
+---
 
-### 10.12 Credential Brokering — HTTP Proxy + Session Tokens
+### 5.3 Prefault Worker
 
-**Decision:** HTTP proxy on the tap network interface at link-local address `169.254.0.1:8080`. Guest→proxy leg is plain HTTP (link-local, never leaves host). Proxy→upstream leg is real HTTPS. Session tokens authenticate each request — no long-lived credentials ever enter the guest.
+**Responsibility:** Stream snapshot pages into page cache in background after vCPU resume.
 
-**Network topology:**
-```
-Guest VM (tap0, 169.254.0.2)
-  │  plain HTTP  (link-local, internal only)
-  ▼
-Host broker process (169.254.0.1:8080)
-  │  validates session token
-  │  strips X-Sandbox-Token header
-  │  injects real credential (API key / Bearer token)
-  ▼  real HTTPS
-External service (api.openai.com, s3.amazonaws.com, etc.)
-```
+**Thread function:**
 
-**Session token lifecycle:**
 ```c
-// On sandbox_create(), engine daemon generates a session token:
-uint8_t token_bytes[32];
-getrandom(token_bytes, sizeof(token_bytes), 0);  // kernel CSPRNG, no /dev/urandom fd needed
-char token_hex[65];
-bytes_to_hex(token_bytes, 32, token_hex);  // 64-char hex string
+void* prefault_worker_fn(void* arg) {
+    vm_handle_t* vm = arg;
+    
+    // Advise kernel: sequential read-ahead
+    madvise(vm->snap_base, vm->snap_size, MADV_SEQUENTIAL);
+    
+    // Touch every page to fault it into page cache
+    for (size_t off = 0; off < vm->snap_size; off += PAGE_SIZE) {
+        if (vm->destroyed) break;  // Early exit if VM destroyed mid-stream
+        
+        volatile uint8_t touch = *((uint8_t*)vm->snap_base + off);
+        (void)touch;  // Suppress unused warning
+    }
+    return NULL;
+}
+```
 
-// Token is stored in broker's in-memory session table:
+**Coordination with uffd_handler:** No explicit coordination needed. Both threads read from the same mmap region. The `uffd_handler` serves faults synchronously on-demand; `prefault_worker` races to populate the page cache so subsequent faults hit cache instead of disk.
+
+---
+
+### 5.4 Jailer
+
+**Responsibility:** Confine and privilege-drop the Firecracker VMM process before it handles any guest input.
+
+**Execution sequence:**
+
+```c
+// Called by vmm_manager when spawning a new Firecracker process
+int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {
+    pid_t pid = fork();
+    if (pid != 0) return pid;  // Parent returns child PID
+    
+    // Child becomes the Jailer, then execs Firecracker
+    
+    // 1. Create jail directory structure
+    char jail_root[PATH_MAX];
+    snprintf(jail_root, sizeof(jail_root), "/var/lib/sandbox-engine/jail/%s", vm_id);
+    mkdir_recursive(jail_root, 0755);
+    
+    // 2. Bind-mount /dev/kvm, /dev/net/tun into jail
+    mount_jail_devices(jail_root);
+    
+    // 3. chroot into jail
+    chroot(jail_root);
+    chdir("/");
+    
+    // 4. Place self in cgroup (memory/CPU limits for VMM process)
+    write_cgroup_procs(config->cgroup_path, getpid());
+    
+    // 5. Drop capabilities (keep only CAP_NET_ADMIN if needed for tap, then drop that too)
+    drop_capabilities();
+    
+    // 6. setuid/setgid to unprivileged uid
+    setgid(config->jailer_gid);  // e.g., 65534
+    setuid(config->jailer_uid);  // e.g., 65534
+    
+    // 7. Apply seccomp filter
+    apply_seccomp_filter();  // Whitelist from §5.5
+    
+    // 8. exec Firecracker
+    execve("/firecracker", firecracker_args, env);
+    _exit(127);  // exec failed
+}
+```
+
+**Jail directory layout:**
+
+```
+/var/lib/sandbox-engine/jail/<vm-id>/
+  dev/
+    kvm          → bind-mount of /dev/kvm
+    net/
+      tun        → bind-mount of /dev/net/tun
+  firecracker    → copy of Firecracker binary
+  api.sock       → Unix socket for Firecracker API (created by Firecracker)
+```
+
+---
+
+### 5.5 Jailer Seccomp Policy
+
+**Default action:** Build-time toggle
+
+```c
+#ifdef NDEBUG
+  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_KILL_PROCESS  // Release
+#else
+  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_ERRNO(EPERM)  // Debug
+#endif
+```
+
+**Whitelist (Firecracker VMM process):**
+
+```c
+int apply_seccomp_filter(void) {
+    scmp_filter_ctx ctx = seccomp_init(JAILER_SECCOMP_DEFAULT);
+    
+    // KVM interaction
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+                     SCMP_A1(SCMP_CMP_MASKED_EQ, 0xFF00, 0xAE00));  // KVM_* ioctls only
+    
+    // Memory management
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mprotect), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mremap), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(madvise), 0);
+    
+    // File I/O (snapshot files, API socket)
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(openat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(lseek), 0);
+    
+    // Signaling
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(signalfd), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigaction), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigprocmask), 0);
+    
+    // Epoll/event loop
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(epoll_create1), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(epoll_ctl), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(epoll_wait), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(eventfd), 0);
+    
+    // Threading
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
+                     SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_VM, CLONE_VM));  // Thread creation only
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(futex), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(set_robust_list), 0);
+    
+    // Process lifecycle
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(getpid), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(tgkill), 0);
+    
+    // Time
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_gettime), 0);
+    seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clock_nanosleep), 0);
+    
+    // Load filter
+    seccomp_load(ctx);
+    seccomp_release(ctx);
+    return 0;
+}
+```
+
+**Critical detail:** `ioctl` is argument-filtered to allow only `KVM_*` commands (`0xAE00` family). Blanket-allowing `ioctl` would undermine the entire filter.
+
+---
+
+### 5.6 Snapshot Manager
+
+**Responsibility:** Create snapshot templates (boot VM, serialize to disk), manage snapshot versions.
+
+**Snapshot layout:**
+
+```
+/var/lib/sandbox-engine/snapshots/<template-name>/
+  vmstate              # Firecracker microVM state file (~KB, JSON+binary)
+  memory.snap          # Guest memory dump (sparse file, memory_mib × 1MiB)
+  manifest.bin         # Page bitmap + metadata
+```
+
+**Manifest format:**
+
+```c
 typedef struct {
-    char     token_hex[65];
-    uint32_t sandbox_id;
-    time_t   created_at;
-    time_t   expires_at;       // = sandbox destroy time or hard TTL, whichever is first
-    char**   allowed_services; // e.g. ["openai", "s3-bucket-name"] — per-sandbox allowlist
-} session_entry_t;
-
-// Token is injected into the guest at boot via kernel cmdline:
-// "sandbox_token=<hex> sandbox_proxy=169.254.0.1:8080"
-// Guest agent reads from /proc/cmdline at startup — no vsock handshake needed
+    uint32_t magic;          // 0x534E4150 ("SNAP")
+    uint32_t version;        // Incremented on every template rebuild
+    uint64_t guest_mem_size; // Total guest memory bytes
+    uint32_t page_size;      // Always 4096
+    uint32_t page_count;     // guest_mem_size / page_size
+    uint8_t  page_bitmap[];  // 1 bit per page: 1=present, 0=zero (packed)
+} snap_manifest_t;
 ```
 
-**Guest-side usage (agent code):**
-```python
-import os, requests
+**Template creation flow:**
 
-PROXY   = os.environ.get("SANDBOX_PROXY", "http://169.254.0.1:8080")
-TOKEN   = open("/proc/cmdline").read().split("sandbox_token=")[1].split()[0]
-HEADERS = {"X-Sandbox-Token": TOKEN}
-
-# Agent calls the proxy over plain HTTP — proxy makes real HTTPS to OpenAI
-resp = requests.post(
-    "http://api.openai.com/v1/chat/completions",  # HTTP scheme — proxy rewrites to HTTPS
-    headers=HEADERS,
-    json={"model": "gpt-4o", "messages": [...]},
-    proxies={"http": PROXY, "https": PROXY},
-)
+```c
+int create_snapshot_template(const char* template_name, const template_config_t* config) {
+    char temp_dir[PATH_MAX];
+    snprintf(temp_dir, sizeof(temp_dir), "/var/lib/sandbox-engine/snapshots/.tmp-%s", template_name);
+    mkdir(temp_dir, 0755);
+    
+    // 1. Boot a fresh VM (cold boot, ~125ms)
+    vm_handle_t* vm = vmm_cold_boot(config);
+    
+    // 2. Wait for application init to complete inside guest
+    //    (Guest signals readiness via vsock or by writing to a known file)
+    wait_for_guest_ready(vm);
+    
+    // 3. Pause vCPUs
+    vmm_pause_vcpus(vm);
+    
+    // 4. Call Firecracker API: create_snapshot
+    char vmstate_path[PATH_MAX], memory_path[PATH_MAX];
+    snprintf(vmstate_path, sizeof(vmstate_path), "%s/vmstate", temp_dir);
+    snprintf(memory_path, sizeof(memory_path), "%s/memory.snap", temp_dir);
+    firecracker_create_snapshot(vm, vmstate_path, memory_path);
+    
+    // 5. Scan memory.snap, build page bitmap
+    snap_manifest_t* manifest = build_manifest(memory_path);
+    manifest->version = read_current_version(template_name) + 1;
+    
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.bin", temp_dir);
+    write_manifest(manifest_path, manifest);
+    
+    // 6. Atomic rename to final path
+    char final_dir[PATH_MAX];
+    snprintf(final_dir, sizeof(final_dir), "/var/lib/sandbox-engine/snapshots/%s", template_name);
+    rename(temp_dir, final_dir);  // Atomic on same filesystem
+    
+    // 7. Destroy template VM
+    vmm_destroy(vm);
+    
+    // 8. Signal pool manager: new version available
+    pool_manager_flush_and_rebuild(template_name, manifest->version);
+    
+    return 0;
+}
 ```
 
-**Broker request handling (per incoming request):**
+**Version check (on daemon startup / pool init):**
+
+```c
+uint32_t loaded_version = read_manifest_version(template_name);
+if (loaded_version != pool->expected_version) {
+    // Drain warm queue, destroy all warm VMs from old snapshot
+    pool_drain(pool);
+    pool->expected_version = loaded_version;
+    // Replenishment thread will rebuild pool from new snapshot
+}
 ```
-1. Parse X-Sandbox-Token header — if missing or malformed → 401
-2. Look up token in session table (O(1) hash map lookup)
-   → if not found or expired → 401
-   → if found: get sandbox_id, allowed_services, credential set
-3. Check target hostname against allowed_services allowlist
-   → if not allowed → 403
-4. Strip X-Sandbox-Token from request headers
-5. Inject real credential:
-   → Authorization: Bearer <real_api_key>  (looked up from broker's in-memory credential store)
-6. Rewrite request URL scheme: http:// → https://
-7. Forward request to upstream over real HTTPS (TLS verified, no MITM)
-8. Stream response back to guest — no buffering of response body
-9. Log: sandbox_id, target service, response status, latency (no request body logged)
+
+---
+
+### 5.7 Network Manager
+
+**Responsibility:** Create tap devices, assign IPs, configure firewall rules to force traffic through broker.
+
+**Per-VM network setup:**
+
+```c
+int network_setup(const char* vm_id, vm_network_t* out_net) {
+    char tap_name[IFNAMSIZ];
+    snprintf(tap_name, sizeof(tap_name), "tap-%s", vm_id);  // e.g., "tap-vm-001"
+    
+    // 1. Create tap device
+    int tap_fd = open("/dev/net/tun", O_RDWR);
+    struct ifreq ifr = {0};
+    strncpy(ifr.ifr_name, tap_name, IFNAMSIZ);
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    ioctl(tap_fd, TUNSETIFF, &ifr);
+    
+    // 2. Bring tap interface up
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+    ioctl(sock, SIOCSIFFLAGS, &ifr);
+    
+    // 3. Assign host-side IP (169.254.0.1)
+    struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
+    addr->sin_family = AF_INET;
+    addr->sin_addr.s_addr = inet_addr("169.254.0.1");
+    ioctl(sock, SIOCSIFADDR, &ifr);
+    close(sock);
+    
+    // 4. Configure nftables rule: force all guest traffic to broker
+    char nft_cmd[1024];
+    snprintf(nft_cmd, sizeof(nft_cmd),
+        "nft add rule ip sandbox_policy forward "
+        "iifname %s ip daddr 169.254.0.1 tcp dport 8080 accept; "
+        "nft add rule ip sandbox_policy forward iifname %s drop",
+        tap_name, tap_name);
+    system(nft_cmd);  // TODO: use libnftables instead of system() in production
+    
+    // 5. Return tap_fd and guest IP to vmm_manager (Firecracker will use this fd)
+    out_net->tap_fd = tap_fd;
+    out_net->guest_ip = inet_addr("169.254.0.2");
+    strncpy(out_net->tap_name, tap_name, IFNAMSIZ);
+    
+    return 0;
+}
 ```
+
+**Cleanup (on VM destroy):**
+
+```c
+int network_cleanup(const vm_network_t* net) {
+    // 1. Delete nftables rules
+    char nft_cmd[1024];
+    snprintf(nft_cmd, sizeof(nft_cmd),
+        "nft delete rule ip sandbox_policy forward handle <handle>");  // TODO: track rule handles
+    system(nft_cmd);
+    
+    // 2. Close tap fd (kernel removes interface)
+    close(net->tap_fd);
+    
+    return 0;
+}
+```
+
+**Network policy enforced:**
+- Guest can reach `169.254.0.1:8080` (broker) only
+- All other outbound traffic is dropped at host firewall
+- No direct internet access from guest
+
+---
+
+### 5.8 Credential Broker
+
+**Responsibility:** Validate session tokens, inject real credentials, proxy HTTP requests to upstream services. Separate process from engine daemon.
 
 **Broker process architecture:**
-- Separate process from the engine daemon — the broker holds credentials, the engine holds none. If the engine daemon has a bug reachable from the API, it cannot exfiltrate credentials it doesn't hold.
-- Broker communicates with engine daemon over a local Unix socket to validate session token→sandbox_id mappings and receive destroy notifications (for token revocation)
-- Broker listens only on `169.254.0.1:8080` — bound to the link-local address, not `0.0.0.0`. Not reachable from outside the host.
-- Credentials loaded at broker startup from a config file (not env vars — env vars leak into `/proc/<pid>/environ`). Config file is `chmod 600`, owned by the broker's uid.
-- Broker drops to an unprivileged uid after binding the port and loading credentials.
 
-**Token revocation on sandbox destroy:**
 ```c
-// engine daemon sends destroy notification to broker over Unix socket
-broker_msg_t msg = {
-    .type       = BROKER_MSG_REVOKE,
-    .sandbox_id = vm->sandbox_id,
-};
-send(broker_sock_fd, &msg, sizeof(msg), 0);
-// broker removes session_entry from table — token immediately invalid
-```
-
-**Network policy integration:** `network_manager` configures an nftables rule that forces all guest TCP port 80/443 traffic through `169.254.0.1:8080` — the guest cannot bypass the proxy by connecting directly to external IPs. Direct outbound connections to non-proxy destinations are dropped at the host firewall level.
-
-```
-nftables rule (applied per-VM on tap interface):
-  table ip sandbox_policy {
-    chain forward {
-      type filter hook forward priority 0;
-      # Allow guest → proxy
-      iifname "tap-<vm_id>" ip daddr 169.254.0.1 tcp dport 8080 accept
-      # Drop all other outbound from guest (no direct internet access)
-      iifname "tap-<vm_id>" drop
+int main(int argc, char** argv) {
+    // 1. Load credentials from config file (chmod 600)
+    credential_store_t* creds = load_credentials("/etc/sandbox-engine/credentials.conf");
+    
+    // 2. Connect to engine daemon over Unix socket (for token validation)
+    int engine_sock = connect_to_engine("/var/run/sandbox-engine/broker-control.sock");
+    
+    // 3. Bind HTTP listener to 169.254.0.1:8080
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = inet_addr("169.254.0.1"),
+        .sin_port = htons(8080),
+    };
+    bind(listen_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(listen_fd, 128);
+    
+    // 4. Drop privileges (after binding privileged port)
+    setgid(broker_gid);
+    setuid(broker_uid);
+    
+    // 5. Accept loop
+    for (;;) {
+        int client_fd = accept(listen_fd, NULL, NULL);
+        handle_request(client_fd, creds, engine_sock);
+        close(client_fd);
     }
-  }
+}
 ```
 
---- (Context, Not Yet Resolved)
+**Request handling:**
 
-The author is planning outreach to a Dedalus Labs engineer with a specific technical question before finalizing architecture, roughly:
+```c
+void handle_request(int client_fd, credential_store_t* creds, int engine_sock) {
+    // 1. Parse HTTP request (headers only — no buffering of body)
+    http_request_t req = parse_http_headers(client_fd);
+    
+    // 2. Extract X-Sandbox-Token header
+    const char* token = http_get_header(&req, "X-Sandbox-Token");
+    if (!token) {
+        send_http_error(client_fd, 401, "Missing token");
+        return;
+    }
+    
+    // 3. Validate token with engine daemon
+    session_info_t session;
+    if (validate_token(engine_sock, token, &session) != 0) {
+        send_http_error(client_fd, 401, "Invalid or expired token");
+        return;
+    }
+    
+    // 4. Check target hostname against allowlist
+    const char* host = http_get_header(&req, "Host");
+    if (!is_allowed(session.allowed_services, host)) {
+        send_http_error(client_fd, 403, "Service not allowed");
+        return;
+    }
+    
+    // 5. Strip X-Sandbox-Token from request
+    http_remove_header(&req, "X-Sandbox-Token");
+    
+    // 6. Inject real credential
+    const char* real_cred = credential_store_lookup(creds, host);
+    http_set_header(&req, "Authorization", real_cred);  // e.g., "Bearer sk-..."
+    
+    // 7. Rewrite scheme: http:// → https://
+    req.scheme = "https";
+    
+    // 8. Forward request to upstream (blocking, use libcurl or custom HTTPS client)
+    http_response_t resp = forward_request_upstream(&req);
+    
+    // 9. Stream response back to guest
+    send_http_response(client_fd, &resp);
+    
+    // 10. Log (sandbox_id, host, status, latency)
+    log_request(session.sandbox_id, host, resp.status, resp.latency_ms);
+}
+```
 
-> Whether namespace-based isolation is fundamentally insufficient for LLM-driven agent execution given prompt-injection risk (i.e., does Dedalus treat "trusted" agent code as still needing hardware isolation), or whether Dedalus treats that as an acceptable risk tier and reserves microVM isolation for specific workload classes — and separately, whether userfaultfd-based snapshot restore is actually what closes their latency gap in production, or whether application-level initialization dominates regardless.
+**Session token validation (via engine daemon):**
 
-**This response, if obtained, should materially inform §6's open questions** — particularly #1 and #2. The implementation session should check whether this conversation happened and what was learned before locking in a direction, rather than proceeding purely from the desk research in this document.
+```c
+// Broker sends validation request to engine over Unix socket
+typedef struct {
+    uint8_t type;           // BROKER_MSG_VALIDATE_TOKEN
+    char token_hex[65];
+} broker_validate_req_t;
+
+typedef struct {
+    uint8_t status;         // 0=valid, 1=invalid
+    uint32_t sandbox_id;
+    char** allowed_services;  // NULL-terminated array
+} broker_validate_resp_t;
+
+int validate_token(int engine_sock, const char* token, session_info_t* out_session) {
+    broker_validate_req_t req = { .type = BROKER_MSG_VALIDATE_TOKEN };
+    strncpy(req.token_hex, token, sizeof(req.token_hex));
+    send(engine_sock, &req, sizeof(req), 0);
+    
+    broker_validate_resp_t resp;
+    recv(engine_sock, &resp, sizeof(resp), MSG_WAITALL);
+    
+    if (resp.status != 0) return -1;
+    
+    out_session->sandbox_id = resp.sandbox_id;
+    out_session->allowed_services = resp.allowed_services;
+    return 0;
+}
+```
 
 ---
 
-## 8. Prior Work Already Done (Reusable Regardless of Final Direction)
+## 6. Data Formats
 
-- Deep study of Linux namespaces, seccomp-bpf, and cgroups v2 fundamentals — completed, notes exist
-- A detailed namespace-only engine architecture was previously designed in full (component breakdown: `ns_manager`, `seccomp_manager`, `cgroup_manager`, `rootfs_manager`, `pool_manager`, `capability_manager`, `lifecycle`, `telemetry`; C ABI sketch with opaque handles and builder-pattern `SandboxSpec`; C++ RAII wrapper sketch; daemon vs. embedded deployment modes; pool-based warm-provisioning design for latency) — this remains a valid and detailed starting point for the namespace backend regardless of whether it ends up as the sole backend or one tier among several
-- A full threat-model / suitability writeup exists comparing namespace sandboxing to VM-grade isolation in general terms (before the microVM-specific research in this document sharpened the AI-agent-specific argument)
-- A comparative table and technical rationale for Firecracker/Cloud Hypervisor/Unikraft/WasmEdge/gVisor exists (this document consolidates and supersedes the narrative version of that research)
+### 6.1 Protobuf Schema (IPC)
 
-**None of this prior work should be treated as a locked decision — it's institutional memory of what's already been explored, provided so the implementation session doesn't have to re-derive it from scratch.**
+**File:** `proto/sandbox.proto`
+
+```protobuf
+syntax = "proto3";
+package sandbox;
+
+// Client → Daemon
+message ClientMessage {
+  oneof payload {
+    CreateRequest  create  = 1;
+    DestroyRequest destroy = 2;
+    PauseRequest   pause   = 3;
+    ResumeRequest  resume  = 4;
+    InspectRequest inspect = 5;
+  }
+}
+
+message CreateRequest {
+  uint64 memory_mib = 1;
+  uint32 vcpu_count = 2;
+  string template_name = 3;
+  repeated string env_vars = 4;  // "KEY=VALUE"
+  uint32 pool_wait_ms = 5;
+}
+
+message DestroyRequest {
+  uint32 sandbox_id = 1;
+}
+
+message PauseRequest {
+  uint32 sandbox_id = 1;
+}
+
+message ResumeRequest {
+  uint32 sandbox_id = 1;
+}
+
+message InspectRequest {
+  uint32 sandbox_id = 1;
+}
+
+// Daemon → Client
+message ServerMessage {
+  oneof payload {
+    CreateResponse  create  = 1;
+    DestroyResponse destroy = 2;
+    ErrorResponse   error   = 3;
+    InspectResponse inspect = 4;
+  }
+}
+
+message CreateResponse {
+  uint32 sandbox_id = 1;
+  string session_token = 2;  // Hex-encoded 256-bit token
+}
+
+message DestroyResponse {
+  uint32 sandbox_id = 1;
+}
+
+message ErrorResponse {
+  int32 error_code = 1;       // Maps to sandbox_error_t
+  string error_message = 2;
+}
+
+message InspectResponse {
+  uint32 sandbox_id = 1;
+  bool is_running = 2;
+  uint64 uptime_ms = 3;
+  uint64 memory_rss_mib = 4;
+  uint32 page_faults = 5;
+}
+```
+
+**Wire format:**
+```
+[ 4 bytes: uint32 message length (big-endian) ]
+[ N bytes: serialized protobuf message ]
+```
 
 ---
 
-## 9. Suggested First Actions for the Implementation Session
+## 7. Configuration Files
 
-Not a plan, just a suggested entry point:
+### 7.1 Engine Configuration
 
-1. Check whether the Dedalus outreach (§7) produced a response; if so, weigh it heavily in resolving §6.1/6.2.
-2. If no response yet, make an explicit, stated assumption about §6.1 (single vs. multi-backend) and §6.2 (which backend), document the reasoning, and proceed — don't let an unanswered outreach block progress indefinitely.
-3. Whatever backend is chosen first, treat the "Jailer" pattern (§4) as a near-term follow-on regardless, since it's valuable under every scenario in §6.1/6.2.
-4. Treat credential brokering (§5) as a separate, parallel research task — it doesn't block isolation-backend implementation and shouldn't be an afterthought bolted on at the end.
+**File:** `/var/lib/sandbox-engine/config/engine.conf`
+
+```ini
+[daemon]
+socket_path = /var/run/sandbox-engine/engine.sock
+jailer_uid = 65534
+jailer_gid = 65534
+
+[pool]
+target_size = 5
+max_queue_depth = 50
+pool_wait_timeout_ms = 500
+
+[paths]
+jail_root = /var/lib/sandbox-engine/jail
+snapshot_root = /var/lib/sandbox-engine/snapshots
+```
+
+### 7.2 Broker Credentials
+
+**File:** `/etc/sandbox-engine/credentials.conf` (chmod 600, owned by broker uid)
+
+```ini
+[api.openai.com]
+credential = Bearer sk-proj-...
+
+[s3.amazonaws.com]
+credential = AWS4-HMAC-SHA256 ...
+```
+
+---
+
+## 8. Build System
+
+### 8.1 CMakeLists.txt (Top-level)
+
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(sandbox-engine C CXX)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
+
+# Build types
+set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
+set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
+
+# Dependencies
+find_package(Protobuf REQUIRED)
+find_library(SECCOMP_LIB seccomp REQUIRED)
+
+# Protobuf code generation
+protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS proto/sandbox.proto)
+
+# Core library
+add_library(sandbox SHARED
+    src/pool_manager.c
+    src/uffd_handler.c
+    src/prefault_worker.c
+    src/vmm_manager.c
+    src/snapshot_manager.c
+    src/network_manager.c
+    src/jailer.c
+    src/seccomp.c
+    src/lifecycle.c
+    src/telemetry.c
+    src/ipc_server.c
+    ${PROTO_SRCS}
+)
+target_link_libraries(sandbox ${SECCOMP_LIB} ${Protobuf_LIBRARIES} pthread)
+
+# C++ wrapper
+add_library(sandbox++ SHARED
+    src/cpp/sandbox.cpp
+)
+target_link_libraries(sandbox++ sandbox)
+
+# Daemon
+add_executable(sandboxd
+    src/daemon/main.c
+)
+target_link_libraries(sandboxd sandbox)
+
+# Broker
+add_executable(sandbox-broker
+    src/broker/main.c
+    src/broker/http.c
+    src/broker/credentials.c
+)
+
+# CLI tool
+add_executable(sandbox-cli
+    src/cli/main.c
+)
+target_link_libraries(sandbox-cli sandbox++)
+
+# Tests
+enable_testing()
+add_subdirectory(tests)
+```
+
+---
+
+## 9. Testing Strategy
+
+### 9.1 Unit Tests
+
+| Component | Test Coverage |
+|---|---|
+| Pool manager | Warm queue, overflow queue, replenishment, invariant checks |
+| UFFD handler | Page fault dispatch, zero page vs. copy, race conditions |
+| Jailer | Seccomp filter correctness (syscall allow/deny), chroot isolation |
+| Snapshot manager | Manifest generation, version increment, atomic rename |
+| Network manager | Tap creation, IP assignment, firewall rule application |
+
+### 9.2 Integration Tests
+
+| Test Case | Pass Criteria |
+|---|---|
+| Provision from warm pool | < 100ms end-to-end |
+| Provision with pool exhaustion | Overflow queue blocks, timeout fires |
+| Snapshot restore | Guest resumes at correct instruction, memory intact |
+| Credential brokering | Guest HTTP call succeeds, real API key never in guest |
+| VMM crash recovery | Lifecycle manager detects pidfd event, pool replenishes |
+
+### 9.3 Stress Tests
+
+- Concurrent provision (100 requests in 1 second)
+- Pool churn (create/destroy loop for 1 hour)
+- Large snapshot (2GB guest, verify uffd latency profile)
+
+---
+
+## 10. Deployment
+
+### 10.1 System Requirements
+
+- Linux kernel >= 5.10 (userfaultfd, cgroups v2, KVM)
+- `/dev/kvm` accessible
+- 4GB+ RAM (for pool of 5 × 512MB guests)
+- NVMe storage (snapshot loading performance)
+
+### 10.2 Installation
+
+```bash
+# 1. Install dependencies
+apt-get install firecracker libseccomp-dev protobuf-compiler
+
+# 2. Build engine
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
+
+# 3. Install binaries
+sudo install -m 755 build/sandboxd /usr/local/bin/
+sudo install -m 755 build/sandbox-broker /usr/local/bin/
+sudo install -m 755 build/libsandbox.so /usr/local/lib/
+
+# 4. Create directories
+sudo mkdir -p /var/lib/sandbox-engine/{jail,snapshots,config}
+sudo mkdir -p /var/run/sandbox-engine
+
+# 5. Install config
+sudo install -m 644 config/engine.conf /var/lib/sandbox-engine/config/
+sudo install -m 600 config/credentials.conf /etc/sandbox-engine/
+
+# 6. Create systemd service
+sudo install -m 644 systemd/sandboxd.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now sandboxd
+```
+
+### 10.3 Systemd Service
+
+**File:** `systemd/sandboxd.service`
+
+```ini
+[Unit]
+Description=Sandbox Engine Daemon
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandboxd
+Restart=on-failure
+RestartSec=5s
+
+# Security hardening
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sandbox-engine /var/run/sandbox-engine
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 11. Observability
+
+### 11.1 Metrics (Prometheus format)
+
+```
+sandbox_pool_warm_count         # Current warm VMs in pool
+sandbox_pool_restoring_count    # VMs currently being restored
+sandbox_pool_overflow_depth     # Pending requests in overflow queue
+sandbox_pool_exhaustion_total   # Cumulative pool exhaustions
+sandbox_provision_latency_ms    # Histogram: sandbox_create() latency
+sandbox_uffd_faults_total       # Cumulative page faults served
+sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
+```
+
+### 11.2 Structured Logging
+
+```json
+{
+  "timestamp": "2025-09-12T10:15:32Z",
+  "level": "INFO",
+  "component": "pool_manager",
+  "event": "provision_from_pool",
+  "sandbox_id": 42,
+  "latency_ms": 87,
+  "pool_state": {"warm": 4, "restoring": 1, "overflow": 0}
+}
+```
+
+---
+
+## 12. Security Considerations
+
+### 12.1 Threat Model
+
+| Threat | Mitigation | Residual Risk |
+|---|---|---|
+| Guest kernel escape | KVM hardware boundary | Zero-day in KVM itself |
+| VMM compromise | Jailer (chroot + seccomp + unprivileged uid) | Bug in Jailer setup code |
+| Credential exfiltration | Session tokens only, broker validates | Token leaked within sandbox lifetime |
+| Host DoS via resource exhaustion | Cgroups on VMM process, pool size limit | Engine daemon itself has no resource limit |
+| Snapshot poisoning | Atomic rename, checksum in manifest | TOCTOU if snapshot dir writable by attacker |
+
+### 12.2 Audit Checklist (Pre-Production)
+
+- [ ] Seccomp filter tested against Firecracker syscall trace
+- [ ] Jailer chroot verified (no escape via /proc/self/root)
+- [ ] Credential config file permissions (chmod 600, root-owned)
+- [ ] Engine daemon runs with `PR_SET_NO_NEW_PRIVS` after setup
+- [ ] Network policy tested (guest cannot reach internet directly)
+- [ ] Broker TLS cert validation enabled (HTTPS to upstream)
+- [ ] Session token entropy (getrandom, not /dev/urandom)
+
+---
+
+## 13. Future Enhancements (Out of Scope for V1)
+
+- Dynamic pool auto-scaling (PID controller based on request rate)
+- Content-addressed snapshot store (dedup shared pages across templates)
+- Snapshot delta encoding (store only changed pages vs. base)
+- GPU passthrough for local model inference (requires Cloud Hypervisor)
+- Multi-tenant isolation (per-client pool quotas, accounting)
+- Distributed engine (pool spread across multiple hosts, central scheduler)
+
+---
+
+## 14. References
+
+- Firecracker design paper: [NSDI 2020](https://www.usenix.org/conference/nsdi20/presentation/agache)
+- userfaultfd man page: `man 2 userfaultfd`
+- libseccomp docs: https://github.com/seccomp/libseccomp
+- KVM API: https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt
+- Protobuf C++: https://protobuf.dev/reference/cpp/
+
+---
+
+**Document Version:** 1.0  
+**Last Updated:** 2025-09-12  
+**Status:** Implementation-ready
