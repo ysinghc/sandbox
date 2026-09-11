@@ -218,7 +218,7 @@ These are the isolation mechanisms researched, presented as options with their a
 
 **What this decision does not foreclose:** The Jailer pattern (§4) and credential brokering (§5) are still in scope as separate workstreams — they are orthogonal to backend choice and remain fully valid under a single-backend design.
 
-**Remaining open question:** Which backend? — resolved in §6.2 below.
+**Backend decision:** Firecracker + userfaultfd snapshot/restore — resolved below in §2.3 and §6.
 
 ---
 
