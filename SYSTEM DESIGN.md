@@ -683,10 +683,77 @@ void* replenishment_fn(void* arg) {
 
 **Observability:** `telemetry` tracks `pool_warm_count`, `pool_restoring_count`, `pool_overflow_depth`, and `pool_exhaustion_count` as live metrics — these are the primary operational health signals for the pool.
 
+### 10.11 Snapshot Storage Layout
+
+**Decision:** Flat file pair per template, with a versioned binary manifest. No content-addressed deduplication.
+
+**On-disk layout:**
+```
+/var/lib/sandbox-engine/
+  snapshots/
+    <template-name>/          # e.g. "python-agent", "node-agent"
+      vmstate                 # Firecracker microVM state file (~KB, JSON+binary)
+      memory.snap             # raw guest memory dump (memory_mib × 1MiB, sparse file)
+      manifest.bin            # page bitmap + metadata (see format below)
+  config/
+    engine.conf               # daemon configuration (pool size, timeouts, etc.)
+```
+
+**`manifest.bin` format:**
+```c
+typedef struct {
+    uint32_t magic;           // 0x534E4150 ("SNAP")
+    uint32_t version;         // incremented on every template rebuild
+    uint64_t guest_mem_size;  // total guest memory in bytes
+    uint32_t page_size;       // always 4096
+    uint32_t page_count;      // guest_mem_size / page_size
+    uint8_t  page_bitmap[];   // 1 bit per page: 1=present in snapshot, 0=zero page
+                               // packed, ceil(page_count / 8) bytes
+} snap_manifest_t;
+```
+
+**Version check at pool startup:**
+```c
+// pool_manager reads manifest version on startup and after any template rebuild
+uint32_t loaded_version = read_manifest_version(snap_dir);
+if (loaded_version != pool->expected_version) {
+    // Drain warm queue, destroy all warm VMs, restart replenishment
+    // from the new snapshot. Prevents restoring stale VMs after a
+    // template rebuild without a daemon restart.
+    pool_flush_and_rebuild(pool, loaded_version);
+}
+```
+
+**Snapshot write path (template creation):**
+```
+1. snapshot_manager calls Firecracker API: pause vCPUs
+2. snapshot_manager calls Firecracker API: create_snapshot
+     → Firecracker writes vmstate + memory.snap atomically to a temp directory
+3. snapshot_manager scans memory.snap page-by-page, builds page_bitmap
+4. snapshot_manager increments version, writes manifest.bin
+5. snapshot_manager atomically renames temp directory to final path (rename(2))
+     → rename is atomic on Linux for same-filesystem moves — no partial snapshot visible
+6. snapshot_manager signals pool_manager: new version available
+```
+
+**Snapshot read path (restore):**
+```
+1. snapshot_manager opens vmstate, memory.snap, manifest.bin from template directory
+2. memory.snap is mmap(MAP_SHARED | MAP_POPULATE=false) into daemon address space
+     → MAP_POPULATE omitted intentionally: we want on-demand faulting, not eager load
+3. manifest.bin is read fully into heap (small — 128MB guest = 32768 pages = 4KB bitmap)
+4. vmstate path + mmap base + manifest pointer passed to uffd_handler and vmm_manager
+5. vmm_manager calls Firecracker API: load_snapshot(vmstate_path, mem_file_path)
+6. Firecracker maps guest memory region — this is the region registered with userfaultfd
+7. uffd_handler thread starts, registers guest region, arms uffd
+8. vmm_manager calls Firecracker API: resume vCPUs
+```
+
+**Sparse file note:** `memory.snap` should be created as a sparse file — Firecracker's snapshot writer already does this for zero pages. A 512MB guest with mostly-zero memory costs much less than 512MB on disk. The `manifest.bin` bitmap lets the fault handler skip reading zero-page regions entirely (served via `UFFDIO_ZEROPAGE` at no disk cost).
+
 ### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
 
 - Credential brokering design (§5 / §6 item 7)
-- Snapshot storage layout (single flat file vs. content-addressed page store)
 
 --- (Context, Not Yet Resolved)
 
