@@ -489,10 +489,89 @@ On VM pidfd readable (VMM died):
 
 **Session ownership model:** All sandboxes created within a session are owned by that session. If the client disconnects (clean close or crash), the daemon destroys all owned sandboxes. No orphaned VMs.
 
+### 10.9 `uffd_handler` — Threading Model and Page Resolution
+
+**Decision:** One dedicated fault-handler thread per VM. Snapshot file is `mmap`'d into the daemon's address space at restore time. Faults are resolved by `UFFDIO_COPY` from the mmap region. A separate `prefault_worker` thread per VM streams the snapshot into page cache in the background.
+
+**Why one thread per VM:** At pool sizes of 5–20 VMs, linear thread scaling is trivially cheap. Each thread blocks silently on `read(uffd_fd)` when idle. A slow page resolution for one VM blocks only that VM's thread — zero cross-VM interference. No locks, no shared state between fault handlers.
+
+**Full restore sequence for one VM:**
+
+```c
+// 1. snapshot_manager maps the snapshot into daemon address space at restore time
+void* snap_base = mmap(NULL, snap_size, PROT_READ, MAP_SHARED, snap_fd, 0);
+// snap_base is now the source for all UFFDIO_COPY operations
+
+// 2. Register guest physical memory region with userfaultfd
+struct uffdio_register reg = {
+    .range = { .start = (uint64_t)guest_mem_base, .len = guest_mem_size },
+    .mode  = UFFDIO_REGISTER_MODE_MISSING,
+};
+ioctl(uffd_fd, UFFDIO_REGISTER, &reg);
+
+// 3. Resume vCPUs via Firecracker API — guest starts executing immediately,
+//    page faults on unmapped pages are delegated to uffd_fd instead of SIGSEGV
+
+// 4. uffd_handler thread (one per VM):
+void* uffd_thread_fn(void* arg) {
+    vm_t* vm = arg;
+    struct uffd_msg msg;
+    for (;;) {
+        read(vm->uffd_fd, &msg, sizeof(msg));  // blocks until fault
+        if (msg.event != UFFD_EVENT_PAGEFAULT) continue;
+
+        uint64_t fault_addr = msg.arg.pagefault.address & ~(PAGE_SIZE - 1);
+        uint64_t offset     = fault_addr - (uint64_t)vm->guest_mem_base;
+
+        // Check snapshot page map: is this page non-zero in the snapshot?
+        if (snapshot_page_is_present(vm->snap_manifest, offset)) {
+            struct uffdio_copy copy = {
+                .dst  = fault_addr,
+                .src  = (uint64_t)(vm->snap_base + offset),  // from mmap region
+                .len  = PAGE_SIZE,
+                .mode = 0,
+            };
+            ioctl(vm->uffd_fd, UFFDIO_COPY, &copy);
+        } else {
+            struct uffdio_zeropage zero = {
+                .range = { .start = fault_addr, .len = PAGE_SIZE },
+                .mode  = 0,
+            };
+            ioctl(vm->uffd_fd, UFFDIO_ZEROPAGE, &zero);
+        }
+    }
+}
+
+// 5. prefault_worker thread (one per VM, starts concurrently with vCPU resume):
+void* prefault_worker_fn(void* arg) {
+    vm_t* vm = arg;
+    // Advise kernel: sequential access pattern, read-ahead aggressively
+    madvise(vm->snap_base, vm->snap_size, MADV_SEQUENTIAL);
+    // Stream through all pages — pulls them into page cache so uffd_handler
+    // hits cache (~1-10µs) instead of disk (~50-200µs) for subsequent faults
+    for (size_t off = 0; off < vm->snap_size; off += PAGE_SIZE) {
+        volatile uint8_t* p = (uint8_t*)vm->snap_base + off;
+        (void)*p;  // touch page to fault it into page cache
+        if (vm->destroyed) break;  // VM was destroyed, stop streaming
+    }
+}
+```
+
+**Snapshot page manifest:** The `snapshot_manager` writes a compact bitmap alongside the memory snapshot — one bit per 4KB page, 1 = page has non-zero content in snapshot, 0 = page was zero. The fault handler uses this to dispatch `UFFDIO_COPY` vs `UFFDIO_ZEROPAGE` without reading the page content. `UFFDIO_ZEROPAGE` is significantly cheaper than `UFFDIO_COPY` (kernel zeroes in place vs. copying from mmap) and zero pages are common in a freshly booted guest.
+
+**Race safety:** vCPUs resume before the fault handler thread starts — this is safe because the kernel holds faulting vCPUs blocked on the uffd fd until a handler resolves them. There is no window where the guest can access unmapped memory and get a crash rather than a handled fault. The `uffdio_register` call must complete before vCPU resume for this guarantee to hold.
+
+**Teardown:** On VM destroy, `vm->destroyed` flag is set, the uffd fd is closed (this unblocks the `read()` in the fault handler with an error), and both threads are `pthread_join`'d before the mmap region is unmapped.
+
+**Latency profile with warm page cache (from pool):**
+- vCPU resume to first guest instruction: ~1ms (Firecracker API call overhead)
+- Per-fault resolution (page in cache): ~1–10µs (`UFFDIO_COPY` from mmap, page already in page cache)
+- Per-fault resolution (page cold): ~50–200µs (mmap fault → disk read → `UFFDIO_COPY`)
+- `prefault_worker` races to warm cache: most pages cached within 50–200ms depending on snapshot size and NVMe throughput
+
 ### 10.6 Open LLD Questions (to be resolved in subsequent decisions)
 
 - Credential brokering design (§5 / §6 item 7)
-- `uffd_handler` threading model (single fault thread vs. per-VM fault thread)
 - Pool size policy (static N vs. demand-driven auto-scaling)
 - Snapshot storage layout (single flat file vs. content-addressed page store)
 
