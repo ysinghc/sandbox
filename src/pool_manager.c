@@ -72,6 +72,7 @@ int pool_manager_init(pool_manager_t* pool, int target_size) {
     pool->overflow_head = pool->overflow_tail = pool->overflow_count = 0;
     pool->target_size = target_size;
     pool->restoring_count = 0;
+    pool->expected_version = 0;
     pool->shutdown = false;
 
     if (pthread_mutex_init(&pool->lock, NULL) != 0) return -1;
@@ -122,8 +123,7 @@ void pool_manager_destroy(pool_manager_t* pool) {
 }
 
 // Drain warm queue, destroy all warm VMs from old snapshot (§5.6 version check).
-int pool_drain(pool_manager_t* pool) {
-    if (!pool) return -1;
+int pool_drain(pool_manager_t* pool) {    if (!pool) return -1;
     vm_handle_t* drained[POOL_MAX_SIZE];
     int n = 0;
     pthread_mutex_lock(&pool->lock);
@@ -137,6 +137,13 @@ int pool_drain(pool_manager_t* pool) {
     pthread_mutex_unlock(&pool->lock);
     for (int i = 0; i < n; i++) vmm_destroy(drained[i]);
     return n;
+}
+
+// Called by create_snapshot_template; the daemon (Phase 8) hooks the live
+// pool here. No-op until then.
+void pool_manager_flush_and_rebuild(const char* template_name, uint32_t version) {
+    (void)template_name;
+    (void)version;
 }
 
 // --- provision ---

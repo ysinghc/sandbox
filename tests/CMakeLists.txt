@@ -29,3 +29,10 @@ set_tests_properties(network PROPERTIES TIMEOUT 180 FIXTURES_SETUP netfix)
 add_test(NAME network_cleanup
          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/net_cleanup.sh)
 set_tests_properties(network_cleanup PROPERTIES FIXTURES_CLEANUP netfix)
+
+# Phase 4: snapshot manager tests (no root needed: tmp dirs only).
+add_executable(test_snapshot test_snapshot.c)
+target_include_directories(test_snapshot PRIVATE ../include)
+target_link_libraries(test_snapshot sandbox)
+add_test(NAME snapshot COMMAND test_snapshot)
+set_tests_properties(snapshot PROPERTIES TIMEOUT 120)

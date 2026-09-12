@@ -94,6 +94,23 @@ code comments; detail lives here.
   bind per-tap or wildcard. Test uses fd-injection (host-side sockets
   would not traverse `iifname` rules) and covers two-VM no-crosstalk.
 
+## Phase 4 — Snapshot Manager (§5.6)
+
+- Manifest I/O (`build_`/`write_`/`read_manifest`, page-present bit ops)
+  with validation (magic, 4K pages, exact bitmap size; corrupt/truncated
+  manifests refused, never exposed). `SANDBOX_SNAPSHOT_ROOT` overrides the
+  LLD path for tests.
+- Publish is backup-swap on rebuild (plain `rename` cannot replace a
+  non-empty dir): readers see old, missing, then new — never partial
+  (168k concurrent reads, 0 bad). Same-dir rename keeps atomicity.
+- `snapshot_check_version()` adopts on first sight, drains + adopts on
+  change (`expected_version` field added to the pool); create-flow hygiene
+  verified with stubbed VMM (fails clean, no temp residue, final intact).
+- VMM seams (`cold_boot` returns NULL until Phase 6) keep the LLD
+  orchestration line-for-line; real Firecracker capture + `wait_ready`
+  land in Phase 6. `pool_manager_flush_and_rebuild` is a no-op hook for
+  the Phase 8 daemon.
+
 ## Phase 2 — Jailer + Seccomp (§5.4, §5.5)
 
 - Order follows the spec text: cgroup → chroot → caps → setuid/setgid →

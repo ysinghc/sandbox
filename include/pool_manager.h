@@ -27,6 +27,9 @@ typedef struct {
     int target_size;        // Runtime-configurable (from config file)
     int restoring_count;    // VMs currently being restored (not yet warm)
 
+    // Snapshot version this pool was built from (0 = none yet).
+    uint32_t expected_version;
+
     pthread_mutex_t lock;
     pthread_cond_t vm_available;    // Signaled when warm VM enqueued
     pthread_cond_t slot_available;  // Signaled when replenishment can start
@@ -49,5 +52,8 @@ void* replenishment_thread(void* arg);
 
 // Test helpers
 int pool_drain(pool_manager_t* pool);
+
+// Daemon wiring hook for new snapshot versions (Phase 8 owns the live pool).
+void pool_manager_flush_and_rebuild(const char* template_name, uint32_t version);
 
 #endif // POOL_MANAGER_H
