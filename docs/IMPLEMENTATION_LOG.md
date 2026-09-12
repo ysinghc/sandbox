@@ -50,6 +50,41 @@ code comments; detail lives here.
 - Measured: pool self-fills 0→5 in ~0.5s; 12 workers × 6 provisions =
   72/72 OK, 0 failures, ~35k invariant samples, TSan clean.
 
+## Phase 3 — Network Manager (§5.7)
+
+- Rules are verbatim §5.7 (`iifname` accept for `.1:8080`, then drop), via
+  `system()` per LLD (libnftables TODO kept). Chain auto-created as
+  `type filter hook forward priority 0; policy accept` (LLD assumes it
+  exists). Rule handles resolved at cleanup by parsing `nft -a list`, so
+  `vm_network_t` is unchanged.
+- Bare `SIOCSIFADDR` leaves a /32 with no connected route (replies to .2
+  escape via the default interface); the lib also sets 255.255.0.0 via
+  `SIOCSIFNETMASK`. Without this the design cannot function.
+- Verified at packet level from the guest side (frames through the tap fd):
+  `.1:8080` answers SYN-ACK; non-local destinations are silent; deleting
+  only the drop rule lets the SYN-ACK through and restoring it re-silences
+  (control proves the rule does the dropping). nftrace confirms
+  drop-verdict vs policy-accept per phase.
+- Test-topology notes (not production issues): the netns "internet" needs a
+  static `.2` neighbor pointing at VH's MAC (foreign dst MAC dies as
+  PACKET_OTHERHOST on veth ingress); the guest ARP on the tap is answered
+  by the test like a real guest would. Test checksums are byte-wise (an
+  earlier `uint16_t`-cast version misbehaved under `-O3`).
+- FINDING (security-relevant, needs a decision): the specified rules live
+  only in the `forward` chain, so host-LOCAL destinations bypass them.
+  Measured: SYN `.2`→`.1:9999` gets RST,ACK — the guest can probe every
+  host-local port (open ones would handshake). "Only 8080 reachable" holds
+  for forwarded traffic, not for host-local. Fix would be input-chain
+  rules (`iifname tap-*` → only `.1:8080` accept, rest drop) — not added
+  without approval since it changes the design.
+- Multi-tap: duplicate `.1` assignment succeeds on the ioctl path (no
+  EEXIST), so pool-of-5 setup won't fail at assignment; guest `.2`
+  collisions across taps need a Phase 6 answer. Tap names must stay under
+  `IFNAMSIZ` (test uses `vmt<PID>`; daemon vm IDs must stay short).
+- Hygiene: `tests/net_cleanup.sh` runs as a CTest FIXTURES_CLEANUP (leaked
+  netns/routes/rules poison later runs — learned the hard way); the test
+  also pre-cleans and saves/restores `ip_forward`.
+
 ## Phase 2 — Jailer + Seccomp (§5.4, §5.5)
 
 - Order follows the spec text: cgroup → chroot → caps → setuid/setgid →
