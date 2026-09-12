@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <sched.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -140,53 +141,101 @@ static int copy_file(const char* src, const char* dst) {
     return (n < 0) ? -1 : 0;
 }
 
-// Child A: enter userns, map ids, run the jailed probe. _exit(SKIP_CODE) when
-// the environment forbids id-mapping.
+// Runs spawn_jailed + probe inside a userns. A (this process) writes B's id
+// maps from the outside, the only pattern the kernel accepts. Root maps the
+// full range (real uid-drop to 65534); non-root maps itself once and runs a
+// uid-0 variant (chroot still real). _exit(SKIP_CODE) when mapping is denied.
 static void userns_sequence_child(const char* jail, const char* probe_in_jail,
                                   const char* sentinel, int out_fd) {
-    if (unshare(CLONE_NEWUSER) < 0) _exit(SKIP_CODE);
-    char map[64];
-    snprintf(map, sizeof(map), "0 %d 65536", (int)geteuid());
-    if (write_file("/proc/self/setgroups", "deny") < 0) _exit(SKIP_CODE);
-    if (write_file("/proc/self/uid_map", map) < 0) _exit(SKIP_CODE);
-    if (write_file("/proc/self/gid_map", map) < 0) _exit(SKIP_CODE);
-
-    // Reap the jailer grandchild and relay its result.
-    int pipefd[2];
-    if (pipe(pipefd) < 0) _exit(2);
-    pid_t inner = fork();
-    if (inner < 0) _exit(2);
-    if (inner == 0) {
-        dup2(pipefd[1], STDOUT_FILENO);
-        close(pipefd[1]);  // stdout now holds the only write end in this process
-        jailer_config_t cfg = { .jailer_uid = 65534, .jailer_gid = 65534, .cgroup_path = NULL };
-        char* const argv[] = { (char*)probe_in_jail, (char*)sentinel, (char*)"65534",
-                               (char*)"socket", NULL };
-        // Same steps as production, seccomp deferred to the probe (a static
-        // binary cannot start under the filter: arch_prctl is not whitelisted).
-        pid_t jailed = spawn_jailed(jail, &cfg, probe_in_jail, argv, false, false);
+    int notify[2], go[2];
+    if (pipe(notify) < 0 || pipe(go) < 0) _exit(2);
+    pid_t b = fork();
+    if (b < 0) _exit(2);
+    if (b == 0) {
+        // B: enter userns, wait for A's mapping, run the jailed probe.
+        close(notify[0]);
+        close(go[1]);
+        if (unshare(CLONE_NEWUSER) < 0) {
+            (void)write(notify[1], "x", 1);
+            _exit(SKIP_CODE);
+        }
+        if (write(notify[1], "x", 1) != 1) _exit(2);
+        char cmd = 0;
+        if (read(go[0], &cmd, 1) != 1) _exit(2);
+        if (cmd == 'S') _exit(SKIP_CODE);
+        if (cmd != 'G' && cmd != 'U') _exit(2);
+        // Map fullness comes from A: B is uid 0 in-ns either way.
+        // 'G' = full map, real uid-drop to 65534; 'U' = single-map variant.
+        uid_t juid = (cmd == 'G') ? 65534 : 0;
+        char juid_s[16], marker[64];
+        snprintf(juid_s, sizeof(juid_s), "%d", (int)juid);
+        snprintf(marker, sizeof(marker), "PROBE ok uid=%d", (int)juid);
+        int pipefd[2];
+        if (pipe(pipefd) < 0) _exit(2);
+        pid_t inner = fork();
+        if (inner < 0) _exit(2);
+        if (inner == 0) {
+            dup2(pipefd[1], STDOUT_FILENO);
+            close(pipefd[1]);  // stdout now holds the only write end in this process
+            jailer_config_t cfg = { .jailer_uid = juid, .jailer_gid = juid,
+                                    .cgroup_path = NULL };
+            char* const argv[] = { (char*)probe_in_jail, (char*)sentinel, juid_s,
+                                   (char*)"socket", NULL };
+            // Same steps as production, seccomp deferred to the probe (a static
+            // binary cannot start under the filter: arch_prctl is not whitelisted).
+            pid_t jailed = spawn_jailed(jail, &cfg, probe_in_jail, argv, false, false);
+            int st = 0;
+            if (jailed < 0 || waitpid(jailed, &st, 0) < 0) _exit(3);
+            close(STDOUT_FILENO);  // last writer (grandchild is dead) -> EOF
+            char out[256] = {0};
+            size_t off = 0;
+            ssize_t n;
+            while (off < sizeof(out) - 1 &&
+                   (n = read(pipefd[0], out + off, sizeof(out) - 1 - off)) > 0)
+                off += (size_t)n;
+            if (WIFSIGNALED(st) && WTERMSIG(st) == SIGSYS) {
+                if (!strstr(out, marker)) _exit(5);
+                _exit(0);
+            }
+            if (WIFEXITED(st)) _exit(100 + WEXITSTATUS(st));  // probe/child exit code
+            _exit(200 + WTERMSIG(st));  // unexpected signal
+        }
+        close(pipefd[1]);
         int st = 0;
-        if (jailed < 0 || waitpid(jailed, &st, 0) < 0) _exit(3);
-        close(STDOUT_FILENO);  // last writer (grandchild is dead) -> EOF
-        char out[256] = {0};
-        size_t off = 0;
-        ssize_t n;
-        while (off < sizeof(out) - 1 &&
-               (n = read(pipefd[0], out + off, sizeof(out) - 1 - off)) > 0)
-            off += (size_t)n;
-        if (!WIFSIGNALED(st) || WTERMSIG(st) != SIGSYS) _exit(4);
-        if (!strstr(out, "PROBE ok uid=65534")) _exit(5);
-        _exit(0);
+        if (waitpid(inner, &st, 0) < 0) _exit(2);
+        if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+            const char msg[] = "SEQUENCE ok\n";
+            (void)write(out_fd, msg, sizeof(msg) - 1);
+            _exit(0);
+        }
+        // Relay inner's diagnostic code directly.
+        if (WIFEXITED(st)) _exit(WEXITSTATUS(st));
+        _exit(6);
     }
-    close(pipefd[1]);
+    // A: map B from the outside, then release it.
+    close(notify[1]);
+    close(go[0]);
+    char c = 0;
+    if (read(notify[0], &c, 1) != 1) _exit(2);
+    char procdir[64], map[64], path[96];
+    snprintf(procdir, sizeof(procdir), "/proc/%d", (int)b);
+    bool full = (geteuid() == 0);
+    if (full)
+        snprintf(map, sizeof(map), "0 0 65536");
+    else
+        snprintf(map, sizeof(map), "0 %d 1", (int)geteuid());
+    snprintf(path, sizeof(path), "%s/setgroups", procdir);
+    int ok = (write_file(path, "deny") == 0);
+    snprintf(path, sizeof(path), "%s/uid_map", procdir);
+    ok = ok && (write_file(path, map) == 0);
+    if (!full) snprintf(map, sizeof(map), "0 %d 1", (int)getegid());
+    snprintf(path, sizeof(path), "%s/gid_map", procdir);
+    ok = ok && (write_file(path, map) == 0);
+    (void)write(go[1], !ok ? "S" : (full ? "G" : "U"), 1);
     int st = 0;
-    if (waitpid(inner, &st, 0) < 0) _exit(2);
-    if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
-        const char msg[] = "SEQUENCE ok\n";
-        (void)write(out_fd, msg, sizeof(msg) - 1);
-        _exit(0);
-    }
-    _exit(WIFEXITED(st) ? (100 + WEXITSTATUS(st)) : 6);
+    if (waitpid(b, &st, 0) < 0) _exit(2);
+    if (WIFEXITED(st)) _exit(WEXITSTATUS(st));  // relay B's code (0, 77=SKIP, or step id)
+    _exit(7);
 }
 
 static void test_jailer_sequence(void) {

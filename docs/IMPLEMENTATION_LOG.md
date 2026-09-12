@@ -58,8 +58,11 @@ code comments; detail lives here.
 - `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` across the drop
   (the subsequent setuid/setgid per LLD order requires them), drops
   everything else including the bounding set; the uid transition clears the
-  rest. Implemented via raw `capget`/`capset` (`<linux/capability.h>`, no
-  libcap on this box).
+  rest. Bounding drops run BEFORE the `capset` clear — the first version did
+  it after, which strips `CAP_SETPCAP` from the effective set and makes every
+  `PR_CAPBSET_DROP` fail EPERM (production spawns would all `_exit(127)`);
+  caught by the sequence test via strace. Implemented via raw
+  `capget`/`capset` (`<linux/capability.h>`, no libcap on this box).
 - Internal `spawn_jailed()` takes jail root, binary, argv, and
   mount/seccomp toggles; public `spawn_firecracker_jailed()` pins the
   canonical root, `/firecracker`, mounts on, seccomp on. Test-only splits
@@ -68,3 +71,12 @@ code comments; detail lives here.
   (`arch_prctl` is not whitelisted).
 - Seccomp whitelist is verbatim §5.5, including the KVM-only `ioctl` mask.
   No syscalls added.
+- Verified in a multipass jammy VM (8c/8G, system protobuf 3.12, all
+  builds/tests run there, never on the host): `ctest` 2/2 as both `ubuntu`
+  and root. Seccomp kills verified (`socket`, non-KVM `ioctl` → SIGSYS).
+  Sequence test forks: child unshares, parent writes `/proc/<pid>/uid_map`
+  from outside (self-writes from inside fail under AppArmor/restricted
+  kernels — the first version did that and always SKIPped). Root maps the
+  full range: real chroot + uid-drop to 65534 verified end to end. Non-root
+  maps itself once and runs a uid-0 variant (chroot still real; the uid
+  transition is a no-op there).

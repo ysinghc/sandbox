@@ -74,9 +74,14 @@ int write_cgroup_procs(const char* cgroup_path, pid_t pid) {
     return (w == (ssize_t)n) ? 0 : -1;
 }
 
-// Drops everything except CAP_SETUID/CAP_SETGID (needed for the setuid/setgid
-// step that follows per LLD order); the uid transition clears the rest.
+// Drops the bounding set first (needs CAP_SETPCAP, still held), then clears
+// everything except CAP_SETUID/CAP_SETGID (needed for the setuid/setgid step
+// that follows per LLD order); the uid transition clears the rest.
 int drop_capabilities(void) {
+    for (int c = 0; c <= CAP_LAST_CAP; c++) {
+        if (prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) return -1;
+    }
+
     struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
     struct __user_cap_data_struct data[2];
     if (syscall(SYS_capget, &hdr, data) < 0) return -1;
@@ -87,10 +92,6 @@ int drop_capabilities(void) {
     data[0].inheritable = 0;
     data[1].effective = data[1].permitted = data[1].inheritable = 0;
     if (syscall(SYS_capset, &hdr, data) < 0) return -1;
-
-    for (int c = 0; c <= CAP_LAST_CAP; c++) {
-        if (prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) return -1;
-    }
     return 0;
 }
 
