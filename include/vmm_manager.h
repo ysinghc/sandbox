@@ -19,6 +19,8 @@ typedef struct vm_handle_t {
     snap_manifest_t* manifest;
     pthread_t uffd_thread;
     pthread_t prefault_thread;
+    bool uffd_thread_started;
+    bool prefault_thread_started;
     bool destroyed;
     uint32_t page_faults;
     uint64_t resume_time_ms;

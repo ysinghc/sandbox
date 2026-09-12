@@ -36,3 +36,10 @@ target_include_directories(test_snapshot PRIVATE ../include)
 target_link_libraries(test_snapshot sandbox)
 add_test(NAME snapshot COMMAND test_snapshot)
 set_tests_properties(snapshot PROPERTIES TIMEOUT 120)
+
+# Phase 5: uffd lazy-restore tests (SKIPs where userfaultfd is denied).
+add_executable(test_uffd test_uffd.c)
+target_include_directories(test_uffd PRIVATE ../include)
+target_link_libraries(test_uffd sandbox)
+add_test(NAME uffd COMMAND test_uffd)
+set_tests_properties(uffd PROPERTIES TIMEOUT 120)

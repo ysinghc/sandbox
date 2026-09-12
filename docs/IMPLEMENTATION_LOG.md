@@ -94,6 +94,21 @@ code comments; detail lives here.
   bind per-tap or wildcard. Test uses fd-injection (host-side sockets
   would not traverse `iifname` rules) and covers two-VM no-crosstalk.
 
+## Phase 5 — UFFD Handler + Prefault Worker (§5.2, §5.3)
+
+- Setup order per LLD (mmap snap, `UFFDIO_API`, `UFFDIO_REGISTER`, spawn
+  handler, then resume); handler + prefault both start pre-resume.
+  Copy-vs-zero branch on the manifest bit; short copies left missing for
+  guest refault. fd is NONBLOCK + 100ms poll so destroy is clean.
+- `page_faults`/`destroyed` use `__atomic` builtins on the plain fields
+  (no struct-type change); manifest page size must match the host page.
+- Measured: setup (mmap+uffd+register) 0–1ms — far inside the 83ms budget,
+  which Firecracker load will dominate in Phase 6. 64/64 pages faulted
+  exactly once with per-word data match; prefault early-exit 1ms.
+- TSan caught 2 shutdown races (close-vs-inflight-read, `-1` write vs
+  poll setup); fixed by ordering flag → join → release instead of
+  close-to-wake. TSan silent on uffd + pool afterwards.
+
 ## Phase 4 — Snapshot Manager (§5.6)
 
 - Manifest I/O (`build_`/`write_`/`read_manifest`, page-present bit ops)
