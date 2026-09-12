@@ -84,6 +84,15 @@ code comments; detail lives here.
 - Hygiene: `tests/net_cleanup.sh` runs as a CTest FIXTURES_CLEANUP (leaked
   netns/routes/rules poison later runs — learned the hard way); the test
   also pre-cleans and saves/restores `ip_forward`.
+- Follow-up fixes (approved): per-VM /30 subnets via FNV-1a hash of vm_id
+  (`network_subnet_addrs()`; hash keeps string IDs stable, 16384 slots),
+  input-chain accept+drop per tap (closes the host port-scan hole —
+  verified: closed local ports now silent, was RST,ACK), `vm_network_t`
+  unchanged (handles resolved at cleanup for both chains),
+  `network_manager_init()` added for daemon startup (setup ensures chains
+  too). Broker endpoint is now per-VM (host IP of its /30); Phase 7 must
+  bind per-tap or wildcard. Test uses fd-injection (host-side sockets
+  would not traverse `iifname` rules) and covers two-VM no-crosstalk.
 
 ## Phase 2 — Jailer + Seccomp (§5.4, §5.5)
 

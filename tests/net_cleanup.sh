@@ -12,13 +12,15 @@ done
 ip route del 169.254.0.2/32 2>/dev/null
 ip route del 192.0.2.1/32 2>/dev/null
 
-# Delete this run's (and any stale) tap rules by handle.
-nft -a list chain ip sandbox_policy forward 2>/dev/null | grep 'tap-vmt' | \
-while IFS= read -r line; do
-    h=$(printf '%s' "$line" | sed -n 's/.*# handle //p')
-    if [ -n "$h" ]; then
-        nft delete rule ip sandbox_policy forward handle "$h" 2>/dev/null
-    fi
+# Delete this run's (and any stale) tap rules by handle, both chains.
+for chain in forward input; do
+    nft -a list chain ip sandbox_policy "$chain" 2>/dev/null | grep 'tap-vmt' | \
+    while IFS= read -r line; do
+        h=$(printf '%s' "$line" | sed -n 's/.*# handle //p')
+        if [ -n "$h" ]; then
+            nft delete rule ip sandbox_policy "$chain" handle "$h" 2>/dev/null
+        fi
+    done
 done
 
 # Restore the pre-test ip_forward value saved by the test itself.

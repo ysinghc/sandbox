@@ -35,10 +35,12 @@
     fprintf(stderr, "FAIL %s: %s (%s:%d)\n", (what), strerror(errno), __FILE__, __LINE__); \
     abort(); } } while (0)
 
-#define GUEST_IP_S "169.254.0.2"
-#define BROKER_IP_S "169.254.0.1"
 #define OUTER_IP_S "192.0.2.1"  // TEST-NET-1: unroutable stand-in for "internet"
 static const uint8_t GUEST_MAC[6] = {0x02, 0x00, 0x0a, 0x00, 0x00, 0x02};
+
+// Per-run addresses from network_subnet_addrs() (network byte order + strings).
+static uint32_t g_host_ip, g_guest_ip;
+static char g_host_s[INET_ADDRSTRLEN], g_guest_s[INET_ADDRSTRLEN];
 
 static int run(const char* cmd) {
     int rc = system(cmd);
@@ -103,8 +105,7 @@ static void get_tap_mac(const char* tap, uint8_t* mac) {
 // Ethernet + IPv4 + TCP SYN from guest to dst_ip:dport.
 static size_t build_syn(uint8_t* frame, const uint8_t* dst_mac,
                         uint32_t sport, uint32_t dport, uint32_t seq, uint32_t dst_ip) {
-    uint32_t src_ip;
-    inet_pton(AF_INET, GUEST_IP_S, &src_ip);
+    uint32_t src_ip = g_guest_ip;
     memcpy(frame, dst_mac, 6);
     memcpy(frame + 6, GUEST_MAC, 6);
     frame[12] = 0x08;
@@ -143,7 +144,7 @@ static size_t build_syn(uint8_t* frame, const uint8_t* dst_mac,
 }
 
 static void send_arp_reply(int fd, const uint8_t* tap_mac, const uint8_t* req) {
-    // req:asp/an ARP who-has for GUEST_IP_S. Answer with GUEST_MAC.
+    // req: an ARP who-has for the guest IP. Answer with GUEST_MAC.
     uint8_t f[42];
     memcpy(f, req + 6, 6);       // dst = requester
     memcpy(f + 6, GUEST_MAC, 6); // src = guest
@@ -152,8 +153,7 @@ static void send_arp_reply(int fd, const uint8_t* tap_mac, const uint8_t* req) {
     f[14] = 0x00; f[15] = 0x01; f[16] = 0x08; f[17] = 0x00;
     f[18] = 0x06; f[19] = 0x04; f[20] = 0x00; f[21] = 0x02;
     memcpy(f + 22, GUEST_MAC, 6);
-    uint32_t gip;
-    inet_pton(AF_INET, GUEST_IP_S, &gip);
+    uint32_t gip = g_guest_ip;
     memcpy(f + 28, &gip, 4);
     memcpy(f + 32, req + 6, 6);
     memcpy(f + 38, req + 28, 4);
@@ -164,8 +164,7 @@ static void send_arp_reply(int fd, const uint8_t* tap_mac, const uint8_t* req) {
 static int is_arp_for_guest(const uint8_t* f, ssize_t n) {
     if (n < 42 || f[12] != 0x08 || f[13] != 0x06 || f[20] != 0x00 || f[21] != 0x01)
         return 0;
-    uint32_t gip, tip;
-    inet_pton(AF_INET, GUEST_IP_S, &gip);
+    uint32_t gip = g_guest_ip, tip;
     memcpy(&tip, f + 38, 4);
     return tip == gip;
 }
@@ -179,8 +178,7 @@ static int await_synack(int fd, const uint8_t* tap_mac, uint32_t sport_s,
     clock_gettime(CLOCK_MONOTONIC, &end);
     end.tv_sec += timeout_ms / 1000;
     end.tv_nsec += (timeout_ms % 1000) * 1000000L;
-    uint32_t guest_ip;
-    inet_pton(AF_INET, GUEST_IP_S, &guest_ip);
+    uint32_t guest_ip = g_guest_ip;
     for (;;) {
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
@@ -241,8 +239,7 @@ static int expect_silence(int fd, int ms) {
 // polluting later silence windows). seq_no = our ISN + 1.
 static void send_rst(int fd, const uint8_t* dst_mac, uint32_t sport,
                      uint32_t dport, uint32_t seq_no, uint32_t dst_ip) {
-    uint32_t src_ip;
-    inet_pton(AF_INET, GUEST_IP_S, &src_ip);
+    uint32_t src_ip = g_guest_ip;
     uint8_t frame[54];
     memcpy(frame, dst_mac, 6);
     memcpy(frame + 6, GUEST_MAC, 6);
@@ -311,6 +308,11 @@ int main(void) {
     char vm_id[64];
     snprintf(vm_id, sizeof(vm_id), "vmt%d", (int)getpid() % 100000);
 
+    // This VM's /30 addrs; everything below derives from these.
+    CHECK_RC(network_subnet_addrs(vm_id, &g_host_ip, &g_guest_ip), "subnet addrs");
+    if (!inet_ntop(AF_INET, &g_host_ip, g_host_s, sizeof(g_host_s))) abort();
+    if (!inet_ntop(AF_INET, &g_guest_ip, g_guest_s, sizeof(g_guest_s))) abort();
+
     // Save ip_forward for the cleanup fixture (restores it even on abort).
     FILE* ipf = fopen("/proc/sys/net/ipv4/ip_forward", "r");
     if (ipf) {
@@ -330,8 +332,10 @@ int main(void) {
     run("pkill -9 -f '[1]92\\.0\\.2\\.1' 2>/dev/null");
     run("for ns in $(ip netns list 2>/dev/null | grep -o 'sbtest[0-9]*'); do "
         "ip netns del $ns 2>/dev/null; done; true");
-    run("ip route del 169.254.0.2/32 2>/dev/null; "
-        "ip route del 192.0.2.1/32 2>/dev/null; true");
+    char groute[64];
+    snprintf(groute, sizeof(groute), "ip route del %s/32 2>/dev/null; ", g_guest_s);
+    run(groute);
+    run("ip route del 192.0.2.1/32 2>/dev/null; true");
 
     // --- setup + state ---
     printf("[test] setup_state...\n");
@@ -341,7 +345,7 @@ int main(void) {
     char tap[IFNAMSIZ];
     snprintf(tap, sizeof(tap), "tap-%s", vm_id);
     if (net.tap_fd < 0) abort();
-    if (net.guest_ip != inet_addr(GUEST_IP_S)) abort();
+    if (net.guest_ip != g_guest_ip) abort();
     if (if_nametoindex(tap) == 0) abort();
     int ds = socket(AF_INET, SOCK_DGRAM, 0);
     struct ifreq ifr;
@@ -353,13 +357,19 @@ int main(void) {
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tap);
     CHECK_SYS(ioctl(ds, SIOCGIFADDR, &ifr), "SIOCGIFADDR");
     struct sockaddr_in* a = (struct sockaddr_in*)&ifr.ifr_addr;
-    if (a->sin_addr.s_addr != inet_addr(BROKER_IP_S)) abort();
+    if (a->sin_addr.s_addr != g_host_ip) abort();
     close(ds);
     char* rules = capture("nft -a list chain ip sandbox_policy forward 2>/dev/null");
     char want[IFNAMSIZ + 16];
     snprintf(want, sizeof(want), "iifname \"%s\"", tap);
     if (!strstr(rules, want) || !strstr(rules, "dport 8080 accept") || !strstr(rules, " drop")) {
         fprintf(stderr, "rules missing:\n%s\n", rules);
+        abort();
+    }
+    free(rules);
+    rules = capture("nft -a list chain ip sandbox_policy input 2>/dev/null");
+    if (!strstr(rules, want) || !strstr(rules, "dport 8080 accept") || !strstr(rules, " drop")) {
+        fprintf(stderr, "input rules missing:\n%s\n", rules);
         abort();
     }
     free(rules);
@@ -374,14 +384,13 @@ int main(void) {
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in la = { .sin_family = AF_INET,
                               .sin_port = htons(8080),
-                              .sin_addr.s_addr = inet_addr(BROKER_IP_S) };
+                              .sin_addr.s_addr = g_host_ip };
     CHECK_SYS(bind(listen_fd, (struct sockaddr*)&la, sizeof(la)), "bind 8080");
     CHECK_SYS(listen(listen_fd, 5), "listen");
     uint8_t tap_mac[6];
     get_tap_mac(tap, tap_mac);
     uint8_t frame[256];
-    uint32_t broker_ip;
-    inet_pton(AF_INET, BROKER_IP_S, &broker_ip);
+    uint32_t broker_ip = g_host_ip;
     size_t flen = build_syn(frame, tap_mac, 40001, 8080, 0x10000001, broker_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject SYN");
     if (await_synack(net.tap_fd, tap_mac, 40001, 8080, 0x10000001, broker_ip, 3000) < 0) {
@@ -424,10 +433,10 @@ int main(void) {
     snprintf(vh_mac_s, sizeof(vh_mac_s), "%02x:%02x:%02x:%02x:%02x:%02x",
              vh_mac[0], vh_mac[1], vh_mac[2], vh_mac[3], vh_mac[4], vh_mac[5]);
     snprintf(cmd, sizeof(cmd),
-             "ip netns exec %s sh -c 'ip addr add 192.0.2.1/32 dev %s && ip link set %s up && ip link set lo up && ip route add default dev %s && ip neigh add 169.254.0.2 lladdr %s dev %s nud permanent' && "
+             "ip netns exec %s sh -c 'ip addr add 192.0.2.1/32 dev %s && ip link set %s up && ip link set lo up && ip route add default dev %s && ip neigh add %s lladdr %s dev %s nud permanent' && "
              "ip route add 192.0.2.1/32 dev %s && "
-             "ip route add 169.254.0.2/32 dev %s",
-             ns, vn, vn, vn, vh_mac_s, vn, vh, tap);
+             "ip route add %s/32 dev %s",
+             ns, vn, vn, vn, g_guest_s, vh_mac_s, vn, vh, g_guest_s, tap);
     CHECK_RC(run(cmd), "veth/routes");
     snprintf(cmd, sizeof(cmd),
              "ip netns exec %s python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind((\"192.0.2.1\",80)); s.listen(5); s.settimeout(150); "
@@ -473,14 +482,56 @@ int main(void) {
     printf("[test] forward_drop: PASS (drop enforced by our rule, proven by control)\n");
     fflush(stdout);
 
-    // --- input-gap probe (reported, not asserted): closed local port ---
-    printf("[test] input_gap_probe...\n");
+    // --- input drop: closed host-local port is silenced, not RST ---
+    printf("[test] input_drop...\n");
     fflush(stdout);
     flen = build_syn(frame, tap_mac, 40005, 9999, 0x30000001, broker_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject local SYN");
-    int got = await_synack(net.tap_fd, tap_mac, 40005, 9999, 0x30000001, broker_ip, 1500);
-    printf("[test] input_gap_probe: %s (see log)\n",
-           got == 0 ? "UNEXPECTED SYN-ACK" : "no SYN-ACK (RST or drop)");
+    if (expect_silence(net.tap_fd, 1000) < 0) {
+        fprintf(stderr, "FAIL input_drop: reply from closed local port\n");
+        abort();
+    }
+    printf("[test] input_drop: PASS\n");
+    fflush(stdout);
+
+    // --- two VMs: distinct /30s, no cross-talk either direction ---
+    printf("[test] two_vm...\n");
+    fflush(stdout);
+    char vm2_id[64];
+    snprintf(vm2_id, sizeof(vm2_id), "vmt2-%d", (int)getpid() % 100000);
+    uint32_t host2_ip, guest2_ip;
+    CHECK_RC(network_subnet_addrs(vm2_id, &host2_ip, &guest2_ip), "subnet2");
+    if (host2_ip == g_host_ip || guest2_ip == g_guest_ip) {
+        fprintf(stderr, "FAIL two_vm: subnet collision\n");
+        abort();
+    }
+    if ((host2_ip & htonl(0xFFFFFFFCu)) == (g_host_ip & htonl(0xFFFFFFFCu))) {
+        fprintf(stderr, "FAIL two_vm: same /30\n");
+        abort();
+    }
+    vm_network_t net2;
+    CHECK_RC(network_setup(vm2_id, &net2), "network_setup 2");
+    // Guest A -> B-host:8080 (local to host, wrong VM): input drop on tap A.
+    flen = build_syn(frame, tap_mac, 40006, 8080, 0x40000001, host2_ip);
+    CHECK_SYS(write(net.tap_fd, frame, flen), "inject cross SYN");
+    if (expect_silence(net.tap_fd, 1000) < 0) {
+        fprintf(stderr, "FAIL two_vm: cross-VM host reply\n");
+        abort();
+    }
+    // Guest A -> B-guest:80 (forwarded): forward drop on tap A.
+    flen = build_syn(frame, tap_mac, 40007, 80, 0x40000002, guest2_ip);
+    CHECK_SYS(write(net.tap_fd, frame, flen), "inject cross SYN 2");
+    if (expect_silence(net.tap_fd, 1000) < 0) {
+        fprintf(stderr, "FAIL two_vm: cross-VM guest reply\n");
+        abort();
+    }
+    CHECK_RC(network_cleanup(&net2), "network_cleanup 2");
+    // A's rules must survive B's cleanup.
+    rules = capture("nft -a list chain ip sandbox_policy forward 2>/dev/null");
+    int agone = (strstr(rules, tap) == NULL);
+    free(rules);
+    if (agone) abort();
+    printf("[test] two_vm: PASS\n");
     fflush(stdout);
 
     // --- cleanup ---
@@ -488,14 +539,17 @@ int main(void) {
     waitpid(listener_pid, NULL, 0);
     snprintf(cmd, sizeof(cmd),
              "ip netns del %s; ip route del 192.0.2.1/32 dev %s 2>/dev/null; "
-             "ip route del 169.254.0.2/32 dev %s 2>/dev/null; true",
-             ns, vh, tap);
+             "ip route del %s/32 dev %s 2>/dev/null; true",
+             ns, vh, g_guest_s, tap);
     run(cmd);
     set_ip_forward(ip_forward_saved);
     CHECK_RC(network_cleanup(&net), "network_cleanup");
     if (if_nametoindex(tap) != 0) abort();
     rules = capture("nft -a list chain ip sandbox_policy forward 2>/dev/null");
     int leftover = (strstr(rules, tap) != NULL);
+    free(rules);
+    rules = capture("nft -a list chain ip sandbox_policy input 2>/dev/null");
+    leftover = leftover || (strstr(rules, tap) != NULL);
     free(rules);
     if (leftover) abort();
     printf("[test] cleanup: PASS\n");
