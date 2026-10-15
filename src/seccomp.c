@@ -1,4 +1,12 @@
-// Jailer seccomp policy (§5.5). Whitelist is verbatim from the LLD.
+// Jailer seccomp policy (§5.5). Our filter is the *only* one — Firecracker is
+// exec'd with --no-seccomp — and the jailer installs it *before* dup2/execve,
+// so it must also cover the calls Firecracker makes before it would install its
+// own per-thread filters (thread creation, socket bind/listen, uname, ...).
+//
+// The syscall set mirrors Firecracker v1.17's own aarch64 policy
+// (resources/seccomp/aarch64-unknown-linux-musl.json — the union of its vmm,
+// api and vcpu thread filters) plus those pre-filter calls. Verified against a
+// full cold-boot + snapshot + UFFD-restore + pool run under SCMP_ACT_LOG.
 #define _GNU_SOURCE  // CLONE_VM under strict C11
 
 #include "sandbox_seccomp.h"
@@ -22,53 +30,110 @@ int apply_seccomp_filter(void) {
         goto fail; \
 } while (0)
 
-    // KVM interaction
+    // ioctl: KVM_* (type 0xAE) plus the tap/block/terminal requests Firecracker
+    // uses. The LLD's "KVM-only" mask is too narrow — FC opens its tap and
+    // probes its backing file through ioctl as well.
     if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
                          SCMP_A1(SCMP_CMP_MASKED_EQ, 0xFF00, 0xAE00)) < 0)
-        goto fail;  // KVM_* ioctls only
+        goto fail;
+    // UFFD control class (type 0xAA): Firecracker creates the userfaultfd
+    // (USERFAULTFD_IOC_NEW) and registers the guest-memory regions itself before
+    // handing the fd to the external handler over the UDS.
+    if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+                         SCMP_A1(SCMP_CMP_MASKED_EQ, 0xFF00, 0xAA00)) < 0)
+        goto fail;
+    static const uint32_t extra_ioctls[] = {
+        4712,         // BLKSSZGET
+        4727,         // BLKDISCARD
+        4728,         // BLKIOMIN
+        4729,         // BLKIOOPT
+        4731,         // BLKPBSZGET
+        21505,        // TCGETS
+        21506,        // TCSETS
+        21523,        // TIOCGWINSZ
+        21537,        // FIONBIO
+        1074025674,   // TUNSETIFF
+        1074025680,   // TUNSETOFFLOAD
+        1074025688,   // TUNSETVNETHDRSZ
+    };
+    for (size_t i = 0; i < sizeof(extra_ioctls) / sizeof(extra_ioctls[0]); i++) {
+        if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(ioctl), 1,
+                             SCMP_A1(SCMP_CMP_EQ,
+                                     (scmp_datum_t)extra_ioctls[i])) < 0)
+            goto fail;
+    }
 
-    // Memory management
+    // Firecracker runtime set (union of its vmm/api/vcpu policies).
+    ALLOW(accept4);      // UDS API accept
+    ALLOW(bind);         // API socket bind (pre-filter)
+    ALLOW(brk);
+    ALLOW(clock_gettime);
+    ALLOW(close);
+    ALLOW(connect);      // UFFD socket connect
+    ALLOW(dup);          // fds (pre-filter)
+    ALLOW(dup3);         // what dup2() lowers to on aarch64 (jailer dup2)
+    ALLOW(epoll_ctl);
+    ALLOW(epoll_create1);
+    ALLOW(epoll_pwait);
+    ALLOW(eventfd2);
+    ALLOW(exit);
+    ALLOW(exit_group);
+    ALLOW(fallocate);
+    ALLOW(fcntl);
+    ALLOW(fstat);
+    ALLOW(fsync);
+    ALLOW(ftruncate);
+    ALLOW(futex);
+    ALLOW(getrandom);
+    ALLOW(gettid);
+    ALLOW(io_uring_enter);
+    ALLOW(io_uring_register);
+    ALLOW(io_uring_setup);
+    ALLOW(listen);       // API socket listen (pre-filter)
+    ALLOW(lseek);
+    ALLOW(madvise);
+    ALLOW(memfd_create);
+    ALLOW(mincore);
     ALLOW(mmap);
-    ALLOW(munmap);
     ALLOW(mprotect);
     ALLOW(mremap);
-    ALLOW(madvise);
-
-    // File I/O (snapshot files, API socket)
-    ALLOW(read);
-    ALLOW(write);
-    ALLOW(open);
+    ALLOW(msync);
+    ALLOW(munmap);
+    ALLOW(newfstatat);
     ALLOW(openat);
-    ALLOW(close);
-    ALLOW(fstat);
-    ALLOW(lseek);
-
-    // Signaling
-    ALLOW(signalfd);
+    ALLOW(ppoll);
+    ALLOW(prlimit64);    // Rust stdlib init reads resource limits
+    ALLOW(read);
+    ALLOW(readv);
+    ALLOW(recvfrom);
+    ALLOW(recvmsg);
+    ALLOW(restart_syscall);
     ALLOW(rt_sigaction);
     ALLOW(rt_sigprocmask);
+    ALLOW(rt_sigreturn);
+    ALLOW(sched_yield);
+    ALLOW(sendmsg);
+    ALLOW(sendto);
+    ALLOW(sigaltstack);
+    ALLOW(socket);
+    ALLOW(timerfd_create);
+    ALLOW(timerfd_settime);
+    ALLOW(tkill);
+    ALLOW(uname);        // host CPU identification (pre-filter)
+    ALLOW(write);
+    ALLOW(writev);
 
-    // Epoll/event loop
-    ALLOW(epoll_create1);
-    ALLOW(epoll_ctl);
-    ALLOW(epoll_wait);
-    ALLOW(eventfd);
-
-    // Threading
+    // Thread/runtime plumbing Firecracker performs before its own filters land.
     if (seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(clone), 1,
                          SCMP_A0(SCMP_CMP_MASKED_EQ, CLONE_VM, CLONE_VM)) < 0)
         goto fail;  // Thread creation only
-    ALLOW(futex);
+    ALLOW(prctl);
     ALLOW(set_robust_list);
-
-    // Process lifecycle
-    ALLOW(exit_group);
+    ALLOW(set_tid_address);
     ALLOW(getpid);
-    ALLOW(tgkill);
 
-    // Time
-    ALLOW(clock_gettime);
-    ALLOW(clock_nanosleep);
+    // Jailer hand-off.
+    ALLOW(execve);       // Jailer execs firecracker
 
 #undef ALLOW
 

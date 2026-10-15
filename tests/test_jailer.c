@@ -74,10 +74,10 @@ static void check_filter_death(int status, const char* what) {
     abort();
 }
 
-static void test_seccomp_socket(void) {
-    printf("[test] seccomp_socket...\n");
+static void test_seccomp_forbidden_syscall(void) {
+    printf("[test] seccomp_forbidden_syscall...\n");
     fflush(stdout);
-    check_filter_death(run_probe_bare((char*)"socket"), "seccomp_socket");
+    check_filter_death(run_probe_bare((char*)"ptrace"), "seccomp_forbidden_syscall");
 }
 
 static void test_seccomp_ioctl_args(void) {
@@ -180,10 +180,11 @@ static void userns_sequence_child(const char* jail, const char* probe_in_jail,
             jailer_config_t cfg = { .jailer_uid = juid, .jailer_gid = juid,
                                     .cgroup_path = NULL };
             char* const argv[] = { (char*)probe_in_jail, (char*)sentinel, juid_s,
-                                   (char*)"socket", NULL };
+                                   (char*)"ptrace", NULL };
             // Same steps as production, seccomp deferred to the probe (a static
             // binary cannot start under the filter: arch_prctl is not whitelisted).
-            pid_t jailed = spawn_jailed(jail, &cfg, probe_in_jail, argv, false, false);
+            pid_t jailed = spawn_jailed(jail, &cfg, probe_in_jail, argv, false, false,
+                                          NULL, NULL);
             int st = 0;
             if (jailed < 0 || waitpid(jailed, &st, 0) < 0) _exit(3);
             close(STDOUT_FILENO);  // last writer (grandchild is dead) -> EOF
@@ -280,7 +281,7 @@ static void test_jailer_sequence(void) {
 }
 
 int main(void) {
-    test_seccomp_socket();
+    test_seccomp_forbidden_syscall();
     test_seccomp_ioctl_args();
     test_helpers();
     test_jailer_sequence();

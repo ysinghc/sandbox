@@ -146,13 +146,67 @@ code comments; detail lives here.
   in the same order — a static probe cannot start under the filter
   (`arch_prctl` is not whitelisted).
 - Seccomp whitelist is verbatim §5.5, including the KVM-only `ioctl` mask.
-  No syscalls added.
+  No syscalls added. *(Superseded in Phase 6: the real Firecracker needs far
+  more — see below and `SYSTEM DESIGN.md` §15.3.)*
 - Verified in a multipass jammy VM (8c/8G, system protobuf 3.12, all
   builds/tests run there, never on the host): `ctest` 2/2 as both `ubuntu`
-  and root. Seccomp kills verified (`socket`, non-KVM `ioctl` → SIGSYS).
+  and root. Seccomp kills verified (`socket`, non-KVM `ioctl` → SIGSYS)
+  *(the Phase 6 filter allows `socket`; the probe now uses `ptrace` + `FIONREAD`)*.
   Sequence test forks: child unshares, parent writes `/proc/<pid>/uid_map`
   from outside (self-writes from inside fail under AppArmor/restricted
   kernels — the first version did that and always SKIPped). Root maps the
   full range: real chroot + uid-drop to 65534 verified end to end. Non-root
   maps itself once and runs a uid-0 variant (chroot still real; the uid
   transition is a no-op there).
+
+## Phase 6 — VMM / Snapshot / Restore + aarch64 bring-up (§5.6, §5.4 flow)
+
+- **Test host = Raspberry Pi 5**, not multipass. Ubuntu 24.04 aarch64, 4c/7G,
+  `/dev/kvm` + `/dev/userfaultfd`, `unprivileged_userfaultfd=0`. Firecracker
+  v1.17.0 built from source (`aarch64-unknown-linux-musl`); assets in
+  `/opt/sandbox-assets/` (`firecracker`, `vmlinux` 6.1.188, `rootfs.ext4`
+  128 MiB). Repo syncs to `~/sandbox`, builds into `~/sb-build`.
+- **Transport is virtio-MMIO, not PCI.** `--enable-pci` on this host fails:
+  MSI-X setup fails → virtio-blk never registers → `Cannot open root device
+  "vda"`; with 128 MiB RAM PCI gives no kernel output and an immediate guest
+  shutdown. `pci_enabled()` now defaults to MMIO and `--enable-pci` is opt-in
+  via `SANDBOX_FC_PCI=1`; both capture and restore honour it. `fc_boot_args()`
+  prepends `keep_bootcon` on aarch64.
+- **Per-VM tap via `/snapshot/load` `network_overrides`, not hotplug.** FC only
+  supports post-restore device attach on PCI, so the template is captured
+  *with* a NIC (`net1`) and each restore retargets it
+  (`[{"iface_id":"net1","host_dev_name":"<tap>"}]`). FC fixes the guest MAC at
+  capture and `network_overrides` cannot change it, so restored VMs share the
+  template MAC. The restore tap must pre-exist (FC won't create it).
+- **Persistent tap + released fd.** `network_setup()` now sets `TUNSETPERSIST`
+  and closes its fd (`tap_fd = -1`); holding a non-multiqueue fd made FC's own
+  `TUNSETIFF` fail `EBUSY (os error 16)`. `network_tap_open()` reopens for
+  tests; `network_cleanup()` deletes by name. Bug found here: `TUNSETPERSIST`
+  takes its argument **by value** — `&zero` *set* the flag, leaking every tap
+  (`tun_flags = 0x1802`); fixed to pass `1`/`0` directly.
+- **Restore deadlock fix.** FC faults guest memory *during* `/snapshot/load`,
+  so the order is: `fc_send_request(load)` → start the UFFD handler → then
+  `fc_read_response` → start prefault → resume. HTTP client split into
+  `fc_connect`/`fc_send_request`/`fc_read_response`/`fc_transact`.
+- **Post-restore timer.** The restored guest executes (fresh serial output),
+  but the aarch64 arch timer does not re-arm on this host, so a `sleep`ing
+  guest hangs in WFI. The rootfs `/init` heartbeat busy-spins (`SANDBOX-TICK`
+  with a bounded loop); `test_vmm` waits for a fresh tick as execution proof.
+- **Seccomp rebuilt from Firecracker's own policy** (union of
+  `resources/seccomp/aarch64-unknown-linux-musl.json` vmm/api/vcpu filters) plus
+  the pre-filter calls (`socket/bind/listen/accept4`, `connect/sendmsg/recvmsg`,
+  `ppoll`, `uname`, `prctl`, `clone`, `dup3`, `epoll_create1`, `prlimit64`,
+  `getpid`, `set_robust_list`, `set_tid_address`) and a broadened `ioctl` filter
+  (KVM class `0xAE` + UFFD class `0xAA` incl. `USERFAULTFD_IOC_NEW` + specific
+  `TUN*`/`FIONBIO`/`TIOCGWINSZ`/`TCGETS`/`BLK*`). Derived under `SCMP_ACT_LOG`
+  (kernel audit, rate limits raised) and iterated via SIGSYS `syscall=` in
+  `dmesg`. Temp `SANDBOX_SECCOMP_LOG` hook removed. Probe now dies on `ptrace`
+  and `FIONREAD` (both genuinely forbidden).
+- **Network test hardened for the host.** Docker's iptables `FORWARD`
+  `policy drop` sits at the same filter priority as `sandbox_policy`, so
+  `forward_drop` never isolated our rule; the test now inserts a tap-scoped
+  accept (`-i`/`-o <tap>`) around that section and flushes the `sandbox_policy`
+  chains at start (pid-embedding tap names can collide across aborted runs).
+- Full `ctest` **8/8** (`tmpl_setup`, `pool`, `jailer`, `network`,
+  `network_cleanup`, `snapshot`, `vmm`, `uffd`) passes twice back-to-back with
+  seccomp **on** and MMIO, leaving **zero** leaked taps / rules.

@@ -1,7 +1,12 @@
-// Static probe executed inside the jail. Args: <outside_path> <expected_uid> <socket|ioctl>
+// Static probe executed inside the jail. Args: <outside_path> <expected_uid> <ptrace|ioctl>
 // Exit 10: outside path reachable (chroot broken). Exit 11: uid mismatch.
 // Exit 13: allowed syscall failed post-filter. Exit 14: filter load failed.
 // Otherwise dies by SIGSYS on the fatal call (Release), or exits with errno (Debug).
+//
+// NOTE: socket()/TCGETS are deliberately *not* probed as fatal — Firecracker's
+// runtime set needs both (UDS API server, UFFD handshake, terminal restore), so
+// the filter allows them. ptrace and an unlisted ioctl request stand in as
+// genuinely-forbidden calls.
 
 #include <errno.h>
 #include <fcntl.h>
@@ -10,6 +15,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <termios.h>
 #include <time.h>
@@ -41,10 +47,12 @@ int main(int argc, char** argv) {
     close(efd);
 
     if (use_ioctl) {
-        struct termios t;
-        int rc = ioctl(STDOUT_FILENO, TCGETS, &t);
+        // FIONREAD is not in the ioctl allow-list (KVM 0xAE / UFFD 0xAA classes
+        // plus specific tap/block/terminal requests) — must be killed.
+        int n = 0;
+        int rc = ioctl(STDOUT_FILENO, FIONREAD, &n);
         _exit(rc >= 0 ? 12 : errno);
     }
-    int sfd = socket(AF_INET, SOCK_STREAM, 0);
-    _exit(sfd >= 0 ? 12 : errno);
+    long prc = ptrace(PTRACE_TRACEME, 0, 0, 0);  // not in Firecracker's set
+    _exit(prc >= 0 ? 12 : errno);
 }

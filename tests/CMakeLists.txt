@@ -7,7 +7,7 @@ set_tests_properties(pool PROPERTIES TIMEOUT 120)
 
 # Phase 2: jailer + seccomp tests. The probe must be fully static: it runs
 # inside an empty chroot with no loader or shared libs.
-find_library(SECCOMP_STATIC_LIB libseccomp.a PATHS /usr/lib/x86_64-linux-gnu REQUIRED)
+find_library(SECCOMP_STATIC_LIB libseccomp.a PATHS /usr/lib/x86_64-linux-gnu /usr/lib/aarch64-linux-gnu REQUIRED)
 add_executable(jailer_probe jailer_probe.c ../src/seccomp.c)
 target_include_directories(jailer_probe PRIVATE ../include)
 target_link_libraries(jailer_probe ${SECCOMP_STATIC_LIB})
@@ -24,10 +24,10 @@ set_tests_properties(jailer PROPERTIES TIMEOUT 120)
 add_executable(test_network test_network.c)
 target_include_directories(test_network PRIVATE ../include)
 target_link_libraries(test_network sandbox)
-add_test(NAME network COMMAND test_network)
+add_test(NAME network COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_network)
 set_tests_properties(network PROPERTIES TIMEOUT 180 FIXTURES_SETUP netfix)
 add_test(NAME network_cleanup
-         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/net_cleanup.sh)
+         COMMAND sudo -E sh ${CMAKE_CURRENT_SOURCE_DIR}/net_cleanup.sh)
 set_tests_properties(network_cleanup PROPERTIES FIXTURES_CLEANUP netfix)
 
 # Phase 4: snapshot manager tests (no root needed: tmp dirs only).
@@ -36,6 +36,36 @@ target_include_directories(test_snapshot PRIVATE ../include)
 target_link_libraries(test_snapshot sandbox)
 add_test(NAME snapshot COMMAND test_snapshot)
 set_tests_properties(snapshot PROPERTIES TIMEOUT 120)
+
+# Phase 6: template fixture (builds "e2e" once; consumers REQUIRE it).
+# Roots live on LOCAL disk (/tmp): the workspace mount (9p) rejects Unix
+# socket creation (api.sock/uffd.sock bind fails with EPERM there).
+get_filename_component(TEST_BDIR ${CMAKE_CURRENT_BINARY_DIR} NAME)
+set(TEST_SNAPROOT "/tmp/sbtest-${TEST_BDIR}/snapshots")
+set(TEST_JAILROOT "/tmp/sbtest-${TEST_BDIR}/jails")
+add_executable(make_template make_template.c)
+target_include_directories(make_template PRIVATE ../include)
+target_link_libraries(make_template sandbox)
+add_test(NAME tmpl_setup COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/make_template)
+set_tests_properties(tmpl_setup PROPERTIES
+    TIMEOUT 300
+    FIXTURES_SETUP tmplfix
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+
+add_executable(test_vmm test_vmm.c)
+target_include_directories(test_vmm PRIVATE ../include)
+target_link_libraries(test_vmm sandbox)
+add_test(NAME vmm COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_vmm)
+set_tests_properties(vmm PROPERTIES
+    TIMEOUT 300
+    FIXTURES_REQUIRED tmplfix
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+
+# Pool now restores real VMs: same fixture + env (longer timeout for boots).
+set_tests_properties(pool PROPERTIES
+    TIMEOUT 300
+    FIXTURES_REQUIRED tmplfix
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
 
 # Phase 5: uffd lazy-restore tests (SKIPs where userfaultfd is denied).
 add_executable(test_uffd test_uffd.c)

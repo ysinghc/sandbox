@@ -7,6 +7,7 @@
 #include "snapshot_manager.h"
 #include "pool_manager.h"
 #include "vmm_manager.h"
+#include "jailer.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -198,23 +199,31 @@ int snapshot_check_version(pool_manager_t* pool, const char* template_name) {
 
 // --- template creation flow (§5.6) ---
 
-// Phase 6 seams (declared here until the VMM/firecracker layer lands).
-static int wait_for_guest_ready(vm_handle_t* vm) {
-    (void)vm;
-    return 0;
+// VMM seams (real since Phase 6; static shims keep the LLD call shape).
+static int wait_for_guest_ready(vm_handle_t* vm, const template_config_t* config) {
+    const char* marker = (config && config->ready_marker) ? config->ready_marker
+                                                          : "SANDBOX-READY";
+    return vmm_wait_ready(vm, marker, 60000);
 }
 
 static int firecracker_create_snapshot(vm_handle_t* vm, const char* vmstate_path,
                                        const char* memory_path) {
-    (void)vm;
     (void)vmstate_path;
     (void)memory_path;
-    return -1;  // no VMM until Phase 6
+    // temp_dir is bound at $jail/out, so capture lands in the staging dir.
+    return vmm_snapshot(vm, "/out/vmstate", "/out/memory.snap");
 }
 
 static int rm_rf(const char* path) {
     char cmd[PATH_MAX + 16];
     snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
+    int rc = system(cmd);
+    return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
+}
+
+static int copy_into(const char* src, const char* dst) {
+    char cmd[PATH_MAX * 2 + 16];
+    snprintf(cmd, sizeof(cmd), "cp %s %s", src, dst);
     int rc = system(cmd);
     return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
 }
@@ -246,19 +255,60 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     template_paths(template_name, final_dir, sizeof(final_dir));
 
     rm_rf(temp_dir);  // stale temp from a crashed run
+    if (mkdir_recursive(snapshot_root(), 0755) < 0) return -1;
     if (mkdir(temp_dir, 0755) < 0) return -1;
 
-    // 1. Boot a fresh VM (cold boot, ~125ms)
-    vm_handle_t* vm = vmm_cold_boot(config);
-    if (!vm) { rm_rf(temp_dir); return -1; }
+    // Template jail is ephemeral: capture binds temp_dir at $jail/out, and
+    // vmm_destroy below reclaims the whole jail (product stays in temp_dir).
+    char tjail[PATH_MAX], tvm_id[128];
+    snprintf(tvm_id, sizeof(tvm_id), "tpl-%s", template_name);
+    if (vmm_jail_path(tvm_id, tjail, sizeof(tjail)) < 0) {
+        rm_rf(temp_dir);
+        return -1;
+    }
+    rm_rf(tjail);  // stale jail from a crashed run
+
+    // Templates carry a NIC so restores can retarget its host tap via the load
+    // request's network_overrides (§5.7). The tap must exist at boot: the
+    // template VM opens it during InstanceStart. A NIC-less template would
+    // leave restores unable to reach the guest at all.
+    vm_network_t tpl_net;
+    memset(&tpl_net, 0, sizeof(tpl_net));
+    bool tpl_net_up = false;
+    template_config_t local = *config;
+    local.tap_name = NULL;
+    if (network_setup(tvm_id, &tpl_net) == 0) {
+        local.tap_name = tpl_net.tap_name;
+        tpl_net_up = true;
+    } else {
+        fprintf(stderr, "[snapshot] WARN: template NIC setup failed (errno=%d); "
+                        "restores will lack networking\n", errno);
+    }
+
+    // 1. Boot a fresh VM (cold boot, ~125ms).
+    vm_handle_t* vm = vmm_cold_boot(&local, tvm_id, tjail, temp_dir);
+    if (!vm) {
+        if (tpl_net_up) network_cleanup(&tpl_net);
+        rm_rf(temp_dir); rm_rf(tjail);
+        return -1;
+    }
+    if (tpl_net_up) {  // hand the tap to the VM: vmm_destroy reclaims it
+        vm->net = tpl_net;
+        vm->has_net = true;
+        tpl_net_up = false;
+    }
 
     // 2. Wait for application init to complete inside guest
-    if (wait_for_guest_ready(vm) < 0) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
+    if (wait_for_guest_ready(vm, config) < 0) {
+        vmm_destroy(vm);
+        rm_rf(temp_dir);
+        return -1;
+    }
 
     // 3. Pause vCPUs
     if (vmm_pause_vcpus(vm) < 0) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
 
-    // 4. Call Firecracker API: create_snapshot
+    // 4. Call Firecracker API: create_snapshot (lands in temp_dir via /out)
     char vmstate_path[PATH_MAX], memory_path[PATH_MAX];
     snprintf(vmstate_path, sizeof(vmstate_path), "%s/vmstate", temp_dir);
     snprintf(memory_path, sizeof(memory_path), "%s/memory.snap", temp_dir);
@@ -279,6 +329,21 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     uint32_t new_version = manifest->version;
     free(manifest);
     if (rc < 0) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
+
+    // Bundle kernel+rootfs so restores are store-contained (same jail paths).
+    char dst[PATH_MAX];
+    snprintf(dst, sizeof(dst), "%s/vmlinux", temp_dir);
+    if (copy_into(config->kernel_path, dst) < 0) {
+        vmm_destroy(vm);
+        rm_rf(temp_dir);
+        return -1;
+    }
+    snprintf(dst, sizeof(dst), "%s/rootfs.ext4", temp_dir);
+    if (copy_into(config->rootfs_path, dst) < 0) {
+        vmm_destroy(vm);
+        rm_rf(temp_dir);
+        return -1;
+    }
 
     // 6. Atomic publish to final path (same filesystem)
     if (snapshot_publish(temp_dir, final_dir) < 0) {

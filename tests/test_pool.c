@@ -9,15 +9,30 @@
 // Never put side-effecting calls inside assert — store rc first (CHECK_RC).
 
 #include <assert.h>
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "pool_manager.h"
 #include "vmm_manager.h"
+
+// Real-restore mode (Phase 6): provisions boot real Firecracker VMs from the
+// fixture template, so load is reduced vs the stub era. Without the fixture
+// template there is nothing to restore -> SKIP.
+static bool have_template(void) {
+    const char* r = getenv("SANDBOX_SNAPSHOT_ROOT");
+    if (!r || !*r) return false;
+    char ready[PATH_MAX];
+    snprintf(ready, sizeof(ready), "%s/READY", r);
+    struct stat st;
+    return stat(ready, &st) == 0;
+}
 
 #define CHECK_RC(rc, what) do { int _rc = (rc); if (_rc != 0) { \
     fprintf(stderr, "FAIL %s: rc=%d (%s:%d)\n", (what), _rc, __FILE__, __LINE__); \
@@ -71,7 +86,7 @@ static void test_pool_fills(void) {
     fflush(stdout);
     pool_manager_t pool;
     CHECK_RC(pool_manager_init(&pool, 5), "pool_manager_init");
-    CHECK_RC(wait_for_warm(&pool, 5, 5000), "wait_for_warm");
+    CHECK_RC(wait_for_warm(&pool, 5, 60000), "wait_for_warm");
     check_invariant(&pool);
     pool_manager_destroy(&pool);
     printf("[test] pool_fills_to_target: PASS\n");
@@ -80,8 +95,8 @@ static void test_pool_fills(void) {
 
 // --- test 2: N concurrent provision loops + monitor sampling invariant ---
 
-#define N_WORKERS 12
-#define ITERS_PER_WORKER 6
+#define N_WORKERS 8
+#define ITERS_PER_WORKER 3
 
 typedef struct {
     pool_manager_t* pool;
@@ -92,11 +107,11 @@ typedef struct {
 static void* provision_worker(void* arg) {
     worker_arg_t* wa = arg;
     sandbox_spec_t spec = {
-        .memory_mib = 512,
+        .memory_mib = 128,
         .vcpu_count = 1,
-        .template_name = "test",
+        .template_name = "e2e",
         .env_vars = NULL,
-        .pool_wait_ms = 20000,
+        .pool_wait_ms = 90000,
     };
     for (int i = 0; i < ITERS_PER_WORKER; i++) {
         check_invariant(wa->pool);
@@ -137,7 +152,7 @@ static void test_concurrent_provision(void) {
     fflush(stdout);
     pool_manager_t pool;
     CHECK_RC(pool_manager_init(&pool, 5), "pool_manager_init");
-    CHECK_RC(wait_for_warm(&pool, 5, 5000), "wait_for_warm");
+    CHECK_RC(wait_for_warm(&pool, 5, 60000), "wait_for_warm");
 
     atomic_int failures = 0, provisions = 0, samples = 0;
     atomic_bool stop = false;
@@ -195,7 +210,7 @@ static void test_overflow_timeout(void) {
 
     // Patient caller gets a VM once replenishment lands.
     sandbox_spec_t patient = impatient;
-    patient.pool_wait_ms = 5000;
+    patient.pool_wait_ms = 60000;
     rc = pool_provision(&pool, &patient, &vm);
     assert(rc == SANDBOX_OK);
     assert(vm != NULL);
@@ -208,6 +223,11 @@ static void test_overflow_timeout(void) {
 }
 
 int main(void) {
+    if (!have_template()) {
+        printf("SKIP (template fixture not ready)\n");
+        return 0;
+    }
+    pool_set_restore_source("e2e");
     test_pool_fills();
     test_concurrent_provision();
     test_overflow_timeout();

@@ -16,6 +16,12 @@ int uffd_setup_region(vm_handle_t* vm, const char* snap_path,
 int uffd_start_handler(vm_handle_t* vm);
 int uffd_start_prefault(vm_handle_t* vm);
 
+// Accept Firecracker's UFFD connection (JSON region mappings + fd via
+// SCM_RIGHTS), mmap the host snapshot, and populate vm (fd, regions, snap).
+// Manifest ownership transfers to vm. Returns 0 on success.
+int uffd_accept_handler(vm_handle_t* vm, int listen_fd, const char* snap_host_path,
+                        snap_manifest_t* manifest, int timeout_ms);
+
 // Flag destroy, wake + join both threads, release snapshot resources.
 void uffd_stop(vm_handle_t* vm);
 

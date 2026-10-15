@@ -1327,6 +1327,191 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
 
 ---
 
-**Document Version:** 1.0  
-**Last Updated:** 2025-09-12  
-**Status:** Implementation-ready
+**Document Version:** 1.1
+**Last Updated:** 2026-10-15
+**Status:** Implementation-ready + ground-truth deviations (see §15)
+
+---
+
+## 15. Ground-Truth Deviations (implementation wins over §§4–8)
+
+Deviations below are implemented, tested, and previously recorded only in
+`docs/IMPLEMENTATION_LOG.md` or code comments. This section makes them
+authoritative.
+
+### 15.1 Pool Manager (§5.1)
+- Fast path does NOT do `restoring_count++`. Kept verbatim it double-counts
+  with the replenishment thread and pins `warm + restoring == target` so the
+  pool never refills. Only the replenishment thread owns `restoring_count`.
+  (`src/pool_manager.c:2`)
+- `pool_manager_t` gains `pthread_t replenish_thread` (joined on destroy).
+- `target_size` clamped to `POOL_MAX_SIZE` (64); `init` rejects `target <= 0`;
+  `pool_wait_ms == 0` / NULL spec fails immediately; shutdown wakes waiters
+  with `INTERNAL`; NULL restore hands off NULL or retries after 10ms backoff.
+- `POOL_MAX_SIZE = 64`, `POOL_MAX_QUEUE_DEPTH = 128` in code vs `max_queue_depth = 50`
+  in `config/engine.conf`.
+
+### 15.2 Network Manager (§5.7)
+- LLD fixed `169.254.0.1` (host) / `.0.2` (guest) is NOT implemented. Code uses
+  per-VM `/30` subnets from `169.254.0.0/16` (16384 slots, FNV-1a hash of
+  `vm_id`; subnet `i` = host `.4i+1`, guest `.4i+2`) via `network_subnet_addrs()`.
+  Broker endpoint is therefore per-VM (its `/30` host IP), not a single `.1:8080`.
+- `SIOCSIFNETMASK /30` (`255.255.255.252`) is set after `SIOCSIFADDR`; bare
+  `SIOCSIFADDR` leaves a `/32` with no connected route and guest replies escape
+  via the default interface.
+- Rules are installed on BOTH `forward` and `input` chains (per-tap
+  allow `ip daddr <host-ip> tcp dport 8080` + drop). LLD `forward`-only rules
+  leave host-local ports reachable (measured SYN `.2`→`.1:9999` got RST,ACK =
+  guest port-scan); `input` rules close this.
+- Daemon auto-creates `table ip sandbox_policy` + `forward`/`input` chains
+  (`type filter hook …; policy accept`); LLD assumes they exist.
+  `network_manager_init()` (daemon startup) ensures chains; `network_setup()`
+  re-ensures. Cleanup resolves rule handles via `nft -a list` per chain, so
+  `vm_network_t` is unchanged (LLD TODO on handle tracking resolved this way).
+- The tap is created **persistent** and the setup fd is **released**
+  (`vm_network_t.tap_fd = -1`); Firecracker opens the device by name itself.
+  Holding the fd (the LLD/old behaviour) makes Firecracker's own `TUNSETIFF`
+  fail `EBUSY (Resource busy, os error 16)` — one non-multiqueue fd is the
+  only attachment allowed. `network_tap_open()` attaches a fresh fd for tests
+  (frame injection); `network_cleanup()` deletes the device **by name** (attach
+  → `TUNSETPERSIST 0` → close). `TUNSETPERSIST` takes its argument **by value**
+  — passing `&zero` *sets* (never clears) the flag, silently leaking every tap
+  until fixed (proved via `/sys/class/net/<tap>/tun_flags = 0x1802`).
+- `tap_fd == -1` is the "no fd held" sentinel; the VMM never holds one.
+
+### 15.3 Jailer / Seccomp (§§5.4–5.5)
+- Order is cgroup → chroot → caps → setuid/setgid → seccomp → exec. LLD
+  pseudocode places cgroup after chroot, which cannot work (`/sys/fs/cgroup`
+  unreachable post-chroot).
+- `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` (required by the
+  later setuid/setgid per LLD order) plus `CAP_SYS_PTRACE` (Firecracker UFFD
+  creation gate where `unprivileged_userfaultfd=0`; `ptrace()` itself stays
+  seccomp-blocked). Bounding-set drops run BEFORE the `capset` clear, and a
+  `CAP_SYS_PTRACE` file-cap (`security.capability` xattr) is written onto the
+  jail `/firecracker` copy so it survives the uid transition + exec.
+- Devices are fresh `mknod` + `chown` nodes (`/dev/kvm`, `/dev/net/tun`,
+  optionally `/dev/userfaultfd`), NOT LLD bind-mounts (bind preserves
+  root-only modes). `mount_jail_devices()` remains only for tests.
+- `spawn_jailed()` signature is extended vs LLD: `(jail_root, config, bin,
+  argv, mount_devices, apply_seccomp, files{jail-bind kernel/rootfs/vmstate/
+  memory.snap/out_dir}, serial_log)` with child exit codes 1–15
+  (1=mkdir … 14=seccomp 15=execve). Serial log is opened pre-chroot, `dup2`'d
+  post-setuid. Firecracker is launched with `--no-seccomp` (own libseccomp
+  filter applied by us) toggled by `SANDBOX_FC_SECCOMP`.
+- Jail contents additionally include `/vmlinux`, `/rootfs.ext4`, `/vmstate`,
+  `/memory.snap`, `/out`, `/uffd.sock`, `/serial.log`.
+- **Seccomp whitelist is NOT verbatim §5.5.** It is Firecracker v1.17's own
+  aarch64 policy (`resources/seccomp/aarch64-unknown-linux-musl.json`, the union
+  of its vmm/api/vcpu thread filters) **plus** the calls FC makes *before* it
+  would install its own per-thread filters — because FC runs `--no-seccomp` and
+  the jailer installs our filter first, ours is the only filter, so it also
+  covers that pre-filter window. Added beyond §5.5: `socket`/`bind`/`listen`/
+  `accept4` (UDS API server), `connect`/`sendmsg`/`recvmsg` (UFFD handshake),
+  `ppoll`, `uname`, `prctl`, `clone` (CLONE_VM only), `execve`, `dup3` (what
+  `dup2()` lowers to on aarch64 — there is no `dup2` syscall), `dup`,
+  `epoll_create1`, `prlimit64`, `readv`/`writev`, `timerfd_*`, `tkill`,
+  `getpid`, `set_robust_list`, `set_tid_address`.
+- The `ioctl` filter is no longer KVM-only. It allows the KVM class
+  (`arg1 & 0xFF00 == 0xAE00`), the UFFD class (`0xAA00` — FC creates the
+  userfaultfd itself via `USERFAULTFD_IOC_NEW` and registers regions, then hands
+  the fd to our handler), and the specific tap/block/terminal requests FC makes
+  (`TUNSETIFF`/`TUNSETOFFLOAD`/`TUNSETVNETHDRSZ`, `FIONBIO`, `TIOCGWINSZ`,
+  `TCGETS`/`TCSETS`, `BLKSSZGET`/`BLKDISCARD`/`BLKIOMIN`/`BLKIOOPT`/`BLKPBSZGET`).
+  Derived empirically under `SCMP_ACT_LOG` over a full cold-boot + snapshot +
+  UFFD-restore + pool run.
+- The Phase-2 probe now proves filter death on `ptrace` and on an unlisted
+  `ioctl` (`FIONREAD`); `socket`/`TCGETS` are deliberately allowed (FC needs
+  both), so they are no longer the fatal calls.
+
+### 15.4 UFFD Handler / Prefault (§§5.2–5.3)
+- `uffd_fd` is `O_NONBLOCK` + `poll(100ms)`; shutdown is flag → join →
+  release (never close-to-wake). `page_faults`/`destroyed` use `__atomic`
+  builtins on plain fields. Manifest page size must equal host page size.
+- Production restore does NOT use the LLD `uffd_setup_region()` register path.
+  Firecracker owns the uffd fd and passes it plus `[GuestRegionUffdMapping]`
+  (`base_host_virt_addr/size/offset/page_size`, multi-region) over a UDS
+  (`<jail>/uffd.sock`, `SOCK_STREAM`, `SCM_RIGHTS`, 30s accept timeout,
+  `chmod 0777` so jailed uid can connect) via `uffd_accept_handler()`.
+  Fault offsets are `region.file_offset + (fault - region.base)`; short
+  `UFFDIO_COPY` leaves the page missing for guest refault.
+- Both handler and prefault threads start pre-resume so prefault races from t=0
+  (LLD shows prefault with no explicit start point).
+
+### 15.5 VMM / Snapshot / Restore (§5.6 + §5.4 flow)
+- `vmm_cold_boot()` (diskless templates): `--no-seccomp`;
+  **virtio-MMIO by default** — `--enable-pci` only when `SANDBOX_FC_PCI` is
+  truthy. On the aarch64 test host PCI boot fails (MSI-X setup fails →
+  virtio-blk never registers → `Cannot open root device "vda"`; PCI with
+  128 MiB RAM gives no kernel output and an immediate guest shutdown), and the
+  6.1 vmlinux exposes virtio-mmio. 15 ms async API settle before
+  `InstanceStart`; readiness via serial-log marker poll (default
+  `SANDBOX-READY`). A NIC `net1` is attached when `template_config.tap_name` is
+  set, so the captured template can be retargeted per-VM on restore.
+- `vmm_restore()`: `PUT /snapshot/load {"snapshot_path":"/vmstate",
+  "mem_backend":{"backend_path":"/uffd.sock","backend_type":"Uffd"},
+  "network_overrides":[{"iface_id":"net1","host_dev_name":"<tap>"}],
+  "resume_vm":false}`. **There is no hotplug**: Firecracker only supports
+  post-restore device attach on PCI, which is unusable here, so the template is
+  captured *with* a NIC and the per-VM tap is swapped in via `network_overrides`
+  (works on MMIO). The tap must already exist (FC does not create it on restore
+  → `Open tap device failed: Operation not permitted`). FC fixes the guest MAC
+  at capture and `network_overrides` cannot change it (tap only), so restored
+  VMs share the template MAC. Ordering: send `/snapshot/load` → start the UFFD
+  handler (FC faults guest memory *during* load, so accepting first would
+  deadlock) → read the response → start prefault → resume. `fc_boot_args()`
+  prepends `keep_bootcon` on aarch64 to keep the guest console alive for the
+  marker. Full snapshots only.
+- Restore correctness proof is the resumed guest's own serial output
+  (`SANDBOX-TICK`); served `page_faults` only prove the *load*, not post-resume
+  execution (prefault pre-warms the host page cache).
+- Snapshot publish is backup-swap, not plain `rename` (plain rename cannot
+  replace a non-empty dir); readers see old → missing → new, never partial.
+  `pool_manager.expected_version` field added; `snapshot_check_version()`
+  adopts-on-first-sight, drains + adopts on change;
+  `pool_manager_flush_and_rebuild()` is a no-op Phase-8 hook.
+- Env overrides (tests/ops, not in LLD): `SANDBOX_SNAPSHOT_ROOT`,
+  `SANDBOX_JAIL_ROOT`, `FIRECRACKER_BIN`. Firecracker API is a minimal
+  HTTP/1.1 client over `AF_UNIX SOCK_STREAM` (`Content-Length` framing,
+  15s poll-bounded, 128KB response cap).
+- `restore_vm_from_snapshot()` takes no per-call template (global set by
+  `pool_set_restore_source()`); `TEST-DUMMY` returns a dummy handle after
+  ~83ms for pool/snapshot tests.
+
+### 15.6 Not Yet Implemented (stubs, LLD §§2.3, 2.4, 3.1, 5.8, 6)
+- `src/ipc_server.c` (`ipc_server_run/stop`), `src/lifecycle.c` client API
+  (`sandbox_create/pause/resume/destroy/inspect` return
+  `DAEMON_UNREACHABLE`), `src/daemon/main.c`, `src/cli/main.c`,
+  `src/broker/{main,http,credentials}.c`, `src/telemetry.c` are stubs.
+  Consequently: no `SOCK_SEQPACKET` + length-prefixed protobuf wire format yet
+  (only schema in `proto/sandbox.proto`, which matches §6.1), no session-token
+  issuance/validation, no broker (`broker-control.sock`, allowlist, credential
+  injection), no pidfd lifecycle, no metrics/logging output. `config/` ships
+  only `engine.conf` + `credentials.conf.example` (placeholder, never secret).
+
+### 15.7 aarch64 / Test Environment (§9)
+- Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
+  4 cores, ~7 GiB RAM, `/dev/kvm` + `/dev/userfaultfd` present,
+  `unprivileged_userfaultfd=0`, NOPASSWD sudo). All build and test runs happen
+  there; the original dev host could not build Firecracker and had no usable
+  sudo. Firecracker v1.17.0 is built from source
+  (`aarch64-unknown-linux-musl`) with assets under `/opt/sandbox-assets/`.
+- **Post-restore arch timer**: after a UFFD restore the guest *does* resume and
+  execute (proven by fresh serial output), but the aarch64 arch timer does not
+  re-arm on this host, so a guest that `sleep`s hangs in WFI. The rootfs
+  heartbeat therefore **busy-spins** (`SANDBOX-TICK` with a bounded loop)
+  instead of `sleep 1`, so a fresh marker is executable proof of the restored
+  vCPU.
+- **Docker `FORWARD` conflict**: the test host runs Docker, whose iptables
+  `FORWARD` chain has `policy drop` at the same `filter` hook priority as
+  `sandbox_policy`. At equal priority a drop in *any* chain wins regardless of
+  our accept, so the `forward_drop` control could never isolate our rule;
+  `test_network` now inserts a tap-scoped ACCEPT (`-i`/`-o <tap>`) around that
+  section. The test also flushes the `sandbox_policy` chains at start (tap
+  names embed a pid; an aborted run can otherwise collide with a later one).
+- Jail teardown needs the per-VM bind mounts unmounted before `rm -rf`; stale
+  `firecracker` processes leak between runs and must be reaped with
+  `pkill -9 -x firecracker` (use `-x`, not `-f`).
+- Full `ctest` (8/8: `tmpl_setup`, `pool`, `jailer`, `network`,
+  `network_cleanup`, `snapshot`, `vmm`, `uffd`) passes twice back-to-back with
+  seccomp **on** and MMIO transport, leaving zero leaked taps and zero leaked
+  `sandbox_policy` rules.

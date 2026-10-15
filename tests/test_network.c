@@ -336,6 +336,12 @@ int main(void) {
     snprintf(groute, sizeof(groute), "ip route del %s/32 2>/dev/null; ", g_guest_s);
     run(groute);
     run("ip route del 192.0.2.1/32 2>/dev/null; true");
+    // Flush stale sandbox_policy rules leaked by aborted runs. Tap names embed
+    // a pid, so an aborted run can collide with a later one (pid reuse) and a
+    // stale rule would then trip the leftover check.
+    CHECK_RC(network_manager_init(), "network_init");
+    run("nft flush chain ip sandbox_policy forward; "
+        "nft flush chain ip sandbox_policy input; true");
 
     // --- setup + state ---
     printf("[test] setup_state...\n");
@@ -344,6 +350,8 @@ int main(void) {
     CHECK_RC(network_setup(vm_id, &net), "network_setup");
     char tap[IFNAMSIZ];
     snprintf(tap, sizeof(tap), "tap-%s", vm_id);
+    // Firecracker owns the tap; tests reopen it to inject guest-side frames.
+    net.tap_fd = network_tap_open(&net);
     if (net.tap_fd < 0) abort();
     if (net.guest_ip != g_guest_ip) abort();
     if (if_nametoindex(tap) == 0) abort();
@@ -414,6 +422,15 @@ int main(void) {
     ip_forward_saved = fgetc(ff) == '1' ? 1 : 0;
     fclose(ff);
     set_ip_forward(1);
+    // Another filter-hook FORWARD chain (e.g. Docker's iptables chain) may sit
+    // at the same priority with `policy drop`. At equal priority a drop in ANY
+    // chain wins regardless of our accept, so our rule could never be isolated
+    // by the control below. Accept this tap's forwarded traffic for the
+    // duration of this section (no-op when no such chain/policy exists).
+    snprintf(cmd, sizeof(cmd),
+             "iptables -I FORWARD 1 -i %s -j ACCEPT 2>/dev/null; "
+             "iptables -I FORWARD 1 -o %s -j ACCEPT 2>/dev/null; true", tap, tap);
+    run(cmd);
     snprintf(cmd, sizeof(cmd), "ip netns add %s", ns);
     CHECK_RC(run(cmd), "netns add");
     // The netns ARPs for the guest IP on its veth; in production the guest
@@ -481,6 +498,10 @@ int main(void) {
     }
     printf("[test] forward_drop: PASS (drop enforced by our rule, proven by control)\n");
     fflush(stdout);
+    snprintf(cmd, sizeof(cmd),
+             "iptables -D FORWARD -i %s -j ACCEPT 2>/dev/null; "
+             "iptables -D FORWARD -o %s -j ACCEPT 2>/dev/null; true", tap, tap);
+    run(cmd);
 
     // --- input drop: closed host-local port is silenced, not RST ---
     printf("[test] input_drop...\n");
@@ -544,14 +565,23 @@ int main(void) {
     run(cmd);
     set_ip_forward(ip_forward_saved);
     CHECK_RC(network_cleanup(&net), "network_cleanup");
-    if (if_nametoindex(tap) != 0) abort();
+    if (if_nametoindex(tap) != 0) {
+        fprintf(stderr, "FAIL cleanup: tap %s still present\n", tap);
+        abort();
+    }
     rules = capture("nft -a list chain ip sandbox_policy forward 2>/dev/null");
     int leftover = (strstr(rules, tap) != NULL);
+    if (!leftover) {
+        free(rules);
+        rules = capture("nft -a list chain ip sandbox_policy input 2>/dev/null");
+        leftover = (strstr(rules, tap) != NULL);
+    }
+    if (leftover) {
+        fprintf(stderr, "FAIL cleanup: leftover rules for %s:\n%s\n", tap, rules);
+        free(rules);
+        abort();
+    }
     free(rules);
-    rules = capture("nft -a list chain ip sandbox_policy input 2>/dev/null");
-    leftover = leftover || (strstr(rules, tap) != NULL);
-    free(rules);
-    if (leftover) abort();
     printf("[test] cleanup: PASS\n");
     printf("ALL NETWORK TESTS PASSED\n");
     return 0;

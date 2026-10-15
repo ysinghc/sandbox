@@ -71,6 +71,46 @@ int network_manager_init(void) {
     return ensure_policy_chains();
 }
 
+// Attach to an existing tap by name (no TUNSETIFF flags beyond tap/no-pi).
+// Used for frame injection in tests; the VMM never holds a tap fd.
+int network_tap_open(const vm_network_t* net) {
+    if (!net || !net->tap_name[0]) { errno = EINVAL; return -1; }
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", net->tap_name);
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+// Destroy a persistent tap: attach, clear persist, release. The kernel drops
+// the interface once the last fd (ours here) is closed.
+static int network_tap_delete(const char* name) {
+    if (!name || !*name) return -1;
+    int fd = open("/dev/net/tun", O_RDWR);
+    if (fd < 0) return -1;
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+        close(fd);
+        return -1;
+    }
+    // By value: 0 clears the persistent flag, so closing removes the device.
+    if (ioctl(fd, TUNSETPERSIST, 0) < 0) {
+        close(fd);
+        return -1;
+    }
+    close(fd);
+    return 0;
+}
+
 int network_setup(const char* vm_id, vm_network_t* out_net) {
     if (!vm_id || !out_net) { errno = EINVAL; return -1; }
     char tap_name[IFNAMSIZ];
@@ -79,7 +119,10 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
         return -1;
     }
 
-    // 1. Create tap device
+    // 1. Create the tap device, make it persistent, then release our fd.
+    //    Firecracker opens the tap itself by name; while a non-multiqueue fd
+    //    is held, a second TUNSETIFF attach fails EBUSY. A persistent device
+    //    survives the close and can be reopened by name (VMM attach, tests).
     int tap_fd = open("/dev/net/tun", O_RDWR);
     if (tap_fd < 0) return -1;
     struct ifreq ifr;
@@ -90,36 +133,32 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
         close(tap_fd);
         return -1;
     }
+    // TUNSETPERSIST takes the value directly (not a pointer); a non-zero value
+    // keeps the device alive after the last fd closes.
+    if (ioctl(tap_fd, TUNSETPERSIST, 1) < 0) {
+        close(tap_fd);
+        return -1;
+    }
+    close(tap_fd);
+    tap_fd = -1;  // no fd held; the device lives on (persistent)
 
     // 2. Bring tap interface up
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sock < 0) { close(tap_fd); return -1; }
+    if (sock < 0) goto fail_tap;
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tap_name);
     ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) {
-        close(sock);
-        close(tap_fd);
-        return -1;
-    }
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0) { close(sock); goto fail_tap; }
 
     // 3. Assign host-side IP from this VM's /30 (mask /30, not classful).
     uint32_t host_ip, guest_ip;
-    if (network_subnet_addrs(vm_id, &host_ip, &guest_ip) < 0) {
-        close(sock);
-        close(tap_fd);
-        return -1;
-    }
+    if (network_subnet_addrs(vm_id, &host_ip, &guest_ip) < 0) { close(sock); goto fail_tap; }
     struct sockaddr_in* addr = (struct sockaddr_in*)&ifr.ifr_addr;
     memset(&ifr, 0, sizeof(ifr));
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tap_name);
     addr->sin_family = AF_INET;
     addr->sin_addr.s_addr = host_ip;
-    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) {
-        close(sock);
-        close(tap_fd);
-        return -1;
-    }
+    if (ioctl(sock, SIOCSIFADDR, &ifr) < 0) { close(sock); goto fail_tap; }
     // Bare SIOCSIFADDR leaves a /32 with no connected route, so guest replies
     // would route out the default interface. Set the /30 netmask.
     struct sockaddr_in* mask = (struct sockaddr_in*)&ifr.ifr_netmask;
@@ -127,22 +166,15 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
     snprintf(ifr.ifr_name, IFNAMSIZ, "%s", tap_name);
     mask->sin_family = AF_INET;
     mask->sin_addr.s_addr = htonl(0xFFFFFFFCu);
-    if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) {
-        close(sock);
-        close(tap_fd);
-        return -1;
-    }
+    if (ioctl(sock, SIOCSIFNETMASK, &ifr) < 0) { close(sock); goto fail_tap; }
     close(sock);
 
     // 4. nftables: only this VM's broker endpoint reachable, rest drops.
     // Forward chain covers routed traffic; input chain covers host-local
     // services (without it guests can port-scan the host).
-    if (ensure_policy_chains() < 0) { close(tap_fd); return -1; }
+    if (ensure_policy_chains() < 0) goto fail_tap;
     char host_ip_s[INET_ADDRSTRLEN];
-    if (!inet_ntop(AF_INET, &host_ip, host_ip_s, sizeof(host_ip_s))) {
-        close(tap_fd);
-        return -1;
-    }
+    if (!inet_ntop(AF_INET, &host_ip, host_ip_s, sizeof(host_ip_s))) goto fail_tap;
     char nft_cmd[1024];
     const char* chains[2] = { "forward", "input" };
     for (int c = 0; c < 2; c++) {
@@ -150,19 +182,22 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
             "nft add rule ip sandbox_policy %s "
             "iifname %s ip daddr %s tcp dport %d accept",
             chains[c], tap_name, host_ip_s, BROKER_PORT);
-        if (run_cmd(nft_cmd) < 0) { close(tap_fd); return -1; }
+        if (run_cmd(nft_cmd) < 0) goto fail_tap;
         snprintf(nft_cmd, sizeof(nft_cmd),
             "nft add rule ip sandbox_policy %s iifname %s drop",
             chains[c], tap_name);
-        if (run_cmd(nft_cmd) < 0) { close(tap_fd); return -1; }
+        if (run_cmd(nft_cmd) < 0) goto fail_tap;
     }
 
-    // 5. Return tap_fd and guest IP to vmm_manager (Firecracker will use this fd)
-    out_net->tap_fd = tap_fd;
+    // 5. Return guest IP + tap name (no fd: Firecracker owns the device)
+    out_net->tap_fd = -1;
     out_net->guest_ip = guest_ip;
     snprintf(out_net->tap_name, IFNAMSIZ, "%s", tap_name);
-
     return 0;
+
+fail_tap:
+    network_tap_delete(tap_name);
+    return -1;
 }
 
 // Delete every rule in a chain matching this tap (handles resolved at
@@ -198,8 +233,10 @@ int network_cleanup(const vm_network_t* net) {
     delete_tap_rules("forward", net->tap_name);
     delete_tap_rules("input", net->tap_name);
 
-    // 2. Close tap fd (kernel removes interface)
-    close(net->tap_fd);
+    // 2. Drop any locally held fd (tests reopen the tap for injection), then
+    //    destroy the persistent device by name. The VMM holds no fd.
+    if (net->tap_fd >= 0) close(net->tap_fd);
+    network_tap_delete(net->tap_name);
 
     return 0;
 }

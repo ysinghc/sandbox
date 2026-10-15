@@ -16,16 +16,21 @@ if(SANDBOX_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
-# Allow locally-extracted protobuf (no sudo) via PROTO_ROOT env/hint.
-# Production installs with system protobuf need no extra flags.
-if(DEFINED ENV{PROTO_ROOT})
-    list(APPEND CMAKE_PREFIX_PATH "$ENV{PROTO_ROOT}/usr")
-    set(Protobuf_PROTOC_EXECUTABLE "$ENV{PROTO_ROOT}/usr/bin/protoc" CACHE FILEPATH "protoc compiler")
-endif()
-
-# Dependencies
-find_package(Protobuf REQUIRED)
+# Use system protobuf (3.12.4 on Ubuntu 22.04) to avoid GLIBC version mismatches
+# Local protobuf in /tmp uses C23 functions not available in GLIBC 2.35
+# Use MODULE mode since system package doesn't provide Config.cmake
+find_package(Protobuf REQUIRED MODULE)
 find_library(SECCOMP_LIB seccomp REQUIRED)
+
+# Explicitly use system protobuf libraries
+set(Protobuf_LIBRARIES protobuf)
+set(Protobuf_LITE_LIBRARIES protobuf-lite)
+
+# Build-time rpath: test binaries live in build-vm/tests/, libsandbox.so in build-vm/
+# $ORIGIN/.. resolves to build-vm/ (the library directory at build time).
+set(CMAKE_BUILD_RPATH "\$ORIGIN;\$ORIGIN/..")
+set(CMAKE_INSTALL_RPATH "\$ORIGIN/../lib")
+set(CMAKE_BUILD_WITH_INSTALL_RPATH FALSE)
 
 # Protobuf code generation
 protobuf_generate_cpp(PROTO_SRCS PROTO_HDRS proto/sandbox.proto)
@@ -47,6 +52,12 @@ add_library(sandbox SHARED
 )
 target_include_directories(sandbox PUBLIC include ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(sandbox ${SECCOMP_LIB} ${Protobuf_LIBRARIES} pthread)
+
+# Set rpath: at build time libsandbox.so is in build-vm/, install puts it in lib/
+set_target_properties(sandbox PROPERTIES
+    BUILD_RPATH "\$ORIGIN"
+    INSTALL_RPATH "\$ORIGIN/../lib"
+)
 
 # C++ wrapper
 add_library(sandbox++ SHARED

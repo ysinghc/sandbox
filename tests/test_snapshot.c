@@ -19,6 +19,7 @@
 
 #include "pool_manager.h"
 #include "snapshot_manager.h"
+#include "vmm_manager.h"
 
 #define CHECK_RC(rc, what) do { int _rc = (rc); if (_rc != 0) { \
     fprintf(stderr, "FAIL %s: rc=%d (%s:%d)\n", (what), _rc, __FILE__, __LINE__); \
@@ -281,6 +282,7 @@ static int wait_warm(pool_manager_t* pool, int want, int timeout_ms) {
 static void test_version_check(void) {
     printf("[test] version_check...\n");
     fflush(stdout);
+    pool_set_restore_source("TEST-DUMMY");
     char vroot[PATH_MAX], vdir[PATH_MAX];
     snprintf(vroot, sizeof(vroot), "%s/vers", g_root);
     CHECK_RC(mkdir(vroot, 0755), "mkdir vers");

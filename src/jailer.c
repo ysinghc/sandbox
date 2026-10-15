@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -45,6 +46,109 @@ static int touch(const char* path) {
     return 0;
 }
 
+static int copy_file(const char* src, const char* dst, unsigned mode) {
+    int in = open(src, O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, mode);
+    if (out < 0) { close(in); return -1; }
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        ssize_t off = 0;
+        while (off < n) {
+            ssize_t w = write(out, buf + off, (size_t)(n - off));
+            if (w < 0) {
+                if (errno == EINTR) continue;
+                close(in);
+                close(out);
+                return -1;
+            }
+            off += w;
+        }
+    }
+    close(in);
+    if (close(out) < 0) return -1;
+    return (n < 0) ? -1 : 0;
+}
+
+// Bind-mount a host file at a jail path (target created first).
+static int bind_file(const char* src, const char* dst) {
+    if (touch(dst) < 0) return -1;
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) return -1;
+    return 0;
+}
+
+static int jail_bind_files(const char* jail_root, const jail_files_t* files,
+                             uid_t uid, gid_t gid) {
+    char dst[PATH_MAX];
+    if (files->kernel_path) {
+        snprintf(dst, sizeof(dst), "%s/vmlinux", jail_root);
+        if (bind_file(files->kernel_path, dst) < 0) return -1;
+    }
+    if (files->rootfs_path) {
+        snprintf(dst, sizeof(dst), "%s/rootfs.ext4", jail_root);
+        if (bind_file(files->rootfs_path, dst) < 0) return -1;
+    }
+    if (files->snap_state_src) {
+        snprintf(dst, sizeof(dst), "%s/vmstate", jail_root);
+        if (bind_file(files->snap_state_src, dst) < 0) return -1;
+    }
+    if (files->snap_mem_src) {
+        snprintf(dst, sizeof(dst), "%s/memory.snap", jail_root);
+        if (bind_file(files->snap_mem_src, dst) < 0) return -1;
+    }
+    if (files->out_dir) {
+        snprintf(dst, sizeof(dst), "%s/out", jail_root);
+        if (mkdir_recursive(dst, 0755) < 0) return -1;
+        // Ownership AND mode must be set on the SOURCE before bind-mounting.
+        // A bind mount propagates the source inode's DAC attributes into the
+        // jail; chown/chmod after mount on the mount point is a no-op for
+        // directory bind mounts on the same fs (it re-runs on the source inode
+        // which is correct but redundant, and provides no fix if omitted here).
+        // chmod 0700: jailed uid needs rwx for itself; root can always access.
+        if (chown(files->out_dir, uid, gid) < 0) return -1;
+        if (chmod(files->out_dir, 0700) < 0) return -1;
+        if (mount(files->out_dir, dst, NULL, MS_BIND, NULL) < 0) return -1;
+    }
+    // /dev/userfaultfd for kernels exposing it (6.1+); absent is fine.
+    // Fresh node like kvm/tun (bind would keep root-only perms).
+    struct stat ust;
+    if (stat("/dev/userfaultfd", &ust) == 0 && S_ISCHR(ust.st_mode)) {
+        snprintf(dst, sizeof(dst), "%s/dev/userfaultfd", jail_root);
+        unlink(dst);
+        if (mknod(dst, S_IFCHR | 0600, ust.st_rdev) == 0)
+            chown(dst, uid, gid);
+    }
+    return 0;
+}
+
+int make_jail_devices(const char* jail_root, uid_t uid, gid_t gid) {
+    // Fresh device nodes (not bind mounts): the jail uid needs to OPEN
+    // /dev/kvm and /dev/net/tun, but bind-mounting preserves the host's
+    // root-owned modes. mknod+chown gives access without touching host perms.
+    char devdir[PATH_MAX], netdir[PATH_MAX];
+    snprintf(devdir, sizeof(devdir), "%s/dev", jail_root);
+    snprintf(netdir, sizeof(netdir), "%s/dev/net", jail_root);
+    if (mkdir_recursive(netdir, 0755) < 0) return -1;
+    const struct { const char* src; const char* rel; } devs[] = {
+        { "/dev/kvm", "dev/kvm" },
+        { "/dev/net/tun", "dev/net/tun" },
+    };
+    for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
+        struct stat st;
+        if (stat(devs[i].src, &st) < 0) return -1;
+        if (!S_ISCHR(st.st_mode)) { errno = ENODEV; return -1; }
+        char dst[PATH_MAX];
+        snprintf(dst, sizeof(dst), "%s/%s", jail_root, devs[i].rel);
+        unlink(dst);
+        if (mknod(dst, S_IFCHR | 0600, st.st_rdev) < 0) return -1;
+        if (chown(dst, uid, gid) < 0) return -1;
+    }
+    return 0;
+}
+
+// Legacy entry point (bind-mount variant); kept for the unit test's
+// fail-unprivileged contract. Production path uses make_jail_devices.
 int mount_jail_devices(const char* jail_root) {
     char dst[PATH_MAX], devdir[PATH_MAX], netdir[PATH_MAX];
     snprintf(devdir, sizeof(devdir), "%s/dev", jail_root);
@@ -74,11 +178,16 @@ int write_cgroup_procs(const char* cgroup_path, pid_t pid) {
     return (w == (ssize_t)n) ? 0 : -1;
 }
 
-// Drops the bounding set first (needs CAP_SETPCAP, still held), then clears
-// everything except CAP_SETUID/CAP_SETGID (needed for the setuid/setgid step
-// that follows per LLD order); the uid transition clears the rest.
+// Drops everything except CAP_SETUID/CAP_SETGID (needed for the setuid/setgid
+// step that follows per LLD order) and CAP_SYS_PTRACE (Firecracker must create
+// UFFD objects; unprivileged_userfaultfd=0 here. Safe: our seccomp filter
+// blocks ptrace() itself, so the cap only opens the userfaultfd gate).
+// The uid transition clears the rest; file caps re-grant SYS_PTRACE at exec.
 int drop_capabilities(void) {
+    const uint32_t keep = (1u << CAP_SETUID) | (1u << CAP_SETGID) |
+                          (1u << CAP_SYS_PTRACE);
     for (int c = 0; c <= CAP_LAST_CAP; c++) {
+        if (c < 32 && ((keep >> c) & 1u)) continue;  // retained
         if (prctl(PR_CAPBSET_DROP, c, 0, 0, 0) < 0 && errno != EINVAL) return -1;
     }
 
@@ -86,7 +195,6 @@ int drop_capabilities(void) {
     struct __user_cap_data_struct data[2];
     if (syscall(SYS_capget, &hdr, data) < 0) return -1;
 
-    const uint32_t keep = (1u << CAP_SETUID) | (1u << CAP_SETGID);
     data[0].effective &= keep;
     data[0].permitted &= keep;
     data[0].inheritable = 0;
@@ -97,24 +205,70 @@ int drop_capabilities(void) {
 
 pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
                    const char* bin, char* const argv[],
-                   bool mount_devices, bool apply_seccomp) {
+                   bool mount_devices, bool apply_seccomp,
+                   const jail_files_t* files, const char* serial_log) {
     if (!jail_root || !config || !bin) { errno = EINVAL; return -1; }
     pid_t pid = fork();
     if (pid != 0) return pid;  // Parent returns child PID
 
-    // Child becomes the Jailer, then execs. Never returns; _exit(127) on error.
-    if (mkdir_recursive(jail_root, 0755) < 0) _exit(127);
-    if (mount_devices && mount_jail_devices(jail_root) < 0) _exit(127);
+    // Child becomes the Jailer, then execs. Never returns; _exit(N) on error:
+    // 1=mkdir, 2=chown, 3=copy_fc, 4=setxattr, 5=devices, 6=bind_files,
+    // 7=cgroup, 8=serial_open, 9=chroot, 10=chdir, 11=caps, 12=setgid,
+    // 13=setuid, 14=seccomp, 15=execve_fail
+    if (mkdir_recursive(jail_root, 0755) < 0) _exit(1);
+    // The jailed uid must create sockets/files at the jail top level
+    // (api.sock, uffd.sock). chown normally; 0777 fallback where chown is
+    // unsupported (e.g. 9p test mounts); fatal only if both fail.
+    if (chown(jail_root, config->jailer_uid, config->jailer_gid) < 0 &&
+        chmod(jail_root, 0777) < 0)
+        _exit(2);
+    if (files && files->firecracker_bin) {
+        char dst[PATH_MAX];
+        snprintf(dst, sizeof(dst), "%s/firecracker", jail_root);
+        if (copy_file(files->firecracker_bin, dst, 0755) < 0) _exit(3);
+        // Grant CAP_SYS_PTRACE across the setuid+exec boundary so Firecracker
+        // can create UFFD objects (20-byte v3 xattr as setcap writes it).
+        struct {
+            uint32_t magic_etc;
+            uint32_t permitted;
+            uint32_t inheritable;
+            uint32_t rootid;
+            uint32_t pad;
+        } __attribute__((packed)) fcap = { 0x02000001u, 1u << CAP_SYS_PTRACE,
+                                           0, 0, 0 };
+        if (setxattr(dst, "security.capability", &fcap, sizeof(fcap), 0) < 0) _exit(4);
+    }
+    if (mount_devices && make_jail_devices(jail_root, config->jailer_uid,
+                                                 config->jailer_gid) < 0)
+        _exit(5);
+    if (files && jail_bind_files(jail_root, files, config->jailer_uid,
+                                  config->jailer_gid) < 0)
+        _exit(6);
     if (config->cgroup_path && write_cgroup_procs(config->cgroup_path, getpid()) < 0)
-        _exit(127);
-    if (chroot(jail_root) < 0) _exit(127);
-    if (chdir("/") < 0) _exit(127);
-    if (drop_capabilities() < 0) _exit(127);
-    if (setgid(config->jailer_gid) < 0) _exit(127);
-    if (setuid(config->jailer_uid) < 0) _exit(127);
-    if (apply_seccomp && apply_seccomp_filter() < 0) _exit(127);
+        _exit(7);
+    int serial_fd = -1;
+    if (serial_log) {
+        // Opened pre-chroot on the host path and dup2'd post-setuid. The fd
+        // is already write-capable (checked at open), so the chown is only
+        // ownership hygiene and best-effort (9p mounts reject chown).
+        serial_fd = open(serial_log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (serial_fd < 0) _exit(8);
+        fchown(serial_fd, config->jailer_uid, config->jailer_gid);
+    }
+    if (chroot(jail_root) < 0) _exit(9);
+    if (chdir("/") < 0) _exit(10);
+    if (drop_capabilities() < 0) _exit(11);
+    if (setgid(config->jailer_gid) < 0) _exit(12);
+    if (setuid(config->jailer_uid) < 0) _exit(13);
+    if (apply_seccomp && apply_seccomp_filter() < 0) _exit(14);
+    if (serial_fd >= 0) {
+        dup2(serial_fd, STDOUT_FILENO);
+        dup2(serial_fd, STDERR_FILENO);
+        if (serial_fd != STDOUT_FILENO && serial_fd != STDERR_FILENO)
+            close(serial_fd);
+    }
     execve(bin, argv, environ);
-    _exit(127);  // exec failed
+    _exit(15);  // exec failed
 }
 
 int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {
@@ -122,5 +276,6 @@ int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {
     char jail_root[PATH_MAX];
     snprintf(jail_root, sizeof(jail_root), "/var/lib/sandbox-engine/jail/%s", vm_id);
     char* const argv[] = { (char*)"/firecracker", NULL };
-    return spawn_jailed(jail_root, config, "/firecracker", argv, true, true);
+    return spawn_jailed(jail_root, config, "/firecracker", argv, true, true,
+                        NULL, NULL);
 }

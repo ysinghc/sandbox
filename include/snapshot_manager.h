@@ -23,6 +23,10 @@ typedef struct {
     uint32_t vcpu_count;
     const char* kernel_path;
     const char* rootfs_path;
+    const char* ready_marker;  // serial marker, NULL = "SANDBOX-READY"
+    // Host tap for the template's NIC ("net1"). Set by create_snapshot_template;
+    // NULL builds a network-less template (which restores cannot retarget).
+    const char* tap_name;
 } template_config_t;
 
 int create_snapshot_template(const char* template_name, const template_config_t* config);
