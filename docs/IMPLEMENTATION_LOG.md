@@ -210,3 +210,11 @@ code comments; detail lives here.
 - Full `ctest` **8/8** (`tmpl_setup`, `pool`, `jailer`, `network`,
   `network_cleanup`, `snapshot`, `vmm`, `uffd`) passes twice back-to-back with
   seccomp **on** and MMIO, leaving **zero** leaked taps / rules.
+- **Doc/code sync pass.** Audited every component against `SYSTEM DESIGN.md`
+  and closed the remaining gaps in §15: the template store is self-contained
+  (bundles `vmlinux`+`rootfs.ext4`, restore binds `vmstate`/`memory.snap`/
+  `rootfs.ext4`), `create_snapshot_template` uses an ephemeral `tpl-<name>` jail
+  + template NIC, `vmm_cold_boot`/`vmm_restore` signatures differ from the LLD,
+  `restore_vm_from_snapshot` now provisions a real per-VM network, there is no
+  separate jailer binary (in-daemon `fork`) and cgroup placement is unused in
+  the VMM paths, and `src/cpp/sandbox.cpp` + `lifecycle_track/remove` are stubs.

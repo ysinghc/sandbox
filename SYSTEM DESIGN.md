@@ -337,6 +337,10 @@ private:
 
 ## 5. Detailed Component Specifications
 
+> The code bodies in this section are the **LLD pseudocode**. Where the shipped
+> implementation differs (ordering, signatures, file layout, syscall set, …),
+> **§15 (Ground-Truth Deviations) is authoritative**.
+
 ### 5.1 Pool Manager
 
 **Responsibility:** Maintain a fixed-size pool of warm VMs, serve provision requests from the pool, queue overflow requests.
@@ -606,6 +610,11 @@ int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {
   api.sock       → Unix socket for Firecracker API (created by Firecracker)
 ```
 
+> **Superseded in the implementation:** the device nodes are fresh `mknod` +
+> `chown` (not bind mounts), and the jail also carries `/vmlinux`,
+> `/rootfs.ext4`, `/vmstate`, `/memory.snap`, `/out`, `/uffd.sock`,
+> `/serial.log` and (when present) `/dev/userfaultfd`. See §15.3.
+
 ---
 
 ### 5.5 Jailer Seccomp Policy
@@ -681,6 +690,12 @@ int apply_seccomp_filter(void) {
 
 **Critical detail:** `ioctl` is argument-filtered to allow only `KVM_*` commands (`0xAE00` family). Blanket-allowing `ioctl` would undermine the entire filter.
 
+> **Superseded in the implementation:** the shipped filter is broader than this
+> sketch — it mirrors Firecracker's own aarch64 policy plus the calls it makes
+> before installing its per-thread filters, and its `ioctl` allow-list also
+> covers the UFFD class (`0xAA`) and specific tap/block/terminal requests. See
+> §15.3.
+
 ---
 
 ### 5.6 Snapshot Manager
@@ -694,6 +709,8 @@ int apply_seccomp_filter(void) {
   vmstate              # Firecracker microVM state file (~KB, JSON+binary)
   memory.snap          # Guest memory dump (sparse file, memory_mib × 1MiB)
   manifest.bin         # Page bitmap + metadata
+  vmlinux              # bundled kernel copy      (implementation; see §15.5)
+  rootfs.ext4          # bundled rootfs copy      (implementation; see §15.5)
 ```
 
 **Manifest format:**
@@ -1156,6 +1173,9 @@ add_subdirectory(tests)
 
 ## 9. Testing Strategy
 
+> The tables below are the LLD's intended test matrix. The **shipped** CTest
+> suite (8 targets) and its environment are listed in §15.7.
+
 ### 9.1 Unit Tests
 
 | Component | Test Coverage |
@@ -1383,6 +1403,12 @@ authoritative.
 - Order is cgroup → chroot → caps → setuid/setgid → seccomp → exec. LLD
   pseudocode places cgroup after chroot, which cannot work (`/sys/fs/cgroup`
   unreachable post-chroot).
+- There is **no separate jailer binary** (§2.2's "spawns Jailer binary" is
+  conceptual). `spawn_jailed()` is an in-daemon `fork()`; the forked child does
+  the jail setup and then directly `execve`s `/firecracker`. Cgroup placement is
+  `write_cgroup_procs(cgroup_path, getpid())` into a caller-provided
+  `cgroup.procs` (the daemon does not create the hierarchy); the VMM paths pass
+  `cgroup_path = NULL`, so **no cgroup is applied yet**.
 - `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` (required by the
   later setuid/setgid per LLD order) plus `CAP_SYS_PTRACE` (Firecracker UFFD
   creation gate where `unprivileged_userfaultfd=0`; `ptrace()` itself stays
@@ -1461,6 +1487,24 @@ authoritative.
   deadlock) → read the response → start prefault → resume. `fc_boot_args()`
   prepends `keep_bootcon` on aarch64 to keep the guest console alive for the
   marker. Full snapshots only.
+- **Template store is self-contained.** The published template dir holds
+  `vmstate`, `memory.snap`, `manifest.bin` **plus** copies of `vmlinux` and
+  `rootfs.ext4` (§5.6 lists only the first three). Restore binds
+  `vmstate`/`memory.snap`/`rootfs.ext4` into the restore jail at the same paths
+  the snapshot was captured with (`/vmstate`, `/memory.snap`, `/rootfs.ext4`);
+  the kernel is not needed on restore (no boot). The rootfs backing must exist
+  at that exact jail path or the drive re-open fails.
+- `create_snapshot_template()` boots through an **ephemeral `tpl-<name>` jail**
+  (reclaimed by `vmm_destroy`) and first brings up a **template NIC**
+  (`network_setup("tpl-<name>")`) so the capture carries a retargetable `net1`.
+  Signatures differ from §5.6: `vmm_cold_boot(const void* config, vm_id,
+  jail_root, out_dir)` (4 args, not 1 — `config` is `void*` to avoid a header
+  cycle) and the real restore entry is
+  `vmm_restore(template, vm_id, tap_name, guest_ip)`.
+- `restore_vm_from_snapshot()`'s real (non-`TEST-DUMMY`) path provisions a fresh
+  per-VM network (`network_setup("vm-<n>")`) and calls `vmm_restore`, handing the
+  tap to the VM for `vmm_destroy` to reclaim — so the pool delivers fully
+  networked, running VMs, not just handles.
 - Restore correctness proof is the resumed guest's own serial output
   (`SANDBOX-TICK`); served `page_faults` only prove the *load*, not post-resume
   execution (prefault pre-warms the host page cache).
@@ -1482,6 +1526,9 @@ authoritative.
   (`sandbox_create/pause/resume/destroy/inspect` return
   `DAEMON_UNREACHABLE`), `src/daemon/main.c`, `src/cli/main.c`,
   `src/broker/{main,http,credentials}.c`, `src/telemetry.c` are stubs.
+  `src/cpp/sandbox.cpp` (the §3.2 C++ RAII wrapper) is likewise a stub —
+  `Engine::create()` returns `nullptr`, `Sandbox`/`Engine` methods are no-ops —
+  and `lifecycle_track()`/`lifecycle_remove()` are no-op successes.
   Consequently: no `SOCK_SEQPACKET` + length-prefixed protobuf wire format yet
   (only schema in `proto/sandbox.proto`, which matches §6.1), no session-token
   issuance/validation, no broker (`broker-control.sock`, allowlist, credential
