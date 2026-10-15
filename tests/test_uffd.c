@@ -2,8 +2,8 @@
 // A "guest" thread touches pages only after register+handler-start (the
 // vmm_resume_vcpus ordering); every byte must match the snapshot pattern,
 // page_faults must equal the touched page count, and setup latency is
-// reported against the ~83ms restore-to-resume budget (Firecracker load,
-// which dominates it, lands in Phase 6).
+// reported against the ~83ms restore-to-resume budget (the Firecracker
+// /snapshot/load that dominates it is exercised end to end in test_vmm).
 
 #define _DEFAULT_SOURCE
 

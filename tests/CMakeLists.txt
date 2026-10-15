@@ -73,3 +73,12 @@ target_include_directories(test_uffd PRIVATE ../include)
 target_link_libraries(test_uffd sandbox)
 add_test(NAME uffd COMMAND test_uffd)
 set_tests_properties(uffd PROPERTIES TIMEOUT 120)
+
+# Phase 7: credential broker request pipeline (no root). In-process mock
+# engine + mock upstream over an ephemeral loopback port; upstream scheme is
+# forced to http for the test.
+add_executable(test_broker test_broker.c)
+target_include_directories(test_broker PRIVATE ../include)
+target_link_libraries(test_broker sandbox_broker_core)
+add_test(NAME broker COMMAND test_broker)
+set_tests_properties(broker PROPERTIES TIMEOUT 120)

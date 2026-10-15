@@ -21,6 +21,8 @@ endif()
 # Use MODULE mode since system package doesn't provide Config.cmake
 find_package(Protobuf REQUIRED MODULE)
 find_library(SECCOMP_LIB seccomp REQUIRED)
+# Phase 7: credential broker proxies upstream calls over HTTPS via libcurl.
+find_package(CURL REQUIRED)
 
 # Explicitly use system protobuf libraries
 set(Protobuf_LIBRARIES protobuf)
@@ -72,13 +74,20 @@ add_executable(sandboxd
 )
 target_link_libraries(sandboxd sandbox)
 
-# Broker
-add_executable(sandbox-broker
-    src/broker/main.c
+# Broker (§5.8). Core split into a library so the request pipeline is testable
+# in-process; main.c is a thin shim.
+add_library(sandbox_broker_core STATIC
     src/broker/http.c
     src/broker/credentials.c
+    src/broker/core.c
 )
-target_include_directories(sandbox-broker PRIVATE include)
+target_include_directories(sandbox_broker_core PUBLIC include)
+target_link_libraries(sandbox_broker_core PUBLIC CURL::libcurl)
+
+add_executable(sandbox-broker
+    src/broker/main.c
+)
+target_link_libraries(sandbox-broker sandbox_broker_core)
 
 # CLI tool
 add_executable(sandbox-cli

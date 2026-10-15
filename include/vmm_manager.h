@@ -46,7 +46,7 @@ typedef struct vm_handle_t {
     uint64_t resume_time_ms;
 } vm_handle_t;
 
-// Restore a VM from snapshot (Phase 1: stub with usleep(83000); Phase 6: real Firecracker restore)
+// Restore a VM from the configured template via real Firecracker /snapshot/load.
 vm_handle_t* restore_vm_from_snapshot(void);
 
 // Set the template restore source for pool replenishment (global by design:
@@ -78,7 +78,7 @@ int vmm_resume_vcpus(vm_handle_t* vm);
 // Current FC state string ("Running", "Paused", ...). 0 ok, -1 error.
 int vmm_state(vm_handle_t* vm, char* out, size_t n);
 
-// Snapshot a paused VM's state+memory to jail-view paths (Phase 4 seam).
+// Snapshot a paused VM's state+memory to jail-view paths.
 int vmm_snapshot(vm_handle_t* vm, const char* vmstate_jailview, const char* mem_jailview);
 int vmm_destroy(vm_handle_t* vm);
 

@@ -1,7 +1,18 @@
-#include <stdio.h>
+// Credential Broker entry point (§5.8). All request-handling logic lives in
+// the broker core (src/broker/{core,http,credentials}.c) so it is testable
+// in-process; this shim only initialises libcurl and runs the accept loop.
+
+#include "broker.h"
+
+#include <curl/curl.h>
 
 int main(int argc, char** argv) {
-    (void)argc; (void)argv;
-    printf("sandbox-broker (Phase 0 stub)\n");
-    return 0;
+    (void)argc;
+    (void)argv;
+    if (curl_global_init(CURL_GLOBAL_DEFAULT) != 0) {
+        return 1;
+    }
+    int rc = broker_run();
+    curl_global_cleanup();
+    return rc == 0 ? 0 : 1;
 }

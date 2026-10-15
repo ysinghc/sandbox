@@ -1,6 +1,6 @@
 // Phase 4 verification: manifest bitmap correctness, write/read round-trip,
 // versioning, atomic publish under concurrent readers, create-flow hygiene
-// with stubbed VMM, and version-check drain. No root needed (tmp dirs).
+// (bad config fails clean), and version-check drain. No root needed (tmp dirs).
 
 #define _DEFAULT_SOURCE
 
@@ -242,8 +242,8 @@ static void test_atomic_publish(void) {
 static void test_create_hygiene(void) {
     printf("[test] create_hygiene...\n");
     fflush(stdout);
-    // VMM seams are stubbed until Phase 6: creation must fail cleanly with
-    // no temp residue and no touch to any pre-existing final dir.
+    // Bad config (no kernel/rootfs) must fail cleanly with no temp residue
+    // and no touch to any pre-existing final dir.
     char final[PATH_MAX];
     snprintf(final, sizeof(final), "%s/hyg", g_root);
     CHECK_RC(mkdir(final, 0755), "mkdir hyg");

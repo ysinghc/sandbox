@@ -1521,19 +1521,20 @@ authoritative.
   `pool_set_restore_source()`); `TEST-DUMMY` returns a dummy handle after
   ~83ms for pool/snapshot tests.
 
-### 15.6 Not Yet Implemented (stubs, LLD §§2.3, 2.4, 3.1, 5.8, 6)
+### 15.6 Not Yet Implemented (stubs, LLD §§2.3, 3.1, 6)
 - `src/ipc_server.c` (`ipc_server_run/stop`), `src/lifecycle.c` client API
   (`sandbox_create/pause/resume/destroy/inspect` return
   `DAEMON_UNREACHABLE`), `src/daemon/main.c`, `src/cli/main.c`,
-  `src/broker/{main,http,credentials}.c`, `src/telemetry.c` are stubs.
-  `src/cpp/sandbox.cpp` (the §3.2 C++ RAII wrapper) is likewise a stub —
-  `Engine::create()` returns `nullptr`, `Sandbox`/`Engine` methods are no-ops —
-  and `lifecycle_track()`/`lifecycle_remove()` are no-op successes.
+  `src/telemetry.c` are stubs. `src/cpp/sandbox.cpp` (the §3.2 C++ RAII
+  wrapper) is likewise a stub — `Engine::create()` returns `nullptr`,
+  `Sandbox`/`Engine` methods are no-ops — and `lifecycle_track()`/
+  `lifecycle_remove()` are no-op successes.
   Consequently: no `SOCK_SEQPACKET` + length-prefixed protobuf wire format yet
-  (only schema in `proto/sandbox.proto`, which matches §6.1), no session-token
-  issuance/validation, no broker (`broker-control.sock`, allowlist, credential
-  injection), no pidfd lifecycle, no metrics/logging output. `config/` ships
-  only `engine.conf` + `credentials.conf.example` (placeholder, never secret).
+  (only schema in `proto/sandbox.proto`, which matches §6.1), no **engine-side**
+  session-token issuance (`CreateResponse.session_token`) or broker-control
+  validation endpoint (the broker's client half is done — see §15.8), no pidfd
+  lifecycle, no metrics/logging output. `config/` ships only `engine.conf` +
+  `credentials.conf.example` (placeholder, never secret).
 
 ### 15.7 aarch64 / Test Environment (§9)
 - Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
@@ -1558,7 +1559,42 @@ authoritative.
 - Jail teardown needs the per-VM bind mounts unmounted before `rm -rf`; stale
   `firecracker` processes leak between runs and must be reaped with
   `pkill -9 -x firecracker` (use `-x`, not `-f`).
-- Full `ctest` (8/8: `tmpl_setup`, `pool`, `jailer`, `network`,
-  `network_cleanup`, `snapshot`, `vmm`, `uffd`) passes twice back-to-back with
-  seccomp **on** and MMIO transport, leaving zero leaked taps and zero leaked
-  `sandbox_policy` rules.
+- Full `ctest` (9/9: `tmpl_setup`, `pool`, `jailer`, `network`,
+  `network_cleanup`, `snapshot`, `vmm`, `uffd`, `broker`) passes twice
+  back-to-back with seccomp **on** and MMIO transport, leaving zero leaked taps
+  and zero leaked `sandbox_policy` rules. CTest must be run **as root**:
+  `pool`/`jailer`/`vmm`/`network` do chroot / uid-drop / tap work, so a plain
+  unprivileged `ctest` fails them (and the broker test alone is unprivileged).
+
+### 15.8 Credential Broker (§5.8)
+- **Listen address is wildcard `0.0.0.0:8080`, not the LLD's
+  `169.254.0.1:8080`.** Phase 3 gave every VM its own /30, so the host side of
+  each tap is a different `.1`; no single link-local address can serve them all.
+  Overridable via `SANDBOX_BROKER_LISTEN` (`host:port`).
+- **Token-validation wire format is fixed-framing**, not the LLD structs (whose
+  `broker_validate_resp_t.allowed_services` is a `char**`, not serializable):
+  request = `u8 type` + 32 raw token bytes (`token_hex[65]` decoded to 32);
+  response = `u8 status` and, iff valid, `u32 sandbox_id` (BE) +
+  `u16 n_services` + `n × (u8 len + bytes)`. Notes are in `include/broker.h`.
+  The **engine half is Phase 8** (broker-control server + token issuance); the
+  broker's client half (`broker_validate_token`) is implemented and tested
+  against a mock engine.
+- **Upstream forwarding uses libcurl** (a new dependency — §8.1 lists none;
+  `find_package(CURL REQUIRED)` added). Defaults: scheme `https`, certificate
+  verification on. `SANDBOX_BROKER_UPSTREAM_SCHEME=…` and
+  `SANDBOX_BROKER_TLS_VERIFY=0` exist for tests only. The upstream response is
+  relayed **verbatim** (transfer/content decoding disabled) so the guest sees
+  the upstream's own `Transfer-Encoding`/`Content-Encoding` framing.
+- **Body handling:** request headers are read byte-by-byte so the body is never
+  consumed early (the LLD's "no buffering of body"), then the body is streamed
+  upstream through a libcurl read callback bounded by `Content-Length`.
+  **Chunked request bodies are rejected with 502.** The allow-list and the
+  credential lookup both key on the `Host` value with any `:port` stripped and
+  case folded; an allowed host with no credential entry gets 403.
+- **Extra source file:** `src/broker/core.c` holds the pipeline (the LLD lists
+  only `main/http/credentials`). It is compiled into the `sandbox_broker_core`
+  static library so `tests/test_broker.c` can drive one request in-process
+  (mock engine + mock upstream on an ephemeral loopback port); `main.c` is a
+  thin `curl_global_init` + accept-loop shim. The accept loop sets a 30 s
+  send/recv timeout so a stalled guest cannot pin the single-threaded
+  broker.

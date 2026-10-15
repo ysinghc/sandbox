@@ -221,7 +221,7 @@ void* replenishment_thread(void* arg) {
         pool->restoring_count++;
         pthread_mutex_unlock(&pool->lock);
 
-        // Restore VM from snapshot (blocking, ~83ms Phase 1 stub).
+        // Restore VM from the configured template (blocking Firecracker restore).
         vm_handle_t* vm = restore_vm_from_snapshot();
 
         pthread_mutex_lock(&pool->lock);

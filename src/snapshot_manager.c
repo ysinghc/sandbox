@@ -1,6 +1,6 @@
 // Snapshot Manager (§5.6): manifest format, atomic template publish,
-// version checking. VMM seams (cold boot, guest-ready, capture) are Phase 6;
-// the orchestration below follows the LLD flow line-for-line.
+// version checking. Cold boot, guest-ready wait and capture run on the real
+// VMM; the orchestration below follows the LLD flow line-for-line.
 
 #define _DEFAULT_SOURCE
 
@@ -199,7 +199,7 @@ int snapshot_check_version(pool_manager_t* pool, const char* template_name) {
 
 // --- template creation flow (§5.6) ---
 
-// VMM seams (real since Phase 6; static shims keep the LLD call shape).
+// VMM seams (real Firecracker; static shims keep the LLD call shape).
 static int wait_for_guest_ready(vm_handle_t* vm, const template_config_t* config) {
     const char* marker = (config && config->ready_marker) ? config->ready_marker
                                                           : "SANDBOX-READY";

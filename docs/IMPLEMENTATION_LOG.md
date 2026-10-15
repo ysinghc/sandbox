@@ -218,3 +218,42 @@ code comments; detail lives here.
   `restore_vm_from_snapshot` now provisions a real per-VM network, there is no
   separate jailer binary (in-daemon `fork`) and cgroup placement is unused in
   the VMM paths, and `src/cpp/sandbox.cpp` + `lifecycle_track/remove` are stubs.
+
+## Phase 7 — Credential Broker (§5.8, §2.4, §7.2)
+
+- Added `include/broker.h` and split the broker into a static library
+  `sandbox_broker_core` (`src/broker/{http,credentials,core}.c`) so the request
+  pipeline is testable in-process; `src/broker/main.c` is a thin
+  `curl_global_init` + `broker_run()` shim. New dependency: libcurl
+  (`find_package(CURL REQUIRED)`; installed `libcurl4-openssl-dev` on the Pi).
+- `credentials.c`: lenient INI parser (`[host]` + `credential = …`, `#`/`;`
+  comments); lookup strips `:port` and folds case.
+- `http.c`: byte-by-byte request-line+header reader (stops at CRLFCRLF so the
+  body stays in the socket — the LLD's "no buffering of body"), plus
+  case-insensitive get/set/remove and a minimal JSON error sender.
+- `core.c`: token-validation client, allow-list, libcurl forwarding, the
+  request pipeline, and the accept loop.
+- **Listen address is wildcard `0.0.0.0:8080`, not `169.254.0.1:8080`.** With
+  Phase 3's per-VM /30 each tap's host side is a distinct `.1`, so no one
+  link-local address serves all VMs. Overridable via `SANDBOX_BROKER_LISTEN`.
+- **Validation wire format is fixed-framing**, not the LLD structs
+  (`broker_validate_resp_t.allowed_services` is a `char**` — not serializable):
+  req = `u8 type` + 32 raw token bytes; resp = `u8 status`, and iff valid
+  `u32 sandbox_id` (BE) + `u16 n_services` + `n×(u8 len + bytes)`. The engine
+  half is Phase 8; tests drive a **mock engine**.
+- **Forwarding via libcurl** with defaults `https` + cert verification on; the
+  upstream response is relayed verbatim (transfer/content decoding off). Request
+  body is streamed via a libcurl read callback bounded by `Content-Length`;
+  chunked request bodies return 502. `SANDBOX_BROKER_UPSTREAM_SCHEME` /
+  `SANDBOX_BROKER_TLS_VERIFY=0` exist for tests.
+- New test `tests/test_broker.c` (`broker`, unprivileged): credential parsing,
+  HTTP parse/munge, token decode, allow-list, and an end-to-end proxy over an
+  ephemeral loopback mock upstream — asserts the real credential is injected,
+  the session token stripped, and the body streamed; plus the 401/403/400
+  reject paths.
+- **CTest must run as root** (`sudo -E ctest`): `pool`/`jailer`/`vmm`/`network`
+  do chroot / uid-drop / tap work. An unprivileged `ctest` shows spurious
+  `pool`/`jailer` failures (chroot exit 9); the per-test `sudo` commands in
+  `tests/CMakeLists.txt` only cover some targets.
+- Full `ctest` **9/9** (adds `broker`) passes twice back-to-back, seccomp on,
+  MMIO, zero leaked taps/rules.

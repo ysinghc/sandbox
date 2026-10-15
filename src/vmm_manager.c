@@ -526,7 +526,7 @@ int vmm_resume_vcpus(vm_handle_t* vm) {
     return 0;
 }
 
-// Snapshot the paused VM's state+memory to jail-view paths (Phase 4 seam).
+// Snapshot the paused VM's state+memory to jail-view paths.
 int vmm_snapshot(vm_handle_t* vm, const char* vmstate_jailview, const char* mem_jailview) {
     if (!vm || !vmstate_jailview || !mem_jailview) {
         errno = EINVAL;
@@ -762,7 +762,7 @@ void pool_set_restore_source(const char* template_name) {
 
 vm_handle_t* restore_vm_from_snapshot(void) {
     if (g_template[0] == '\0') {
-        usleep(83000);  // no source configured: preserve Phase 1 timing
+        usleep(83000);  // no source configured: keep the restore latency shape
         return NULL;
     }
     if (strcmp(g_template, "TEST-DUMMY") == 0) {
