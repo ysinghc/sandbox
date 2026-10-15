@@ -7,9 +7,12 @@
 #include "lifecycle.h"
 #include "libsandbox.h"
 #include "pool_manager.h"
+#include "telemetry.h"
 #include "vmm_manager.h"
 
 #include <pthread.h>
+#include <signal.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +133,43 @@ int main(void) {
         session_info_t si_bad;
         int vrb = broker_validate_token(bfd, bad, &si_bad);
         CHECK(vrb == BROKER_VALIDATE_INVALID, "bad token rejected");
+
+        // --- pidfd VMM crash detection (§4.2): kill the VMM and confirm the
+        // event loop reaps it, bumps the crash metric, revokes the token, and
+        // stops reporting the sandbox as live. ---
+        sandbox_handle_t* h2 = NULL;
+        CHECK(sandbox_create(&spec, &h2) == SANDBOX_OK && h2 != NULL,
+              "create for crash test");
+        sandbox_status_t cst;
+        memset(&cst, 0, sizeof(cst));
+        if (h2 && sandbox_inspect(h2, &cst) == SANDBOX_OK) {
+            uint32_t cid = cst.sandbox_id;
+            const char* tok2 = sandbox_handle_token(h2);
+            vm_handle_t* cvm = lifecycle_get(cid);
+            CHECK(cvm != NULL, "crash: vm registered");
+            if (cvm) {
+                kill(cvm->vmm_pid, SIGKILL);
+                int gone = 0;
+                for (int i = 0; i < 200; i++) {
+                    if (sandbox_inspect(h2, &cst) != SANDBOX_OK) { gone = 1; break; }
+                    usleep(10000);
+                }
+                CHECK(gone, "crash: reclaim observed");
+                CHECK(lifecycle_get(cid) == NULL, "crash: registry cleared");
+                if (bfd >= 0 && tok2) {
+                    session_info_t s2;
+                    CHECK(broker_validate_token(bfd, tok2, &s2) ==
+                              BROKER_VALIDATE_INVALID,
+                          "crash: token revoked");
+                }
+            }
+        }
+        char mbuf[8192];
+        telemetry_render(mbuf, sizeof(mbuf));
+        CHECK(strstr(mbuf, "sandbox_vmm_crashes_total 1") != NULL,
+              "crash: metric bumped");
+        CHECK(strstr(mbuf, "sandbox_uffd_faults_total 0") == NULL,
+              "metrics: uffd faults served");
 
         // Destroy revokes the token.
         uint32_t id = st.sandbox_id;

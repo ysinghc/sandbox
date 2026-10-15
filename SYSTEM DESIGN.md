@@ -1528,10 +1528,11 @@ authoritative.
   API, `src/daemon/main.c`, `src/cli/main.c`, `src/telemetry.c`,
   `src/cpp/sandbox.cpp`, `lifecycle_track/remove`) were **implemented in
   Phase 8** — see §15.9 for the ground-truth deviations from the LLD.
-- Still not implemented: **pidfd-based VMM crash detection** (no watcher; the
-  `sandbox_vmm_crashes_total` metric is defined but never bumped), **per-VM
-  environment injection** (see §15.9), and a hierarchical config layer
-  (`config/` still ships only `engine.conf` + `credentials.conf.example`).
+- pidfd-based VMM crash detection was implemented in **Phase 9** (§15.10), and
+  the §11 gauges/counters were wired there too.
+- Still not implemented: **per-VM environment injection** (see §15.9/§15.11)
+  and a hierarchical config layer (`config/` still ships only `engine.conf` +
+  `credentials.conf.example`).
 
 ### 15.7 aarch64 / Test Environment (§9)
 - Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
@@ -1624,7 +1625,8 @@ authoritative.
   and `ResumeResponse` (field 6). The LLD schema has no reply for
   pause/resume, so the client would block forever waiting for a frame. The
   addition is backward-compatible.
-- **Event loop is single-threaded epoll, no pidfd watching.** A `Create`
+- **Event loop is single-threaded epoll; Phase 9 added pidfd crash watching**
+  (§15.10). A `Create`
   blocks the loop for the duration of the pool restore (~0.1 s warm / ~1 s cold)
   — acceptable at this scale. `epoll` multiplexes the listener, the wake
   `eventfd` and every client fd; SEQPACKET + level-triggered EPOLLIN guarantees
@@ -1656,7 +1658,8 @@ authoritative.
   Prometheus text; the daemon serves them on `127.0.0.1:<metrics_port>` only
   when `--metrics-port` is set (`telemetry_serve` in a detached thread).
   Counters are `atomic` and bumped on the create path; `sandbox_vmm_crashes_total`
-  is defined but not yet wired. **Structured logs are JSON lines on stderr from
+  is bumped on VMM exit and the pool gauges/uffd counter are pushed from their
+  owners (Phase 9, §15.10). **Structured logs are JSON lines on stderr from
   the component that owns the event** (`daemon`, `ipc_server`, `broker`) — there
   is no separate logger object.
 - **C++ wrapper (§3.2):** `Engine`'s constructor throws `SandboxError` if
@@ -1671,3 +1674,46 @@ authoritative.
   helper — not part of public `libsandbox.h`). `ipc_server.h` adds
   `ipc_server_set_pool/template/allowed_services`, `ipc_server_request_stop`,
   `ipc_server_start/stop_broker_control`, `ipc_server_token_count`.
+
+### 15.10 Phase 9 — Packaging, Metrics, pidfd Crash Detection (§§4.2, 10, 11)
+- **Install rules (§10.2/§10.3).** `CMakeLists.txt` previously had **no
+  `install()` rules**; it now installs `sandboxd`/`sandbox-broker`/`sandbox-cli`
+  → `${CMAKE_INSTALL_BINDIR}`, `libsandbox.so`/`libsandbox++.so` →
+  `${CMAKE_INSTALL_LIBDIR}`, `libsandbox.h`/`libsandbox.hpp` → `include/`,
+  creates the data/run dirs (`/var/lib/sandbox-engine/{jail,snapshots,config}`,
+  `/var/run/sandbox-engine`), installs `config/engine.conf` →
+  `/var/lib/sandbox-engine/config`, `config/credentials.conf.example` →
+  `/etc/sandbox-engine`, and `systemd/sandboxd.service` →
+  `${CMAKE_INSTALL_LIBDIR}/systemd/system`. The absolute roots are cache vars
+  (`SANDBOX_STATE_DIR`/`SANDBOX_ETC_DIR`/`SANDBOX_RUN_DIR`); `DESTDIR=` stages
+  them. `CMAKE_INSTALL_RPATH=$ORIGIN/../lib` makes the installed `sandboxd`
+  resolve the installed `libsandbox.so`. The daemon now falls back to
+  `/var/lib/sandbox-engine/config/engine.conf` when `--config` is absent, so the
+  unit's bare `ExecStart=/usr/local/bin/sandboxd` picks up the packaged config.
+- **Metrics wired (§11.1).** `telemetry_pool_state()` is pushed from the pool at
+  every state change (fast-path hit, overflow enqueue/dequeue/timeout, each
+  replenish result, drain, destroy, init) while holding `pool->lock`, and
+  `telemetry_uffd_fault()` is bumped by the UFFD handler for every served page
+  (`UFFDIO_COPY` *and* `UFFDIO_ZEROPAGE`). Previously only
+  `telemetry_provision_latency`/`telemetry_pool_exhausted` were called, so the
+  warm/restoring/overflow gauges and the fault counter always scraped as 0.
+- **pidfd VMM crash detection (§4.2).** The IPC loop's epoll set now tags each
+  registration via `data.u64` (`EP_LISTEN`/`EP_WAKE`/`EP_CLIENT`/`EP_PIDFD`)
+  instead of `data.fd`. Every **handed-out** VM is tracked with
+  `pidfd_open(vmm_pid, 0)` (CLOEXEC) and its pidfd added to epoll; warm-pool VMs
+  are never tracked (internal destroys handle themselves). On exit the loop
+  `waitid(P_PIDFD, …, WEXITED|WNOHANG)`-reaps the VMM (idempotent with
+  `vmm_destroy`'s own `kill`+`waitpid`), bumps `sandbox_vmm_crashes_total`, logs
+  `{"component":"ipc_server","event":"vmm_crash","sandbox_id":N}`, and reclaims
+  engine state — `vmm_destroy`, `lifecycle_remove`, `token_revoke`,
+  `session_disown` — so a later inspect/destroy reports the sandbox is gone
+  (`PERMISSION_DENIED`: the session no longer owns a dead id). The normal destroy
+  path calls `pidfd_untrack()` before killing. Table is `IPC_MAX_PIDFDS=256`;
+  if `pidfd_open` fails the sandbox still works (crash detection degraded) and a
+  warning is logged.
+- **Test coverage.** `tests/test_ipc.c` gained a crash case: create a second
+  sandbox, `SIGKILL` its VMM via `lifecycle_get()->vmm_pid`, then assert the
+  client observes reclaim, the registry clears, the token no longer validates,
+  and the rendered metrics show `sandbox_vmm_crashes_total 1` and a non-zero
+  `sandbox_uffd_faults_total` (proving the Phase-9 wiring). The metrics scrape
+  also verifies the pool gauges are now live.

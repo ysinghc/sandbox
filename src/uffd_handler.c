@@ -8,6 +8,7 @@
 #include "uffd_handler.h"
 #include "prefault_worker.h"
 #include "snapshot_manager.h"
+#include "telemetry.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -218,16 +219,20 @@ void* uffd_thread_fn(void* arg) {
                     .mode = 0,
                 };
                 if (ioctl(vm->uffd_fd, UFFDIO_COPY, &copy) == 0 &&
-                    copy.copy == (int64_t)ps)
+                    copy.copy == (int64_t)ps) {
                     __atomic_fetch_add(&vm->page_faults, 1u, __ATOMIC_RELAXED);
+                    telemetry_uffd_fault();
+                }
                 // Short copy: page stays missing, guest refaults on retry.
             } else {
                 struct uffdio_zeropage zero = {
                     .range = { .start = fault_addr, .len = (uint64_t)ps },
                     .mode = 0,
                 };
-                if (ioctl(vm->uffd_fd, UFFDIO_ZEROPAGE, &zero) == 0)
+                if (ioctl(vm->uffd_fd, UFFDIO_ZEROPAGE, &zero) == 0) {
                     __atomic_fetch_add(&vm->page_faults, 1u, __ATOMIC_RELAXED);
+                    telemetry_uffd_fault();
+                }
             }
             break;
         }

@@ -167,6 +167,11 @@ int main(int argc, char** argv) {
             config_file = argv[++i];
         }
     }
+    if (!config_file) {
+        // §10.2: the packaged config lives at $SANDBOX_STATE_DIR/config.
+        static const char* def = "/var/lib/sandbox-engine/config/engine.conf";
+        if (access(def, R_OK) == 0) config_file = def;
+    }
     if (config_file) config_load_file(&cfg, config_file);
     config_apply_env(&cfg);
 

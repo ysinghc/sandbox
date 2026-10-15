@@ -97,6 +97,37 @@ add_executable(sandbox-cli
 target_include_directories(sandbox-cli PRIVATE include)
 target_link_libraries(sandbox-cli sandbox++)
 
+# --- Installation (§10.2/§10.3) ---
+include(GNUInstallDirs)
+
+# Deployment layout (§10.2). Absolute paths by default so a plain
+# `cmake --install` lands the daemon where systemd/sandboxd.service expects it;
+# override or use DESTDIR= for staging.
+set(SANDBOX_STATE_DIR "/var/lib/sandbox-engine" CACHE PATH "Engine state dir")
+set(SANDBOX_ETC_DIR   "/etc/sandbox-engine"     CACHE PATH "Engine config dir")
+set(SANDBOX_RUN_DIR   "/var/run/sandbox-engine" CACHE PATH "Engine runtime dir")
+
+install(TARGETS sandboxd sandbox-broker sandbox-cli
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS sandbox sandbox++
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(FILES include/libsandbox.h include/libsandbox.hpp
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+
+# Data/runtime directories (§10.2 step 4).
+install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/jail)
+install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/snapshots)
+install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/config)
+install(DIRECTORY DESTINATION ${SANDBOX_RUN_DIR})
+
+# Config (§10.2 step 5). credentials.conf is 0600 and installed separately.
+install(FILES config/engine.conf DESTINATION ${SANDBOX_STATE_DIR}/config)
+install(FILES config/credentials.conf.example DESTINATION ${SANDBOX_ETC_DIR})
+
+# systemd unit (§10.3).
+install(FILES systemd/sandboxd.service
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
+
 # Tests
 enable_testing()
 add_subdirectory(tests)

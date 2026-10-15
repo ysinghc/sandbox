@@ -35,13 +35,19 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
 #define IPC_MAX_SESSIONS 64
 #define IPC_MAX_OWNED 128
+#define IPC_MAX_PIDFDS 256
 #define TOKEN_MAX_SERVICES 64
+
+// epoll data.u64 tag: low byte = kind, upper bits = payload (fd or table index).
+enum { EP_LISTEN = 1, EP_WAKE = 2, EP_CLIENT = 3, EP_PIDFD = 4 };
 
 typedef struct {
     int fd;
@@ -75,6 +81,14 @@ static struct {
     char bc_path[108];
 
     session_t sessions[IPC_MAX_SESSIONS];
+
+    // pidfd -> sandbox tracking for VMM crash detection (§4.2). Only handed-out
+    // VMs are tracked; warm-pool VMs are only destroyed internally.
+    struct {
+        int pidfd;
+        int session_fd;
+        uint32_t sandbox_id;
+    } vms[IPC_MAX_PIDFDS];
 
     pthread_mutex_t tok_lock;
     token_entry_t* tokens;
@@ -252,6 +266,85 @@ static void session_disown(session_t* s, uint32_t id) {
 }
 
 // ---------------------------------------------------------------------------
+// pidfd crash tracking (§4.2). pidfd_open() + epoll lets the event loop notice
+// a VMM dying (crash or seccomp SIGSYS) without polling. Only the IPC loop
+// thread touches this table.
+// ---------------------------------------------------------------------------
+
+static int pidfd_track(pid_t pid, int session_fd, uint32_t sandbox_id) {
+    if (pid <= 0 || g.epfd < 0) return -1;
+    int idx = -1;
+    for (int i = 0; i < IPC_MAX_PIDFDS; i++) {
+        if (g.vms[i].pidfd < 0) { idx = i; break; }
+    }
+    if (idx < 0) return -1;
+    int pfd = (int)syscall(SYS_pidfd_open, pid, 0);
+    if (pfd < 0) return -1;
+    int fl = fcntl(pfd, F_GETFD);
+    if (fl >= 0) fcntl(pfd, F_SETFD, fl | FD_CLOEXEC);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.u64 = ((uint64_t)idx << 8) | EP_PIDFD;
+    if (epoll_ctl(g.epfd, EPOLL_CTL_ADD, pfd, &ev) < 0) {
+        close(pfd);
+        return -1;
+    }
+    g.vms[idx].pidfd = pfd;
+    g.vms[idx].session_fd = session_fd;
+    g.vms[idx].sandbox_id = sandbox_id;
+    return 0;
+}
+
+// Stop watching a sandbox's VMM (normal destroy path). Safe if untracked.
+static void pidfd_untrack(uint32_t sandbox_id) {
+    for (int i = 0; i < IPC_MAX_PIDFDS; i++) {
+        if (g.vms[i].pidfd >= 0 && g.vms[i].sandbox_id == sandbox_id) {
+            if (g.epfd >= 0) epoll_ctl(g.epfd, EPOLL_CTL_DEL, g.vms[i].pidfd, NULL);
+            close(g.vms[i].pidfd);
+            g.vms[i].pidfd = -1;
+            g.vms[i].session_fd = -1;
+            g.vms[i].sandbox_id = 0;
+        }
+    }
+}
+
+// The VMM exited: reap it, bump the crash metric, and reclaim engine-side
+// state so a later inspect/destroy reports the sandbox is gone.
+static void pidfd_handle(int idx) {
+    if (idx < 0 || idx >= IPC_MAX_PIDFDS || g.vms[idx].pidfd < 0) return;
+    int pfd = g.vms[idx].pidfd;
+    int sfd = g.vms[idx].session_fd;
+    uint32_t id = g.vms[idx].sandbox_id;
+
+    // Reap the dead child (idempotent w.r.t. vmm_destroy's own waitpid).
+    siginfo_t si;
+    while (waitid(P_PIDFD, (id_t)pfd, &si, WEXITED | WNOHANG) < 0 &&
+           errno == EINTR) {
+    }
+    epoll_ctl(g.epfd, EPOLL_CTL_DEL, pfd, NULL);
+    close(pfd);
+    g.vms[idx].pidfd = -1;
+    g.vms[idx].session_fd = -1;
+    g.vms[idx].sandbox_id = 0;
+
+    telemetry_vmm_crash();
+    fprintf(stderr,
+            "{\"component\":\"ipc_server\",\"event\":\"vmm_crash\","
+            "\"sandbox_id\":%u}\n",
+            id);
+
+    vm_handle_t* vm = lifecycle_get(id);
+    if (vm) {
+        vmm_destroy(vm);
+        lifecycle_remove(id);
+    }
+    token_revoke(id);
+    session_t* s = session_find(sfd);
+    if (s) session_disown(s, id);
+}
+
+// ---------------------------------------------------------------------------
 // message handling
 // ---------------------------------------------------------------------------
 
@@ -309,6 +402,11 @@ static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
 
     lifecycle_track(vm);
     session_own(s, vm->sandbox_id);
+    if (pidfd_track(vm->vmm_pid, fd, vm->sandbox_id) < 0) {
+        // Crash detection degraded but the sandbox is still usable.
+        fprintf(stderr, "[ipc] pidfd_track failed for sandbox %u\n",
+                vm->sandbox_id);
+    }
 
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
@@ -336,6 +434,7 @@ static void handle_destroy(int fd, session_t* s, uint32_t id) {
     }
     vm_handle_t* vm = lifecycle_get(id);
     if (vm) vmm_destroy(vm);
+    pidfd_untrack(id);
     lifecycle_remove(id);
     token_revoke(id);
     session_disown(s, id);
@@ -423,6 +522,7 @@ static void drop_session(session_t* s) {
             vmm_destroy(vm);
             lifecycle_remove(id);
         }
+        pidfd_untrack(id);
         token_revoke(id);
     }
     if (g.epfd >= 0) {
@@ -479,7 +579,7 @@ static void accept_clients(int lfd) {
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
         ev.events = EPOLLIN;
-        ev.data.fd = cfd;
+        ev.data.u64 = ((uint64_t)cfd << 8) | EP_CLIENT;
         if (epoll_ctl(g.epfd, EPOLL_CTL_ADD, cfd, &ev) < 0) {
             close(cfd);
             s->fd = -1;
@@ -491,6 +591,11 @@ static void accept_clients(int lfd) {
 int ipc_server_run(const char* socket_path) {
     if (!socket_path) return -1;
     for (int i = 0; i < IPC_MAX_SESSIONS; i++) g.sessions[i].fd = -1;
+    for (int i = 0; i < IPC_MAX_PIDFDS; i++) {
+        g.vms[i].pidfd = -1;
+        g.vms[i].session_fd = -1;
+        g.vms[i].sandbox_id = 0;
+    }
 
     g.listen_fd = make_seqpacket_listener(socket_path);
     if (g.listen_fd < 0) {
@@ -508,9 +613,9 @@ int ipc_server_run(const char* socket_path) {
     struct epoll_event ev;
     memset(&ev, 0, sizeof(ev));
     ev.events = EPOLLIN;
-    ev.data.fd = g.listen_fd;
+    ev.data.u64 = EP_LISTEN;
     epoll_ctl(g.epfd, EPOLL_CTL_ADD, g.listen_fd, &ev);
-    ev.data.fd = g.wake_fd;
+    ev.data.u64 = EP_WAKE;
     epoll_ctl(g.epfd, EPOLL_CTL_ADD, g.wake_fd, &ev);
 
     fprintf(stderr, "[ipc] listening on %s (template %s)\n", socket_path,
@@ -534,16 +639,22 @@ int ipc_server_run(const char* socket_path) {
             break;
         }
         for (int i = 0; i < n; i++) {
-            int fd = evs[i].data.fd;
-            if (fd == g.wake_fd) {
+            uint64_t tag = evs[i].data.u64;
+            int kind = (int)(tag & 0xff);
+            if (kind == EP_WAKE) {
                 uint64_t v;
                 if (read(g.wake_fd, &v, sizeof(v)) < 0) { /* drained */ }
                 continue;
             }
-            if (fd == g.listen_fd) {
+            if (kind == EP_LISTEN) {
                 accept_clients(g.listen_fd);
                 continue;
             }
+            if (kind == EP_PIDFD) {
+                pidfd_handle((int)(tag >> 8));
+                continue;
+            }
+            int fd = (int)(tag >> 8);
             session_t* s = session_find(fd);
             if (!s) continue;
             size_t plen = 0;

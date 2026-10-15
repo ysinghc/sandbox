@@ -300,3 +300,33 @@ code comments; detail lives here.
 - Full `ctest` **10/10** (adds `ipc`) passes twice back-to-back, seccomp on,
   MMIO, zero leaked taps/rules. `sandboxd` + `sandbox-cli run` smoke-tested
   end-to-end (create → hold → SIGTERM → destroy → clean daemon stop).
+
+## Phase 9 — Packaging, Metrics Wiring, pidfd Crash Detection (§§4.2, 10, 11)
+
+Closes the top gaps left after Phase 8. Phase 9a covers packaging, metrics and
+crash detection; Phase 9b covers per-VM environment injection (§15.11).
+
+- **Packaging (§10.2/§10.3).** Added the `install()` rules the project never had:
+  binaries → `bin`, `libsandbox.so`/`libsandbox++.so` → `lib`, headers →
+  `include`, data/run dirs created, `config/engine.conf` →
+  `/var/lib/sandbox-engine/config`, `credentials.conf.example` →
+  `/etc/sandbox-engine`, `systemd/sandboxd.service` →
+  `lib/systemd/system`. Absolute roots are cache vars
+  (`SANDBOX_STATE_DIR`/`SANDBOX_ETC_DIR`/`SANDBOX_RUN_DIR`); `DESTDIR=` stages.
+  The daemon now defaults `--config` to the packaged
+  `/var/lib/sandbox-engine/config/engine.conf` when present. Verified with
+  `DESTDIR=/tmp/instroot cmake --install`: layout matches §10.2 and the staged
+  `sandboxd` resolves `libsandbox.so` via `$ORIGIN/../lib`.
+- **Metrics (§11.1).** `telemetry_pool_state()` is pushed from the pool under
+  `pool->lock` at every transition; `telemetry_uffd_fault()` is bumped per served
+  page in the UFFD handler. Before this, `sandbox_pool_{warm,restoring,overflow}`
+  and `sandbox_uffd_faults_total` always read 0.
+- **pidfd crash detection (§4.2).** The IPC epoll loop now uses tagged
+  `data.u64`; each handed-out VM gets a `pidfd_open` registered in epoll. On VMM
+  exit the loop reaps it (`waitid(P_PIDFD,..,WNOHANG)`), bumps
+  `sandbox_vmm_crashes_total`, logs `vmm_crash`, and reclaims engine state
+  (`vmm_destroy`/`lifecycle_remove`/`token_revoke`/`session_disown`). Normal
+  destroy calls `pidfd_untrack` first. New `test_ipc.c` case kills the VMM and
+  asserts reclaim + token revoke + `sandbox_vmm_crashes_total 1` + non-zero
+  `sandbox_uffd_faults_total`.
+- `ctest` 10/10 with the new assertions (root, seccomp on, MMIO).

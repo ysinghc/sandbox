@@ -5,10 +5,18 @@
 
 #include "pool_manager.h"
 #include "vmm_manager.h"
+#include "telemetry.h"
 
 #include <errno.h>
 #include <stdlib.h>
 #include <time.h>
+
+// Push the current pool gauges (§11) into the metrics registry. Caller must
+// hold pool->lock so warm/restoring/overflow form a consistent snapshot.
+static void push_pool_state(pool_manager_t* pool) {
+    telemetry_pool_state(pool->warm_count, pool->restoring_count,
+                         pool->overflow_count);
+}
 
 // --- overflow queue helpers (ring buffer of pending_request_t*) ---
 
@@ -91,6 +99,7 @@ int pool_manager_init(pool_manager_t* pool, int target_size) {
         pthread_mutex_destroy(&pool->lock);
         return -1;
     }
+    push_pool_state(pool);
     return 0;
 }
 
@@ -114,6 +123,7 @@ void pool_manager_destroy(pool_manager_t* pool) {
         pool->warm_head = (pool->warm_head + 1) % POOL_MAX_SIZE;
         pool->warm_count--;
     }
+    push_pool_state(pool);
     pthread_mutex_unlock(&pool->lock);
     for (int i = 0; i < n; i++) vmm_destroy(leftover[i]);
 
@@ -134,6 +144,7 @@ int pool_drain(pool_manager_t* pool) {    if (!pool) return -1;
     }
     // Wake replenishment so it rebuilds from the new snapshot.
     pthread_cond_signal(&pool->slot_available);
+    push_pool_state(pool);
     pthread_mutex_unlock(&pool->lock);
     for (int i = 0; i < n; i++) vmm_destroy(drained[i]);
     return n;
@@ -180,6 +191,7 @@ sandbox_error_t pool_provision(pool_manager_t* pool, const sandbox_spec_t* spec,
         // Sum decreases by 1: invariant preserved. Wake replenishment so it
         // observes warm + restoring < target and starts a restore.
         pthread_cond_signal(&pool->slot_available);
+        push_pool_state(pool);
         pthread_mutex_unlock(&pool->lock);
         *out_vm = vm;
         return SANDBOX_OK;  // < 1ms on pool hit
@@ -201,11 +213,13 @@ sandbox_error_t pool_provision(pool_manager_t* pool, const sandbox_spec_t* spec,
     }
     pending_request_t req = { .result = NULL, .ready = false };
     enqueue_overflow(pool, &req);
+    push_pool_state(pool);
     struct timespec deadline = now_plus_ms(wait_ms);
     while (!req.ready && !pool->shutdown) {
         int rc = pthread_cond_timedwait(&pool->vm_available, &pool->lock, &deadline);
         if (rc == ETIMEDOUT) {
             if (!req.ready) dequeue_overflow(pool, &req);
+            push_pool_state(pool);
             pthread_mutex_unlock(&pool->lock);
             return SANDBOX_ERR_POOL_EXHAUSTED;
         }
@@ -251,6 +265,7 @@ void* replenishment_thread(void* arg) {
                 pthread_cond_broadcast(&pool->vm_available);
             } else {
                 pthread_cond_signal(&pool->slot_available);
+                push_pool_state(pool);
                 pthread_mutex_unlock(&pool->lock);
                 struct timespec backoff = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000L };
                 nanosleep(&backoff, NULL);
@@ -270,6 +285,7 @@ void* replenishment_thread(void* arg) {
             pool->warm_tail = (pool->warm_tail + 1) % POOL_MAX_SIZE;
             pool->warm_count++;
         }
+        push_pool_state(pool);
         pthread_mutex_unlock(&pool->lock);
     }
 }
