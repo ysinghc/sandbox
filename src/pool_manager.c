@@ -139,11 +139,26 @@ int pool_drain(pool_manager_t* pool) {    if (!pool) return -1;
     return n;
 }
 
-// Called by create_snapshot_template; the daemon (Phase 8) hooks the live
-// pool here. No-op until then.
+// Called by create_snapshot_template; the daemon registers its live pool so
+// the warm set is rebuilt from the new snapshot. No-op without a live pool
+// (e.g. the standalone template-build CLI).
+static pool_manager_t* g_live_pool = NULL;
+static pthread_mutex_t g_live_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void pool_manager_set_live(pool_manager_t* pool) {
+    pthread_mutex_lock(&g_live_lock);
+    g_live_pool = pool;
+    pthread_mutex_unlock(&g_live_lock);
+}
+
 void pool_manager_flush_and_rebuild(const char* template_name, uint32_t version) {
-    (void)template_name;
-    (void)version;
+    (void)version;  // informational: drain+replenish rebuilds from the source
+    pthread_mutex_lock(&g_live_lock);
+    pool_manager_t* pool = g_live_pool;
+    pthread_mutex_unlock(&g_live_lock);
+    if (!pool) return;
+    if (template_name && *template_name) pool_set_restore_source(template_name);
+    pool_drain(pool);  // signals replenishment to rebuild from the new source
 }
 
 // --- provision ---

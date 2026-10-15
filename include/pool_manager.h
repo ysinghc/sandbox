@@ -53,7 +53,12 @@ void* replenishment_thread(void* arg);
 // Test helpers
 int pool_drain(pool_manager_t* pool);
 
-// Daemon wiring hook for new snapshot versions (Phase 8 owns the live pool).
+// Register the daemon's live pool so a snapshot rebuild can drain it
+// (pool_manager_flush_and_rebuild). Pass NULL on shutdown.
+void pool_manager_set_live(pool_manager_t* pool);
+
+// Snapshot-rebuild hook (called by create_snapshot_template): drains the live
+// pool and points replenishment at the new template.
 void pool_manager_flush_and_rebuild(const char* template_name, uint32_t version);
 
 #endif // POOL_MANAGER_H

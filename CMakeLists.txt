@@ -50,6 +50,7 @@ add_library(sandbox SHARED
     src/lifecycle.c
     src/telemetry.c
     src/ipc_server.c
+    src/ipc_codec.cpp
     ${PROTO_SRCS}
 )
 target_include_directories(sandbox PUBLIC include ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})

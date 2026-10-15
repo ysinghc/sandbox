@@ -43,6 +43,8 @@ message ServerMessage {
     DestroyResponse destroy = 2;
     ErrorResponse   error   = 3;
     InspectResponse inspect = 4;
+    PauseResponse   pause   = 5;
+    ResumeResponse  resume  = 6;
   }
 }
 
@@ -52,6 +54,14 @@ message CreateResponse {
 }
 
 message DestroyResponse {
+  uint32 sandbox_id = 1;
+}
+
+message PauseResponse {
+  uint32 sandbox_id = 1;
+}
+
+message ResumeResponse {
   uint32 sandbox_id = 1;
 }
 

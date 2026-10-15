@@ -38,6 +38,8 @@ private:
     std::string template_name_;
     std::vector<std::string> env_vars_;
     uint32_t pool_wait_ms_;
+    // Stable backing store for the const char* array handed to the C API.
+    mutable std::vector<const char*> env_ptrs_;
 };
 
 class Sandbox {

@@ -257,3 +257,46 @@ code comments; detail lives here.
   `tests/CMakeLists.txt` only cover some targets.
 - Full `ctest` **9/9** (adds `broker`) passes twice back-to-back, seccomp on,
   MMIO, zero leaked taps/rules.
+
+## Phase 8 — Daemon / IPC / Lifecycle (§2.3, §3.1, §3.2, §6.1, §11)
+
+- Implemented the layers that were stubs after Phase 7: `src/ipc_server.c`
+  (engine socket + engine-side broker-control), `src/lifecycle.c` (live-VM
+  registry + full `libsandbox` client API), `src/daemon/main.c`,
+  `src/cli/main.c`, `src/telemetry.c`, and `src/cpp/sandbox.cpp`.
+- **Wire format:** `SOCK_SEQPACKET`, one frame = `u32 big-endian length` +
+  protobuf payload (`src/ipc_internal.h`, `sendmsg` iovec). Generated protobuf
+  is **C++**, so a C bridge was added: `include/ipc_codec.h` +
+  `src/ipc_codec.cpp` (extra files beyond §8.1) expose
+  `ipc_encode/decode_{request,response}` with C linkage.
+- **Schema extension:** `ServerMessage` gained `PauseResponse`/`ResumeResponse`
+  (fields 5/6) because §6.1 has no pause/resume reply (the client would block).
+- **Loop:** single-threaded `epoll` (listener + wake `eventfd` + client fds);
+  `ipc_server_request_stop()` is async-signal-safe for a SIGTERM handler. No
+  pidfd crash-watching yet.
+- **Sessions & tokens:** a connection owns its sandboxes and reclaims them on
+  disconnect. Tokens are 256-bit `getrandom`, hex in `session_token`, keyed on
+  the 32 raw bytes; the allow-list is a **global** policy
+  (`SANDBOX_ALLOWED_SERVICES`). The engine-side broker-control server is the
+  §5.8 counterpart to the broker's `broker_validate_token` (shared fixed
+  framing from `include/broker.h`).
+- **`env_vars`** round-trip through the protobuf/client API but are not injected
+  into the restored guest (the snapshot is pre-baked).
+- Daemon: flat `key = value` config (CLI > env > file > defaults),
+  `network_manager_init`, `pool_set_restore_source`, `pool_manager_set_live`
+  (so `pool_manager_flush_and_rebuild` drains the live pool), signal handling.
+- Telemetry: atomic Prometheus counters (`telemetry_render`) + optional
+  `--metrics-port` listener; structured logs are JSON lines on stderr from the
+  owning component.
+- **Bug found & fixed — fork/exec fd inheritance.** The pool forks Firecracker
+  children while client sockets are open; non-`CLOEXEC` sockets were inherited
+  by the child, so the daemon never saw the peer's EOF. In the in-process `ipc`
+  test this deadlocked `ipc_server_stop()` joining the broker-control thread
+  (the bc connection's EOF never arrived). Engine listener/accepted fds,
+  broker-control accepted fd and both client sockets now use `SOCK_CLOEXEC`.
+- New test `tests/test_ipc.c` (`ipc`; root + template fixture): create →
+  inspect → pause → resume → inspect → destroy over the real warm pool, plus
+  broker-control token validate/revoke and bad-token rejection.
+- Full `ctest` **10/10** (adds `ipc`) passes twice back-to-back, seccomp on,
+  MMIO, zero leaked taps/rules. `sandboxd` + `sandbox-cli run` smoke-tested
+  end-to-end (create → hold → SIGTERM → destroy → clean daemon stop).

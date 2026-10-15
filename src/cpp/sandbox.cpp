@@ -19,16 +19,27 @@ sandbox_spec_t Spec::to_c_struct() const {
     spec.memory_mib = memory_mib_;
     spec.vcpu_count = vcpu_count_;
     spec.template_name = template_name_.c_str();
-    spec.env_vars = nullptr;
     spec.pool_wait_ms = pool_wait_ms_;
+    // env_ptrs_ is mutable: it backs the const char* array for the C call.
+    env_ptrs_.clear();
+    env_ptrs_.reserve(env_vars_.size() + 1);
+    for (const auto& kv : env_vars_) env_ptrs_.push_back(kv.c_str());
+    env_ptrs_.push_back(nullptr);
+    spec.env_vars = env_ptrs_.data();
     return spec;
 }
 
 Sandbox::Sandbox(const Spec& spec) : handle_(nullptr) {
-    (void)spec;
+    sandbox_spec_t c = spec.to_c_struct();
+    sandbox_error_t rc = sandbox_create(&c, &handle_);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
 }
 
 Sandbox::~Sandbox() {
+    if (handle_) {
+        sandbox_destroy(handle_);
+        handle_ = nullptr;
+    }
 }
 
 Sandbox::Sandbox(Sandbox&& other) noexcept : handle_(other.handle_) {
@@ -37,6 +48,7 @@ Sandbox::Sandbox(Sandbox&& other) noexcept : handle_(other.handle_) {
 
 Sandbox& Sandbox::operator=(Sandbox&& other) noexcept {
     if (this != &other) {
+        if (handle_) sandbox_destroy(handle_);
         handle_ = other.handle_;
         other.handle_ = nullptr;
     }
@@ -44,30 +56,41 @@ Sandbox& Sandbox::operator=(Sandbox&& other) noexcept {
 }
 
 void Sandbox::pause() {
+    sandbox_error_t rc = sandbox_pause(handle_);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
 }
 
 void Sandbox::resume() {
+    sandbox_error_t rc = sandbox_resume(handle_);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
 }
 
 sandbox_status_t Sandbox::inspect() const {
     sandbox_status_t status = {};
+    sandbox_error_t rc = sandbox_inspect(handle_, &status);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
     return status;
 }
 
 uint32_t Sandbox::id() const {
-    return 0;
+    sandbox_status_t status = {};
+    if (sandbox_inspect(handle_, &status) != SANDBOX_OK) return 0;
+    return status.sandbox_id;
 }
 
 Engine::Engine(const std::string& socket_path) : initialized_(false) {
-    (void)socket_path;
+    sandbox_error_t rc = sandbox_init(socket_path.c_str());
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
+    initialized_ = true;
 }
 
 Engine::~Engine() {
+    if (initialized_) sandbox_cleanup();
 }
 
 std::unique_ptr<Sandbox> Engine::create(const Spec& spec) {
-    (void)spec;
-    return nullptr;
+    if (!initialized_) throw SandboxError(SANDBOX_ERR_DAEMON_UNREACHABLE);
+    return std::unique_ptr<Sandbox>(new Sandbox(spec));
 }
 
 } // namespace sandbox

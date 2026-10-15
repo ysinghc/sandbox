@@ -2,11 +2,14 @@
 // allow-listing, credential injection, and upstream proxying over libcurl.
 // Everything here is testable in-process; src/broker/main.c only wires argv/env.
 
+#define _GNU_SOURCE
+
 #include "broker.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <grp.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdio.h>
@@ -116,7 +119,7 @@ int broker_engine_connect(const char* path) {
         errno = EINVAL;
         return -1;
     }
-    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (fd < 0) return -1;
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
@@ -467,6 +470,31 @@ static int parse_listen(const char* spec, char* host, size_t hn, int* port) {
     return (*port > 0 && *port <= 65535) ? 0 : -1;
 }
 
+// §5.8 step 4: drop privileges after binding. Only meaningful when started as
+// root; the uid/gid come from SANDBOX_BROKER_UID/SANDBOX_BROKER_GID (default
+// nobody:65534) because there is no config-file field for them.
+static int drop_broker_privileges(void) {
+    if (geteuid() != 0) return 0;
+    const char* us = getenv("SANDBOX_BROKER_UID");
+    const char* gs = getenv("SANDBOX_BROKER_GID");
+    gid_t gid = gs ? (gid_t)strtol(gs, NULL, 10) : 65534;
+    uid_t uid = us ? (uid_t)strtol(us, NULL, 10) : 65534;
+    if (setgroups(1, &gid) != 0) {
+        fprintf(stderr, "[broker] setgroups: %s\n", strerror(errno));
+        return -1;
+    }
+    if (setgid(gid) != 0 || setuid(uid) != 0) {
+        fprintf(stderr, "[broker] privilege drop to %d:%d failed: %s\n",
+                (int)uid, (int)gid, strerror(errno));
+        return -1;
+    }
+    if (getuid() != uid || geteuid() != uid) {
+        fprintf(stderr, "[broker] privilege drop not effective\n");
+        return -1;
+    }
+    return 0;
+}
+
 int broker_run(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -493,7 +521,7 @@ int broker_run(void) {
         return -1;
     }
 
-    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int lfd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     if (lfd < 0) {
         close(engine_fd);
         credentials_free(creds);
@@ -516,8 +544,15 @@ int broker_run(void) {
     fprintf(stderr, "[broker] listening on %s, credentials %s, engine %s\n",
             broker_listen_addr(), broker_credentials_path(), broker_control_path());
 
+    if (drop_broker_privileges() != 0) {
+        close(lfd);
+        close(engine_fd);
+        credentials_free(creds);
+        return -1;
+    }
+
     for (;;) {
-        int cfd = accept(lfd, NULL, NULL);
+        int cfd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             break;

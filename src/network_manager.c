@@ -66,7 +66,7 @@ static int ensure_policy_chains(void) {
     return 0;
 }
 
-// Called once on daemon startup (Phase 8 wires the call); setup ensures too.
+// Called once on daemon startup; setup ensures it too.
 int network_manager_init(void) {
     return ensure_policy_chains();
 }

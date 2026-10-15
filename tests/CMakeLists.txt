@@ -82,3 +82,14 @@ target_include_directories(test_broker PRIVATE ../include)
 target_link_libraries(test_broker sandbox_broker_core)
 add_test(NAME broker COMMAND test_broker)
 set_tests_properties(broker PROPERTIES TIMEOUT 120)
+
+# Phase 8: daemon IPC server + client API + engine-side broker-control.
+# Root + template fixture (restores through the real warm pool).
+add_executable(test_ipc test_ipc.c)
+target_include_directories(test_ipc PRIVATE ../include)
+target_link_libraries(test_ipc sandbox sandbox_broker_core)
+add_test(NAME ipc COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_ipc)
+set_tests_properties(ipc PROPERTIES
+    TIMEOUT 300
+    FIXTURES_REQUIRED tmplfix
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")

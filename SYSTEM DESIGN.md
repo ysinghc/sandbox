@@ -1512,7 +1512,9 @@ authoritative.
   replace a non-empty dir); readers see old → missing → new, never partial.
   `pool_manager.expected_version` field added; `snapshot_check_version()`
   adopts-on-first-sight, drains + adopts on change;
-  `pool_manager_flush_and_rebuild()` is a no-op Phase-8 hook.
+  `pool_manager_flush_and_rebuild()` drains the **live** pool registered via
+  `pool_manager_set_live()` and repoints replenishment at the new template
+  (no-op when no daemon is running).
 - Env overrides (tests/ops, not in LLD): `SANDBOX_SNAPSHOT_ROOT`,
   `SANDBOX_JAIL_ROOT`, `FIRECRACKER_BIN`. Firecracker API is a minimal
   HTTP/1.1 client over `AF_UNIX SOCK_STREAM` (`Content-Length` framing,
@@ -1521,20 +1523,15 @@ authoritative.
   `pool_set_restore_source()`); `TEST-DUMMY` returns a dummy handle after
   ~83ms for pool/snapshot tests.
 
-### 15.6 Not Yet Implemented (stubs, LLD §§2.3, 3.1, 6)
-- `src/ipc_server.c` (`ipc_server_run/stop`), `src/lifecycle.c` client API
-  (`sandbox_create/pause/resume/destroy/inspect` return
-  `DAEMON_UNREACHABLE`), `src/daemon/main.c`, `src/cli/main.c`,
-  `src/telemetry.c` are stubs. `src/cpp/sandbox.cpp` (the §3.2 C++ RAII
-  wrapper) is likewise a stub — `Engine::create()` returns `nullptr`,
-  `Sandbox`/`Engine` methods are no-ops — and `lifecycle_track()`/
-  `lifecycle_remove()` are no-op successes.
-  Consequently: no `SOCK_SEQPACKET` + length-prefixed protobuf wire format yet
-  (only schema in `proto/sandbox.proto`, which matches §6.1), no **engine-side**
-  session-token issuance (`CreateResponse.session_token`) or broker-control
-  validation endpoint (the broker's client half is done — see §15.8), no pidfd
-  lifecycle, no metrics/logging output. `config/` ships only `engine.conf` +
-  `credentials.conf.example` (placeholder, never secret).
+### 15.6 Previously Stubbed Layers — Now Implemented in Phase 8
+- The §2.3/§3.1/§3.2/§11 stubs (`src/ipc_server.c`, `src/lifecycle.c` client
+  API, `src/daemon/main.c`, `src/cli/main.c`, `src/telemetry.c`,
+  `src/cpp/sandbox.cpp`, `lifecycle_track/remove`) were **implemented in
+  Phase 8** — see §15.9 for the ground-truth deviations from the LLD.
+- Still not implemented: **pidfd-based VMM crash detection** (no watcher; the
+  `sandbox_vmm_crashes_total` metric is defined but never bumped), **per-VM
+  environment injection** (see §15.9), and a hierarchical config layer
+  (`config/` still ships only `engine.conf` + `credentials.conf.example`).
 
 ### 15.7 aarch64 / Test Environment (§9)
 - Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
@@ -1559,24 +1556,38 @@ authoritative.
 - Jail teardown needs the per-VM bind mounts unmounted before `rm -rf`; stale
   `firecracker` processes leak between runs and must be reaped with
   `pkill -9 -x firecracker` (use `-x`, not `-f`).
-- Full `ctest` (9/9: `tmpl_setup`, `pool`, `jailer`, `network`,
-  `network_cleanup`, `snapshot`, `vmm`, `uffd`, `broker`) passes twice
+- Full `ctest` (10/10: `tmpl_setup`, `pool`, `jailer`, `network`,
+  `network_cleanup`, `snapshot`, `vmm`, `uffd`, `broker`, `ipc`) passes twice
   back-to-back with seccomp **on** and MMIO transport, leaving zero leaked taps
   and zero leaked `sandbox_policy` rules. CTest must be run **as root**:
-  `pool`/`jailer`/`vmm`/`network` do chroot / uid-drop / tap work, so a plain
-  unprivileged `ctest` fails them (and the broker test alone is unprivileged).
+  `pool`/`jailer`/`vmm`/`network`/`ipc` do chroot / uid-drop / tap work, so a
+  plain unprivileged `ctest` fails them (the `broker` test alone is
+  unprivileged).
+- **Long-lived sockets must be `SOCK_CLOEXEC`.** The pool forks Firecracker
+  children (`fork`+`exec`) while client sockets are open; a non-`CLOEXEC` fd is
+  inherited by the child, so the daemon never observes the peer's EOF and leaks
+  the session (and, in-process, the `ipc` test deadlocked joining the
+  broker-control thread). The engine listener/accepted fds, the
+  broker-control accepted fd and both client sockets are all created
+  `SOCK_CLOEXEC`.
 
 ### 15.8 Credential Broker (§5.8)
 - **Listen address is wildcard `0.0.0.0:8080`, not the LLD's
   `169.254.0.1:8080`.** Phase 3 gave every VM its own /30, so the host side of
   each tap is a different `.1`; no single link-local address can serve them all.
   Overridable via `SANDBOX_BROKER_LISTEN` (`host:port`).
+- **Privilege drop (§5.8 step 4) is implemented:** when started as root the
+  broker `setgroups`/`setgid`/`setuid`s to `SANDBOX_BROKER_UID`/`SANDBOX_BROKER_GID`
+  (default `65534`) *after* loading credentials, connecting to the engine and
+  binding the listener. There is no `engine.conf` field for these, so they are
+  environment variables.
 - **Token-validation wire format is fixed-framing**, not the LLD structs (whose
   `broker_validate_resp_t.allowed_services` is a `char**`, not serializable):
   request = `u8 type` + 32 raw token bytes (`token_hex[65]` decoded to 32);
   response = `u8 status` and, iff valid, `u32 sandbox_id` (BE) +
   `u16 n_services` + `n × (u8 len + bytes)`. Notes are in `include/broker.h`.
-  The **engine half is Phase 8** (broker-control server + token issuance); the
+  The **engine half is implemented in Phase 8** (broker-control server + token
+  issuance — see §15.9); the
   broker's client half (`broker_validate_token`) is implemented and tested
   against a mock engine.
 - **Upstream forwarding uses libcurl** (a new dependency — §8.1 lists none;
@@ -1598,3 +1609,65 @@ authoritative.
   thin `curl_global_init` + accept-loop shim. The accept loop sets a 30 s
   send/recv timeout so a stalled guest cannot pin the single-threaded
   broker.
+
+### 15.9 Daemon / IPC / Lifecycle (§2.3, §3.1, §3.2, §6.1, §11)
+- **Framing:** one `SOCK_SEQPACKET` packet = `u32 big-endian length` + protobuf
+  payload (`src/ipc_internal.h`, `sendmsg` with a 2-element iovec so the prefix
+  and payload stay one datagram). §2.3's "length-prefixed protobuf" is honored;
+  SEQPACKET means exactly one message per `recv`.
+- **Protobuf is generated as C++** (`protobuf_generate_cpp` → `sandbox.pb.{h,cc}`),
+  so the C engine reaches it through a small bridge: `include/ipc_codec.h` +
+  `src/ipc_codec.cpp` (an extra file beyond §8.1) expose `ipc_encode/decode_
+  {request,response}` with C linkage. The generated header is never included
+  from C.
+- **Schema extension (§6.1):** `ServerMessage` gained `PauseResponse` (field 5)
+  and `ResumeResponse` (field 6). The LLD schema has no reply for
+  pause/resume, so the client would block forever waiting for a frame. The
+  addition is backward-compatible.
+- **Event loop is single-threaded epoll, no pidfd watching.** A `Create`
+  blocks the loop for the duration of the pool restore (~0.1 s warm / ~1 s cold)
+  — acceptable at this scale. `epoll` multiplexes the listener, the wake
+  `eventfd` and every client fd; SEQPACKET + level-triggered EPOLLIN guarantees
+  a whole frame is ready when read. `ipc_server_request_stop()` (async-signal-
+  safe) is what a SIGTERM handler calls.
+- **Session/token model:** a connection *is* a session; it owns every sandbox it
+  created and reclaims them on disconnect (`sandbox_cleanup()` /
+  peer EOF). Tokens are 256 bits of `getrandom` (hex-encoded in
+  `CreateResponse.session_token`, keyed on the 32 raw bytes). The allow-list
+  handed to the broker is a **global** policy (`SANDBOX_ALLOWED_SERVICES` /
+  `allowed_services` config), not per-sandbox — `CreateRequest` has no field for
+  it. The engine-side broker-control server (`ipc_server_start_broker_control`)
+  is the §5.8 counterpart the broker's client half talks to; it reuses the
+  broker's fixed framing from `include/broker.h`.
+- **`env_vars` are carried but not injected.** They round-trip through the
+  protobuf and the client API, but there is no per-VM env channel into the
+  restored guest (the snapshot is pre-baked), so the daemon ignores them.
+- **Ownership of `g.tok_lock`:** the registry is read by the broker-control
+  thread and written by the IPC thread; `token_lookup` copies service strings
+  under the lock and the socket I/O happens outside it.
+- **Config:** flat `key = value` file (no hierarchy) with precedence
+  CLI > env > file > defaults. Keys: `socket(_path)`, `broker_control_socket`,
+  `template(_name)`, `pool_size`/`target_size`, `allowed_services`,
+  `metrics_port`. Env: `SANDBOX_ENGINE_SOCK`, `SANDBOX_BROKER_CONTROL`,
+  `SANDBOX_TEMPLATE`, `SANDBOX_POOL_SIZE`, `SANDBOX_ALLOWED_SERVICES`,
+  `SANDBOX_METRICS_PORT`, plus the pre-existing `SANDBOX_FC_*`, `FIRECRACKER_BIN`,
+  `SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAIL_ROOT`.
+- **Observability (§11):** `telemetry_render()` emits the §11.1 metric names in
+  Prometheus text; the daemon serves them on `127.0.0.1:<metrics_port>` only
+  when `--metrics-port` is set (`telemetry_serve` in a detached thread).
+  Counters are `atomic` and bumped on the create path; `sandbox_vmm_crashes_total`
+  is defined but not yet wired. **Structured logs are JSON lines on stderr from
+  the component that owns the event** (`daemon`, `ipc_server`, `broker`) — there
+  is no separate logger object.
+- **C++ wrapper (§3.2):** `Engine`'s constructor throws `SandboxError` if
+  `sandbox_init` fails; `Sandbox`'s constructor throws on create failure (RAII).
+  `Sandbox::id()` performs an `inspect` round-trip (the C API has no id
+  accessor). `Spec::to_c_struct()` needs a stable `const char**`, so a
+  `mutable std::vector<const char*> env_ptrs_` member backs it. `Sandbox` is
+  move-only; the move-assignment destroys the existing handle first.
+- **Extra files/symbols beyond §8.1/§3.1:** `src/ipc_codec.cpp`,
+  `include/ipc_codec.h`, `src/ipc_internal.h`. `lifecycle.h` adds internal
+  helpers `lifecycle_get`, `lifecycle_count`, `sandbox_handle_token` (test
+  helper — not part of public `libsandbox.h`). `ipc_server.h` adds
+  `ipc_server_set_pool/template/allowed_services`, `ipc_server_request_stop`,
+  `ipc_server_start/stop_broker_control`, `ipc_server_token_count`.
