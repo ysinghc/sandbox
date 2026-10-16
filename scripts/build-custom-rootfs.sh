@@ -44,6 +44,15 @@ for cmd in sh ash mount umount echo cat ls mkdir touch sleep ps; do
     ln -sf /bin/busybox "$MNTDIR/bin/$cmd" 2>/dev/null || true
 done
 
+# ── 3b. Guest env agent (Phase 9b) ────────────────────────────────────────────
+# Static binary; started by /init before capture, resumes blocked in accept()
+# after a snapshot restore to receive the host's per-VM env over vsock.
+log "Building guest env agent..."
+AGENT_SRC="$(cd "$(dirname "$0")" && pwd)/sandbox-agent.c"
+gcc -static -O2 -o "$MNTDIR/bin/sandbox-agent" "$AGENT_SRC"
+chmod +x "$MNTDIR/bin/sandbox-agent"
+log "  agent: $(file -b "$MNTDIR/bin/sandbox-agent")"
+
 # ── 4. Custom /init ───────────────────────────────────────────────────────────
 log "Writing /init script..."
 cat > "$MNTDIR/init" << 'INIT_SCRIPT'
@@ -60,19 +69,18 @@ mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 # Configure lo
 ip link set lo up 2>/dev/null || true
 
-# Signal the host that the guest is ready for snapshotting
-echo "SANDBOX-READY"
-
-# Heartbeat: after a snapshot restore the guest resumes *mid-loop* (it does not
-# re-run this script), so a fresh line here is executable proof that the
-# restored vCPU is running and its pages are being served. The loop deliberately
-# does NOT sleep (busy spin): on this aarch64 host the guest's arch timer does
-# not fire reliably after restore, so a sleeping guest would hang in WFI.
-while true; do
-    echo "SANDBOX-TICK"
-    i=0
-    while [ "$i" -lt 200000 ]; do i=$((i + 1)); done
-done
+# Per-VM env agent (vsock) is the foreground process. It binds the listener,
+# prints "SANDBOX-READY" (the host's snapshot trigger), then busy-loops serving
+# the host's per-VM env injection while emitting "SANDBOX-TICK".
+#
+# The agent (not this shell) owns the CPU loop on purpose: after a UFFD restore
+# the aarch64 arch timer does not re-arm on this host, so the scheduler tick
+# stops and a CPU-hogging shell loop would starve every other guest process.
+# One process that both polls the vsock socket and emits the heartbeat keeps
+# working without timer interrupts. `exec` replaces the shell so the captured
+# snapshot has the agent as the only CPU consumer.
+echo "SANDBOX-AGENT-LAUNCH"
+exec /bin/sandbox-agent
 INIT_SCRIPT
 chmod +x "$MNTDIR/init"
 

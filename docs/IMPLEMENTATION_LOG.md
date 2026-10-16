@@ -330,3 +330,42 @@ crash detection; Phase 9b covers per-VM environment injection (§15.11).
   asserts reclaim + token revoke + `sandbox_vmm_crashes_total 1` + non-zero
   `sandbox_uffd_faults_total`.
 - `ctest` 10/10 with the new assertions (root, seccomp on, MMIO).
+
+### Phase 9b — Per-VM Env Injection (§6.1 `env_vars`, §15.11)
+
+- **Mechanism = virtio-vsock.** The channel is a device carried in the snapshot;
+  each restore retargets its host backend via `vsock_override.uds_path` (like
+  `network_overrides`, so no hot-plug). `vmm_cold_boot` configures `PUT /vsock`
+  (`guest_cid=3`, `uds_path=/vsock.sock`) before `InstanceStart`.
+- **New guest agent** `scripts/sandbox-agent.c`, built static by
+  `scripts/build-custom-rootfs.sh` and baked in as `/bin/sandbox-agent`. The
+  guest `/init` now `exec`s it; it binds `AF_VSOCK` :5001, prints
+  `SANDBOX-READY`, then busy-loops serving connections and emitting
+  `SANDBOX-TICK`.
+- **The agent, not the shell, ticks.** After a UFFD restore the arch timer does
+  not re-arm (§15.7), so the scheduler tick stops and a CPU-hogging shell loop
+  starves every other guest process. The agent is the single CPU consumer and
+  polls with `poll(…,0)` (never blocks — `SOCK_NONBLOCK` on an `AF_VSOCK`
+  listener proved unreliable here).
+- **Host side** `vmm_inject_env()`: connect `<jail>/vsock.sock`, hybrid-vsock
+  handshake (`CONNECT 5001\n` → `OK <port>\n`), stream `KEY=VALUE\n`, close.
+  `handle_create` calls it after restore — best-effort (logs
+  `env_injected`/`env_inject_failed`; never fails `Create`). Sleeps 1 s before
+  the first attempt (muxer settle — an immediate CONNECT races resume and
+  wedges the port, failing all retries; measured 10/10×1 ms after the settle),
+  then retries 8× and bounds the socket with `SO_RCVTIMEO`/`SO_SNDTIMEO` so a
+  stalled muxer cannot block forever.
+- **Guest re-announces (~5 s) until the env lands**, covering a lost
+  post-restore port announcement; quiet windows let a host connection complete
+  (100 ms rebinds guillotined every attempt).
+- **Hardening.** `vmm_restore` now `jail_cleanup()`s before `mkdir_recursive()`,
+  so a stale `<jail>/api.sock` left by a killed run can no longer wedge the
+  restore with permanent `ECONNREFUSED`.
+- **Debug artifact.** `snapshot_manager` copies the template VM boot serial to
+  `<template>/boot-serial.log`.
+- **Tests.** `test_ipc.c` create carries `MYKEY=myvalue`/`SANDBOX_MODE=test` and
+  polls the restored serial for the guest echo; `test_vmm`'s restore waits for a
+  fresh `SANDBOX-TICK` (now emitted by the agent).
+- `ctest` 10/10 (root, seccomp on, MMIO); `test_ipc` 30/30 consecutive with
+  zero injection failures and zero slow runs after the 1 s settle (before it:
+  ~10–20% failed or burned the full 45 s retry budget).

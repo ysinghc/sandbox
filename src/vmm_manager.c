@@ -30,6 +30,7 @@
 #include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
@@ -46,6 +47,9 @@
 #define FC_MEM_JAILVIEW "/memory.snap"
 #define FC_BOOT_ARGS "console=ttyS0 reboot=k panic=1 init=/init root=/dev/vda ro"
 #define FC_TEMPLATE_IFACE "net1"  // template NIC id; restores retarget its tap
+#define FC_VSOCK_JAILVIEW "/vsock.sock"  // per-VM vsock host backend UDS
+#define FC_VSOCK_GUEST_CID 3
+#define FC_VSOCK_ENV_PORT 5001  // must match scripts/sandbox-agent.c ENV_PORT
 #define FC_ACCEPT_TIMEOUT_MS 30000
 #define FC_FILE_WAIT_MS 10000
 #define FC_READY_DEFAULT "SANDBOX-READY"
@@ -72,6 +76,20 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+static int write_full(int fd, const void* buf, size_t n) {
+    size_t off = 0;
+    while (off < n) {
+        ssize_t w = write(fd, (const char*)buf + off, n - off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (w == 0) return -1;
+        off += (size_t)w;
+    }
+    return 0;
 }
 
 // VirtIO transport must match between template capture and restore
@@ -422,6 +440,17 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
             return NULL;
         }
     }
+    // vsock device (Phase 9b): configured before boot so the captured snapshot
+    // carries it; restores retarget its host UDS via the load request's
+    // vsock_override. The jailed guest agent listens on FC_VSOCK_ENV_PORT.
+    snprintf(vm->vsock_uds, sizeof(vm->vsock_uds), "%s" FC_VSOCK_JAILVIEW, jail_root);
+    snprintf(body, sizeof(body),
+             "{\"vsock_id\": \"vsock0\", \"guest_cid\": %d, \"uds_path\": \"%s\"}",
+             FC_VSOCK_GUEST_CID, FC_VSOCK_JAILVIEW);
+    if (fc_put(vm->api_sock_path, "/vsock", body) < 0) {
+        cold_fail(vm);
+        return NULL;
+    }
     usleep(15000);  // async API settle before InstanceStart (per FC docs)
     if (fc_put(vm->api_sock_path, "/actions", "{\"action_type\": \"InstanceStart\"}") < 0) {
         cold_fail(vm);
@@ -526,6 +555,123 @@ int vmm_resume_vcpus(vm_handle_t* vm) {
     return 0;
 }
 
+// Per-VM env injection (Phase 9b). Connects to this VM's Firecracker vsock UDS
+// and speaks the hybrid-vsock handshake ("CONNECT <port>\n" -> "OK <host>\n"),
+// then streams KEY=VALUE lines and half-closes; the guest agent reads to EOF.
+int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
+    if (!vm || !env_vars || !env_vars[0]) return 0;  // nothing to inject
+    if (!vm->vsock_uds[0]) {
+        errno = ENOTSUP;
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    if (strlen(vm->vsock_uds) >= sizeof(addr.sun_path)) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    strncpy(addr.sun_path, vm->vsock_uds, sizeof(addr.sun_path) - 1);
+
+    // Let Firecracker's vsock muxer settle after resume before the first
+    // CONNECT. A host connection issued while the muxer is still setting up
+    // its restored endpoint is accepted but never answered, and that stuck
+    // half-open state wedges the port: every subsequent attempt then times
+    // out too (measured: ~10-20% of immediate connects wedge all 8 retries,
+    // while a 1 s settle before the first attempt succeeds in ~1 ms 10/10).
+    sleep(1);
+
+    // The backend UDS appears shortly after the load request, and the *guest*
+    // side of the vsock can lag the host's UDS by a few hundred ms after a
+    // restore. Retry the whole connect+handshake+write sequence, recreating the
+    // socket each time (a reset connection leaves the fd unusable).
+    int rc = -1;
+    for (int attempt = 0; attempt < 8 && rc != 0; attempt++) {
+        if (attempt) {
+            struct timespec nap = { .tv_sec = 0, .tv_nsec = 250 * 1000 * 1000L };
+            nanosleep(&nap, NULL);
+        }
+        int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (fd < 0) return -1;
+
+        int cres = -1;
+        for (int i = 0; i < 100; i++) {
+            if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+                cres = 0;
+                break;
+            }
+            if (errno != ENOENT && errno != ECONNREFUSED) break;
+            struct timespec nap = { .tv_sec = 0, .tv_nsec = 20 * 1000 * 1000L };
+            nanosleep(&nap, NULL);
+        }
+        if (cres < 0) {
+            fprintf(stderr, "[vmm_inject_env] connect %s failed: %s (attempt %d)\n",
+                    vm->vsock_uds, strerror(errno), attempt);
+            close(fd);
+            continue;
+        }
+
+        // Bound the handshake/write: if Firecracker's muxer stalls (or the
+        // guest never drains the connection) we must not block forever.
+        struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+        char hs[64];
+        int hn = snprintf(hs, sizeof(hs), "CONNECT %d\n", FC_VSOCK_ENV_PORT);
+        if (write_full(fd, hs, (size_t)hn) < 0) {
+            fprintf(stderr, "[vmm_inject_env] handshake write failed: %s (attempt %d)\n",
+                    strerror(errno), attempt);
+            close(fd);
+            continue;
+        }
+        char rbuf[64];
+        size_t roff = 0;
+        int hfail = 0;
+        for (;;) {
+            if (roff >= sizeof(rbuf) - 1) { hfail = 1; break; }
+            ssize_t r = read(fd, rbuf + roff, 1);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                fprintf(stderr, "[vmm_inject_env] handshake read failed: %s (attempt %d)\n",
+                        strerror(errno), attempt);
+                hfail = 1;
+                break;
+            }
+            if (r == 0) break;
+            if (rbuf[roff++] == '\n') break;
+        }
+        rbuf[roff] = '\0';
+        if (hfail) {
+            close(fd);
+            continue;
+        }
+        if (strncmp(rbuf, "OK", 2) != 0) {
+            fprintf(stderr, "[vmm_inject_env] handshake got '%s' (attempt %d)\n",
+                    rbuf, attempt);
+            close(fd);
+            continue;
+        }
+
+        int wfail = 0;
+        for (int i = 0; env_vars[i]; i++) {
+            if (write_full(fd, env_vars[i], strlen(env_vars[i])) < 0 ||
+                write_full(fd, "\n", 1) < 0) {
+                fprintf(stderr, "[vmm_inject_env] env write failed: %s (attempt %d)\n",
+                        strerror(errno), attempt);
+                wfail = 1;
+                break;
+            }
+        }
+        close(fd);
+        if (wfail) continue;
+        rc = 0;
+    }
+    if (rc != 0) errno = EPROTO;
+    return rc;
+}
+
 // Snapshot the paused VM's state+memory to jail-view paths.
 int vmm_snapshot(vm_handle_t* vm, const char* vmstate_jailview, const char* mem_jailview) {
     if (!vm || !vmstate_jailview || !mem_jailview) {
@@ -617,6 +763,10 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     snprintf(vm->api_sock_path, sizeof(vm->api_sock_path), "%s/api.sock", jail_root);
     char uds_host[PATH_MAX];
     snprintf(uds_host, sizeof(uds_host), "%s/uffd.sock", jail_root);
+    // A previous run killed before vmm_destroy can leave a stale jail whose
+    // api.sock Firecracker cannot rebind (connect then fails ECONNREFUSED
+    // forever, and wait_for_file passes on the stale file). Clear it first.
+    jail_cleanup(jail_root);
     if (mkdir_recursive(jail_root, 0755) < 0) {
         free(manifest);
         free(vm);
@@ -696,14 +846,19 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     // the handler, then read the response.
     char mem_host[PATH_MAX];
     snprintf(mem_host, sizeof(mem_host), "%s/memory.snap", store);
+    // Per-VM vsock backend (Phase 9b): retarget the template's vsock device at
+    // load so each VM gets its own host UDS for env injection.
+    snprintf(vm->vsock_uds, sizeof(vm->vsock_uds), "%s" FC_VSOCK_JAILVIEW, jail_root);
+    unlink(vm->vsock_uds);
     fprintf(stderr, "[vmm_restore] sending /snapshot/load...\n");
     char load_req[1024];
     snprintf(load_req, sizeof(load_req),
              "{\"snapshot_path\": \"/vmstate\", \"mem_backend\": "
              "{\"backend_path\": \"/uffd.sock\", \"backend_type\": \"Uffd\"}, "
              "\"network_overrides\": [{\"iface_id\": \"%s\", \"host_dev_name\": \"%s\"}], "
+             "\"vsock_override\": {\"uds_path\": \"%s\"}, "
              "\"resume_vm\": false}",
-             FC_TEMPLATE_IFACE, tap_name);
+             FC_TEMPLATE_IFACE, tap_name, FC_VSOCK_JAILVIEW);
     int load_fd = fc_send_request(vm->api_sock_path, "PUT", "/snapshot/load", load_req);
     if (load_fd < 0) {
         fprintf(stderr, "[vmm_restore] FAIL: send /snapshot/load errno=%d\n", errno);

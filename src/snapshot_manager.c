@@ -345,6 +345,15 @@ int create_snapshot_template(const char* template_name, const template_config_t*
         return -1;
     }
 
+    // Debug artifact: preserve the template VM's boot serial (guest init +
+    // Firecracker device logs before capture). Best-effort.
+    {
+        char tserial[PATH_MAX], dserial[PATH_MAX];
+        snprintf(tserial, sizeof(tserial), "%s/serial.log", tjail);
+        snprintf(dserial, sizeof(dserial), "%s/boot-serial.log", temp_dir);
+        copy_into(tserial, dserial);
+    }
+
     // 6. Atomic publish to final path (same filesystem)
     if (snapshot_publish(temp_dir, final_dir) < 0) {
         vmm_destroy(vm);

@@ -408,6 +408,21 @@ static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
                 vm->sandbox_id);
     }
 
+    // Per-VM env injection (Phase 9b): best-effort delivery to the guest agent.
+    if (req->env_vars[0]) {
+        if (vmm_inject_env(vm, (const char* const*)req->env_vars) == 0) {
+            fprintf(stderr,
+                    "{\"component\":\"ipc_server\",\"event\":\"env_injected\","
+                    "\"sandbox_id\":%u}\n",
+                    vm->sandbox_id);
+        } else {
+            fprintf(stderr,
+                    "{\"component\":\"ipc_server\",\"event\":\"env_inject_failed\","
+                    "\"sandbox_id\":%u}\n",
+                    vm->sandbox_id);
+        }
+    }
+
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
     resp.kind = IPC_REQ_CREATE;

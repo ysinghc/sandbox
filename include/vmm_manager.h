@@ -35,6 +35,7 @@ typedef struct vm_handle_t {
     int nregions;
     char api_sock_path[108];  // host view of the jail API socket
     char jail_root[PATH_MAX];
+    char vsock_uds[PATH_MAX];  // host path to the per-VM vsock UDS ("" = none)
     vm_network_t net;  // per-VM tap; reclaimed by vmm_destroy
     bool has_net;
     pthread_t uffd_thread;
@@ -71,6 +72,11 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
 
 // Block until the serial log shows marker (or timeout_ms). 0 ready, -1 timeout.
 int vmm_wait_ready(vm_handle_t* vm, const char* marker, int timeout_ms);
+
+// Per-VM env injection (Phase 9b): deliver "KEY=VALUE" strings to the guest's
+// vsock env agent over the VM's Firecracker vsock UDS. No-op (0) when env_vars
+// is empty; -1 if the VM has no vsock or the injection fails.
+int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars);
 
 int vmm_pause_vcpus(vm_handle_t* vm);
 int vmm_resume_vcpus(vm_handle_t* vm);

@@ -11,6 +11,7 @@
 #include "vmm_manager.h"
 
 #include <pthread.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -29,6 +30,20 @@ static int g_fail = 0;
             g_fail++;                                 \
         }                                             \
     } while (0)
+
+// Scan a restored VM's serial log for a marker (guest-side observability).
+static int serial_has(vm_handle_t* vm, const char* needle) {
+    if (!vm || !vm->jail_root[0]) return 0;
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    static char buf[1 << 16];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    return strstr(buf, needle) != NULL;
+}
 
 static pool_manager_t g_pool;
 static char g_engine_sock[256];
@@ -92,6 +107,8 @@ int main(void) {
     spec.vcpu_count = 1;
     spec.template_name = "e2e";
     spec.pool_wait_ms = 60000;
+    const char* envp[] = { "MYKEY=myvalue", "SANDBOX_MODE=test", NULL };
+    spec.env_vars = envp;
 
     if (rc == SANDBOX_OK) {
         rc = sandbox_create(&spec, &h);
@@ -101,6 +118,29 @@ int main(void) {
         rc = sandbox_inspect(h, &st);
         CHECK(rc == SANDBOX_OK && st.sandbox_id != 0, "inspect id");
         CHECK(rc == SANDBOX_OK && st.is_running, "inspect running");
+
+        // Per-VM env injection (Phase 9b): the guest agent echoes a delimited
+        // SANDBOX-ENV block to serial after the host streams the env.
+        vm_handle_t* hvm = lifecycle_get(st.sandbox_id);
+        int seen = 0;
+        for (int i = 0; i < 300; i++) {
+            if (serial_has(hvm, "MYKEY=myvalue")) { seen = 1; break; }
+            usleep(10000);
+        }
+        if (!seen && hvm) {
+            char sp[PATH_MAX + 16];
+            snprintf(sp, sizeof(sp), "%s/serial.log", hvm->jail_root);
+            FILE* sf = fopen(sp, "r");
+            if (sf) {
+                static char b[1 << 16];
+                size_t k = fread(b, 1, sizeof(b) - 1, sf);
+                b[k] = '\0';
+                fprintf(stderr, "--- serial.log (%s) ---\n%s\n--- end ---\n", sp, b);
+                fclose(sf);
+            }
+        }
+        CHECK(seen, "env: injected into guest");
+        CHECK(serial_has(hvm, "SANDBOX-ENV-BEGIN"), "env: guest marker");
 
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,

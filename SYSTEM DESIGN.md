@@ -1641,9 +1641,9 @@ authoritative.
   it. The engine-side broker-control server (`ipc_server_start_broker_control`)
   is the §5.8 counterpart the broker's client half talks to; it reuses the
   broker's fixed framing from `include/broker.h`.
-- **`env_vars` are carried but not injected.** They round-trip through the
-  protobuf and the client API, but there is no per-VM env channel into the
-  restored guest (the snapshot is pre-baked), so the daemon ignores them.
+- **`env_vars` are injected into the restored guest** over a per-VM virtio-vsock
+  channel (Phase 9b, §15.11). They still round-trip through the protobuf and the
+  client API; injection is best-effort and never fails `Create`.
 - **Ownership of `g.tok_lock`:** the registry is read by the broker-control
   thread and written by the IPC thread; `token_lookup` copies service strings
   under the lock and the socket I/O happens outside it.
@@ -1717,3 +1717,85 @@ authoritative.
   and the rendered metrics show `sandbox_vmm_crashes_total 1` and a non-zero
   `sandbox_uffd_faults_total` (proving the Phase-9 wiring). The metrics scrape
   also verifies the pool gauges are now live.
+
+### 15.11 Phase 9b — Per-VM Env Injection via virtio-vsock (§6.1 `env_vars`)
+- **Channel = virtio-vsock.** The restored guest is pre-baked by a snapshot, so
+  there is no boot-time env plumbing; the only supported post-restore paths into
+  the guest are the devices carried in the snapshot. virtio-vsock was chosen
+  because its host backend is a **per-VM Unix socket** that the restore request
+  can retarget (`vsock_override.uds_path`), exactly like the NIC's
+  `network_overrides` — no hot-plug needed. (A `mem_backend`/UFFD or
+  `block_overrides` route would still have to be captured at snapshot time.)
+- **Template now carries a vsock device.** `vmm_cold_boot` configures
+  `PUT /vsock` before `InstanceStart`:
+  `{"vsock_id":"vsock0","guest_cid":3,"uds_path":"/vsock.sock"}` (jail-view
+  path). The snapshot captures the live device, so every restore re-creates it.
+  Firecracker logs `vsock_id field is deprecated` (harmless).
+- **Restore retargets the host backend.** The `/snapshot/load` body gains
+  `"vsock_override":{"uds_path":"/vsock.sock"}` (next to `network_overrides`);
+  the host run of the socket is `<jail>/vsock.sock`, stored on the handle as
+  `vm->vsock_uds` and unlinked before load.
+- **Guest agent (`scripts/sandbox-agent.c`, new — beyond §8.1).** A static
+  aarch64 binary baked into the test rootfs by
+  `scripts/build-custom-rootfs.sh` at `/bin/sandbox-agent`. The guest `/init`
+  now **`exec`s** it as the foreground process. It binds an `AF_VSOCK`
+  listener on **port 5001**, prints `SANDBOX-READY` (the template readiness
+  marker), then busy-loops: it serves the host's connection and periodically
+  prints `SANDBOX-TICK`. On a connection it reads to EOF, writes the payload to
+  `/tmp/sandbox-env`, and echoes a delimited
+  `SANDBOX-ENV-BEGIN`/`…`/`SANDBOX-ENV-END` block to the serial console.
+- **The agent, not a shell, owns the heartbeat loop.** After a UFFD restore the
+  aarch64 arch timer does not re-arm on this host (§15.7), so the scheduler tick
+  stops: a CPU-hogging shell loop would starve every other guest process and a
+  `sleep` would hang in WFI. One process that both polls the socket and emits
+  the heartbeat keeps working with no timer interrupts. The agent uses
+  `poll(…, 0)` (zero-timeout) rather than a blocking `accept()` so the loop
+  never blocks even though `SOCK_NONBLOCK` on the AF_VSOCK listener proved
+  unreliable here; a pending connection makes `poll` report `POLLIN` and the
+  following `accept` returns at once. Incoming vsock data is delivered by the
+  device interrupt and queued in the guest kernel, so `poll` sees it without any
+  timer help.
+- **Host side = hybrid-vsock handshake (`vmm_inject_env`).** Connect to
+  `vm->vsock_uds`, send `CONNECT 5001\n`, read the `OK <host_port>\n` line, then
+  stream `KEY=VALUE\n` lines and close (FIN = EOF, which the agent reads to).
+  Called from `handle_create` after the VM is restored and the pidfd is tracked.
+- **1 s muxer settle before the first CONNECT.** A host connection issued while
+  Firecracker's vsock muxer is still setting up its restored endpoint is
+  accepted but never answered, and that stuck half-open state wedges the port:
+  measured ~10–20% of immediate connects wedged *all* subsequent retries (8×
+  5 s timeouts, then `env_inject_failed`), while waiting 1 s after resume before
+  the first attempt succeeds in ~1 ms (10/10 at 1 s, 2 s, 8 s and 45 s delays).
+  So `vmm_inject_env` sleeps 1 s first; only creates *with* env pay it (the
+  pool-hit path carries no env). Cost: a `Create` with env takes ~1 s.
+- **Guest re-announces its listener (~5 s, until env lands).** Post-restore
+  Firecracker resets the vsock transport and the guest must re-announce its
+  listener on the event queue; if that one-shot announcement is lost the host
+  can handshake forever without the guest seeing anything. Until the env is
+  received the agent therefore closes and re-binds its listener about every
+  5 s; each fresh `listen()` re-emits the port-announce (a guest→host MMIO
+  write, no rx interrupt needed). The interval is deliberately long: a rebind
+  drops any in-flight host connection, and ~100 ms rebinds guillotined every
+  attempt, while 5 s windows let one complete undisturbed. First `POLLIN` after
+  each bind prints `SANDBOX-VSOCK-POLLIN`, each rebind prints
+  `SANDBOX-VSOCK-RELISTEN` (diagnostics, serial).
+- **Best-effort, bounded, retried.** A `Create` **never fails** because of
+  injection: any error logs
+  `{"component":"ipc_server","event":"env_inject_failed","sandbox_id":N}` and the
+  sandbox is returned usable (success logs `env_injected`). Past the settle,
+  the whole connect+handshake+write sequence retries up to 8× (250 ms apart);
+  the socket carries `SO_RCVTIMEO`/`SO_SNDTIMEO` of 5 s so a stalled muxer can
+  never block the create path (worst case ~45 s, then failure, never a hang).
+- **Stale-jail hardening.** `vmm_restore` now calls `jail_cleanup()` before
+  `mkdir_recursive()`. A previous run killed before `vmm_destroy` left a stale
+  `<jail>/api.sock`; Firecracker cannot rebind it, `wait_for_file` passes on the
+  stale file, and every `connect` then fails `ECONNREFUSED`. Clearing first makes
+  repeated create/destroy cycles reliable.
+- **Debug artifact:** `snapshot_manager` copies the template VM's boot serial to
+  `<template>/boot-serial.log` (best-effort) so the guest agent's
+  `SANDBOX-AGENT-*`/`SANDBOX-READY` lines survive for inspection.
+- **Test coverage.** `tests/test_ipc.c`'s create carries
+  `env_vars = {MYKEY=myvalue, SANDBOX_MODE=test}`; after `Create` it polls the
+  restored VM's `serial.log` (via `lifecycle_get`) for `MYKEY=myvalue` and the
+  `SANDBOX-ENV-BEGIN` marker. `test_vmm`'s restore case waits for a fresh
+  `SANDBOX-TICK`, which now proves the agent (and thus the device) is alive
+  post-restore.
