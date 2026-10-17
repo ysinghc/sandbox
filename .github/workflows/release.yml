@@ -1,23 +1,48 @@
 name: Release
 
-# Builds a release tarball and publishes it as a GitHub Release.
-#   - Push a tag like v0.12.0 to trigger automatically, or
+# Builds release artifacts for x86_64 and aarch64 and publishes them as a
+# GitHub Release.
+#   - Push a tag like v0.13.0 to trigger automatically, or
 #   - run this workflow manually and pass an existing tag.
+#
+# Published assets, per architecture (x86_64 and aarch64):
+#   * sandbox-engine-<ver>-linux-<arch>.tar.gz       staged install tree ("the zip")
+#   * sandbox-engine-<ver>-linux-<arch>-bin.tar.gz   bare binaries + shared libs
+#   * sandboxd / sandbox-broker / sandbox-cli / libsandbox*.so, each as a
+#     standalone download suffixed with -linux-<arch>
+#   * .sha256 checksums for both archives
+#
+# x86_64 runs on ubuntu-24.04; arm64 runs natively on ubuntu-24.04-arm (free for
+# public repositories), so no cross-compilation toolchain is needed.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing tag to build (e.g. v0.12.0)"
+        description: "Existing tag to build (e.g. v0.13.0)"
         required: true
 
 permissions:
   contents: write
 
+env:
+  # Tests that need real root + /dev/kvm + Firecracker + guest assets + the
+  # template fixture cannot run on hosted runners. See docs/TESTING.md.
+  CI_TEST_EXCLUDE: "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
 jobs:
-  release:
-    runs-on: ubuntu-24.04
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       - uses: actions/checkout@v5
         with:
@@ -39,34 +64,94 @@ jobs:
         run: cmake --build build -j
 
       - name: Smoke test (unprivileged subset)
-        run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+        run: ctest --test-dir build --output-on-failure -E "$CI_TEST_EXCLUDE"
 
       - name: Stage install
         run: DESTDIR="$PWD/stage" cmake --install build --prefix /usr/local
 
-      - name: Package tarball
-        id: pkg
+      - name: Package release artifacts
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           VER="${TAG#v}"
-          ARCH="$(uname -m)"
-          TARBALL="sandbox-engine-${VER}-linux-${ARCH}.tar.gz"
-          # The staged tree mirrors the filesystem (usr/local, var/lib, ...), so
-          # it extracts over / for a default install.
-          tar -C stage -czf "$TARBALL" .
-          sha256sum "$TARBALL" > "$TARBALL.sha256"
-          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
-          echo "Packaged $TARBALL"
+          BASE="sandbox-engine-${VER}-linux-${ARCH}"
+          DIST="$PWD/dist"
+          rm -rf "$DIST"
+          mkdir -p "$DIST"
+
+          # Locate the installed binaries/libraries without assuming the exact
+          # bindir/libdir layout (lib vs lib/<triplet>).
+          find_one() {
+            local f
+            f="$(find stage -type f -name "$1" -print -quit)"
+            if [ -z "$f" ]; then
+              echo "::error::packaging: '$1' was not installed" >&2
+              exit 1
+            fi
+            printf '%s\n' "$f"
+          }
+          BIN_SANDBOXD="$(find_one sandboxd)"
+          BIN_BROKER="$(find_one sandbox-broker)"
+          BIN_CLI="$(find_one sandbox-cli)"
+          LIB_SANDBOX="$(find_one libsandbox.so)"
+          LIB_SANDBOXPP="$(find_one 'libsandbox++.so')"
+
+          # 1. Staged install tree (the "zip"). It mirrors the filesystem
+          #    (usr/local, etc/sandbox-engine, var/lib, ...) so it extracts over /.
+          tar -C stage -czf "$DIST/${BASE}.tar.gz" .
+          ( cd "$DIST" && sha256sum "${BASE}.tar.gz" > "${BASE}.tar.gz.sha256" )
+
+          # 2. Bare binaries + shared libraries.
+          STAGE_BIN="$PWD/pkg-bin"
+          rm -rf "$STAGE_BIN"
+          mkdir -p "$STAGE_BIN"
+          install -m 0755 "$BIN_SANDBOXD"  "$STAGE_BIN/sandboxd"
+          install -m 0755 "$BIN_BROKER"    "$STAGE_BIN/sandbox-broker"
+          install -m 0755 "$BIN_CLI"       "$STAGE_BIN/sandbox-cli"
+          install -m 0755 "$LIB_SANDBOX"   "$STAGE_BIN/libsandbox.so"
+          install -m 0755 "$LIB_SANDBOXPP" "$STAGE_BIN/libsandbox++.so"
+          tar -C "$STAGE_BIN" -czf "$DIST/${BASE}-bin.tar.gz" .
+          ( cd "$DIST" && sha256sum "${BASE}-bin.tar.gz" > "${BASE}-bin.tar.gz.sha256" )
+
+          # 3. Standalone binaries, suffixed by architecture for direct download.
+          install -m 0755 "$BIN_SANDBOXD"  "$DIST/sandboxd-linux-${ARCH}"
+          install -m 0755 "$BIN_BROKER"    "$DIST/sandbox-broker-linux-${ARCH}"
+          install -m 0755 "$BIN_CLI"       "$DIST/sandbox-cli-linux-${ARCH}"
+          install -m 0755 "$LIB_SANDBOX"   "$DIST/libsandbox-linux-${ARCH}.so"
+          install -m 0755 "$LIB_SANDBOXPP" "$DIST/libsandbox++-linux-${ARCH}.so"
+
+          echo "--- artifacts ---"
+          ls -l "$DIST"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lR dist
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           name: Sandbox Engine ${{ github.event.inputs.tag || github.ref_name }}
-          files: |
-            ${{ steps.pkg.outputs.tarball }}
-            ${{ steps.pkg.outputs.tarball }}.sha256
+          files: dist/*
           generate_release_notes: true
           fail_on_unmatched_files: true
