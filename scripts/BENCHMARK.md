@@ -76,6 +76,7 @@ sudo scripts/bench.sh --iterations 50 --concurrency 8 --output bench.json
 | `--workdir DIR` | /tmp/... | workspace (reuse it to skip the template build) |
 | `--keep` | off | keep the workspace after the run |
 | `--no-systemctl` | off | do not touch the system `sandboxd` service |
+| `--no-fc-seccomp` | off | diagnostic: disable the engine's seccomp filter |
 | `--quick` | off | fast smoke run |
 | `-h, --help` | | help |
 
@@ -97,7 +98,10 @@ Default SLA targets (edit `report()` to change): create p50 < 100 ms, create p99
 
 - **"must run as root"** — rerun with `sudo`.
 - **Template build fails** — check the firecracker/kernel/rootfs paths and
-  `/opt/sandbox-assets`; see the tail shown on failure.
+  `/opt/sandbox-assets`; see the tail shown on failure. If the log shows
+  `[cold_fail] child killed by signal 31` (SIGSYS), the seccomp allow-list is
+  rejecting a syscall the jailed Firecracker needs — rerun with
+  `--no-fc-seccomp` to confirm, and report the arch (see `docs/TROUBLESHOOTING.md`).
 - **Creates fail (`failed` > 0)** — the warm pool was too small for the
   concurrency; increase `--pool-size`.
 - **Daemon log** — kept at `<workdir>/results/daemon.log`; the workspace is

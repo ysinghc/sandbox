@@ -3,10 +3,14 @@
 // so it must also cover the calls Firecracker makes before it would install its
 // own per-thread filters (thread creation, socket bind/listen, uname, ...).
 //
-// The syscall set mirrors Firecracker v1.17's own aarch64 policy
+// The base syscall set mirrors Firecracker v1.17's *aarch64* policy
 // (resources/seccomp/aarch64-unknown-linux-musl.json — the union of its vmm,
 // api and vcpu thread filters) plus those pre-filter calls. Verified against a
 // full cold-boot + snapshot + UFFD-restore + pool run under SCMP_ACT_LOG.
+//
+// x86_64 additionally needs dup2 (jailer), arch_prctl (musl TLS at FC startup)
+// and open/stat; see the __x86_64__ block below. These are guarded so aarch64
+// builds are unaffected.
 #define _GNU_SOURCE  // CLONE_VM under strict C11
 
 #include "sandbox_seccomp.h"
@@ -131,6 +135,25 @@ int apply_seccomp_filter(void) {
     ALLOW(set_robust_list);
     ALLOW(set_tid_address);
     ALLOW(getpid);
+
+    // The set above mirrors Firecracker's *aarch64* filter (the original
+    // target). x86_64 needs four more, or the jailed child dies with SIGSYS:
+    //   dup2       - the jailer calls dup2() *after* installing this filter
+    //                (jailer.c). aarch64 has no dup2 syscall, so glibc lowers
+    //                dup2() to dup3 (already allowed); x86_64 does not.
+    //   arch_prctl - ARCH_SET_FS: static-pie musl installs its thread pointer
+    //                this way at Firecracker startup. aarch64 sets TPIDR_EL0
+    //                directly, with no syscall.
+    //   open, stat - the exact delta between Firecracker v1.17's x86_64 and
+    //                aarch64 policies (v1.17 x86_64: open/stat; aarch64:
+    //                openat/newfstatat, which stay in the common set above and
+    //                are harmless on x86_64).
+#if defined(__x86_64__)
+    ALLOW(dup2);
+    ALLOW(arch_prctl);
+    ALLOW(open);
+    ALLOW(stat);
+#endif
 
     // Jailer hand-off.
     ALLOW(execve);       // Jailer execs firecracker

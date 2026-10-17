@@ -1,7 +1,10 @@
-// Static probe executed inside the jail. Args: <outside_path> <expected_uid> <ptrace|ioctl>
+// Static probe executed inside the jail. Args: <outside_path> <expected_uid>
+// <ptrace|ioctl|allowed>
 // Exit 10: outside path reachable (chroot broken). Exit 11: uid mismatch.
 // Exit 13: allowed syscall failed post-filter. Exit 14: filter load failed.
-// Otherwise dies by SIGSYS on the fatal call (Release), or exits with errno (Debug).
+// Exit 0: "allowed" mode — every permitted syscall (incl. the jailer's dup2 and
+//         musl's arch_prctl at startup) succeeded. Otherwise dies by SIGSYS on
+//         the fatal call (Release), or exits with errno (Debug).
 //
 // NOTE: socket()/TCGETS are deliberately *not* probed as fatal — Firecracker's
 // runtime set needs both (UDS API server, UFFD handshake, terminal restore), so
@@ -10,6 +13,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,6 +24,10 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__x86_64__)
+#include <asm/prctl.h>
+#include <sys/syscall.h>
+#endif
 
 #include "sandbox_seccomp.h"
 
@@ -27,7 +35,8 @@ int main(int argc, char** argv) {
     if (argc != 4) return 15;
     const char* outside_path = argv[1];
     uid_t expected_uid = (uid_t)atoi(argv[2]);
-    int use_ioctl = strcmp(argv[3], "ioctl") == 0;
+    bool mode_ioctl = strcmp(argv[3], "ioctl") == 0;
+    bool mode_allowed = strcmp(argv[3], "allowed") == 0;
 
     int fd = open(outside_path, O_RDONLY);
     if (fd >= 0) { close(fd); return 10; }
@@ -46,7 +55,22 @@ int main(int argc, char** argv) {
     if (efd < 0) return 13;
     close(efd);
 
-    if (use_ioctl) {
+    // dup2() must be permitted: the jailer dup2s its serial fd *after*
+    // installing this filter (jailer.c). x86_64 has a dup2 syscall distinct
+    // from dup3; aarch64 lowers dup2() to dup3. Regression guard for the
+    // x86_64 SIGSYS where Firecracker's aarch64-only allow-list lacked dup2.
+    if (dup2(STDOUT_FILENO, STDOUT_FILENO) < 0) return 13;
+#if defined(__x86_64__)
+    // static-pie musl installs the thread pointer via arch_prctl(ARCH_SET_FS)
+    // at startup; x86_64's Firecracker calls it before any of its own filters
+    // would land. A GET_FS is a side-effect-free proof the syscall is allowed.
+    unsigned long fs = 0;
+    if (syscall(SYS_arch_prctl, ARCH_GET_FS, (unsigned long)&fs) < 0) return 13;
+#endif
+
+    if (mode_allowed) _exit(0);  // all permitted syscalls succeeded
+
+    if (mode_ioctl) {
         // FIONREAD is not in the ioctl allow-list (KVM 0xAE / UFFD 0xAA classes
         // plus specific tap/block/terminal requests) — must be killed.
         int n = 0;

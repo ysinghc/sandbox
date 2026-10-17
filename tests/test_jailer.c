@@ -86,6 +86,29 @@ static void test_seccomp_ioctl_args(void) {
     check_filter_death(run_probe_bare((char*)"ioctl"), "seccomp_ioctl_args");
 }
 
+// Positive guard: every permitted syscall — including the jailer's dup2() and
+// (on x86_64) musl's arch_prctl() at process startup — must succeed after the
+// filter is installed. A missing allow surfaces as SIGSYS (Release) or exit 13
+// (Debug). This is the regression test for the x86_64 SIGSYS where the filter,
+// originally copied from Firecracker's aarch64 policy, omitted dup2/arch_prctl.
+static void test_seccomp_allowed_syscalls(void) {
+    printf("[test] seccomp_allowed_syscalls...\n");
+    fflush(stdout);
+    int status = run_probe_bare((char*)"allowed");
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        printf("[test] seccomp_allowed_syscalls: PASS\n");
+        fflush(stdout);
+        return;
+    }
+    if (WIFSIGNALED(status))
+        fprintf(stderr, "FAIL seccomp_allowed_syscalls: killed by signal=%d "
+                        "(a permitted syscall was denied)\n", WTERMSIG(status));
+    else
+        fprintf(stderr, "FAIL seccomp_allowed_syscalls: exit=%d\n",
+                WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+    abort();
+}
+
 static void test_helpers(void) {
     printf("[test] helpers...\n");
     fflush(stdout);
@@ -305,6 +328,7 @@ static void test_jailer_sequence(void) {
 int main(void) {
     test_seccomp_forbidden_syscall();
     test_seccomp_ioctl_args();
+    test_seccomp_allowed_syscalls();
     test_helpers();
     test_jailer_sequence();
     printf("ALL JAILER TESTS PASSED\n");

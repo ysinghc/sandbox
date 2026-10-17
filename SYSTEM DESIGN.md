@@ -1489,9 +1489,25 @@ authoritative.
   `TCGETS`/`TCSETS`, `BLKSSZGET`/`BLKDISCARD`/`BLKIOMIN`/`BLKIOOPT`/`BLKPBSZGET`).
   Derived empirically under `SCMP_ACT_LOG` over a full cold-boot + snapshot +
   UFFD-restore + pool run.
+- **The whitelist is architecture-aware.** The base set above was derived from
+  Firecracker's *aarch64* policy on the original Pi target. Booting the same
+  engine on x86_64 killed every jailed Firecracker with SIGSYS, because four
+  syscalls differ on that arch: the jailer `dup2`s its serial fd *after*
+  installing the filter and x86_64 has a real `dup2` syscall (glibc does not
+  lower it to `dup3` as on aarch64); static-pie musl installs its thread pointer
+  via `arch_prctl(ARCH_SET_FS)` at startup (aarch64 sets `TPIDR_EL0` with no
+  syscall); and Firecracker's x86_64 policy uses `open`/`stat` where its aarch64
+  policy uses `openat`/`newfstatat` (the exact delta between the two v1.17
+  policies). `seccomp.c` adds exactly these four under `#if defined(__x86_64__)`;
+  no aarch64 rule changes and the common list is a superset on both arches.
 - The Phase-2 probe now proves filter death on `ptrace` and on an unlisted
   `ioctl` (`FIONREAD`); `socket`/`TCGETS` are deliberately allowed (FC needs
-  both), so they are no longer the fatal calls.
+  both), so they are no longer the fatal calls. It also has an `allowed` mode
+  (exit 0 iff every permitted syscall succeeds) exercised by
+  `test_seccomp_allowed_syscalls`: this fails with SIGSYS/exit 13 if a permitted
+  call such as `dup2` or `arch_prctl` is denied. The earlier tests could not
+  catch the x86_64 regression — they assert that *forbidden* calls die, which
+  stays true even when an allowed call is also killed.
 
 ### 15.4 UFFD Handler / Prefault (§§5.2–5.3)
 - `uffd_fd` is `O_NONBLOCK` + `poll(100ms)`; shutdown is flag → join →

@@ -43,6 +43,7 @@ OUTPUT=""
 KEEP=0
 USE_SYSTEMCTL=1
 QUICK=0
+FC_SECCOMP=1          # 0 => export SANDBOX_FC_SECCOMP=0 (diagnostic)
 
 # Populated during the run.
 BENCH_TS=""
@@ -93,6 +94,8 @@ Options:
   --workdir DIR       workspace (default /tmp/sandbox-bench-<timestamp>)
   --keep              keep the workspace and template after the run
   --no-systemctl      do not stop/start the system sandboxd service
+  --no-fc-seccomp     disable the engine's seccomp filter (SANDBOX_FC_SECCOMP=0;
+                      diagnostic only, for isolating seccomp issues)
   --quick             fast smoke run (5 iterations, concurrency 2, small VM)
   -h, --help          this help
 EOF
@@ -113,6 +116,7 @@ parse_args() {
             --workdir)      WORKDIR="$2"; shift 2 ;;
             --keep)         KEEP=1; shift ;;
             --no-systemctl) USE_SYSTEMCTL=0; shift ;;
+            --no-fc-seccomp) FC_SECCOMP=0; shift ;;
             --quick)        QUICK=1; shift ;;
             -h|--help)      usage; exit 0 ;;
             *)              err "unknown option: $1"; usage; exit 2 ;;
@@ -537,6 +541,7 @@ cleanup() {
 main() {
     parse_args "$@"
     [ "$QUICK" = 1 ] && { ITERATIONS=5; WARMUP=2; CONCURRENCY=2; VM_MEMORY=128; PAUSE_CYCLES=5; }
+    [ "$FC_SECCOMP" = 0 ] && export SANDBOX_FC_SECCOMP=0
 
     hdr "Sandbox Engine benchmark"
     preflight
