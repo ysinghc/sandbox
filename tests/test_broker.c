@@ -416,6 +416,59 @@ static void test_proxy(void) {
     report("proxy", b);
 }
 
+// §10.14: chunked request bodies are decoded, re-framed with Content-Length,
+// and forwarded to the upstream.
+static void test_chunked(void) {
+    int b = g_fail;
+    char epath[512];
+    snprintf(epath, sizeof(epath), "%s/engine-chunk.sock", g_dir);
+    mock_engine_t eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.expected = TOKEN_BYTES;
+    eng.n_allowed = 1;
+    eng.allowed[0] = "127.0.0.1";
+    eng.listen_fd = engine_listen(epath);
+    CHECK(eng.listen_fd >= 0, "engine listen");
+    pthread_t eth;
+    pthread_create(&eth, NULL, engine_thread, &eng);
+    eng.client_fd_fd = broker_engine_connect(epath);
+    CHECK(eng.client_fd_fd >= 0, "engine connect");
+
+    mock_upstream_t up;
+    memset(&up, 0, sizeof(up));
+    snprintf(up.response, sizeof(up.response),
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\n"
+             "hello");
+    uint16_t port = 0;
+    up.listen_fd = upstream_listen(&port);
+
+    char greq[1024], resp[4096];
+    snprintf(greq, sizeof(greq),
+             "POST /v1/echo HTTP/1.1\r\n"
+             "Host: 127.0.0.1:%u\r\n"
+             "X-Sandbox-Token: " TOKEN_HEX "\r\n"
+             "Transfer-Encoding: chunked\r\n"
+             "\r\n"
+             "5\r\nhello\r\n"
+             "6\r\n world\r\n"
+             "0\r\n\r\n",
+             port);
+    int st = proxy_once(&eng, &up, greq, resp, sizeof(resp), "hello");
+    CHECK(st == 200, "chunked upstream status 200");
+    CHECK(strstr(resp, "200 OK") && strstr(resp, "hello"), "chunked response relayed");
+
+    close(eng.client_fd_fd);
+    pthread_join(eth, NULL);
+    close(eng.listen_fd);
+    unlink(epath);
+
+    // The reassembled body must arrive with a Content-Length (no chunked TE).
+    CHECK(strstr(up.request, "hello world") != NULL, "chunked body decoded");
+    CHECK(strstr(up.request, "Transfer-Encoding") == NULL, "TE header removed");
+    CHECK(strstr(up.request, "Content-Length: 11") != NULL, "re-framed length");
+    report("chunked", b);
+}
+
 static void test_denied(void) {
     int b = g_fail;
     char epath[512];
@@ -548,10 +601,22 @@ int main(void) {
     test_token();
     test_allowlist();
     test_proxy();
+    test_chunked();
     test_denied();
     test_bad_token();
     test_missing_token();
     test_bad_request();
+
+    // §10.13: broker metrics reflect the requests driven above.
+    {
+        char mb[8192];
+        int n = broker_metrics_render(mb, sizeof(mb));
+        if (n <= 0 || !strstr(mb, "broker_requests_total{status=\"2xx\"}") ||
+            !strstr(mb, "broker_upstream_latency_seconds_count")) {
+            fprintf(stderr, "FAIL: broker metrics render\n%s\n", mb);
+            g_fail = 1;
+        }
+    }
 
     char rm[512];
     snprintf(rm, sizeof(rm), "rm -rf %s", g_dir);

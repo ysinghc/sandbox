@@ -110,3 +110,10 @@ target_include_directories(test_cgroup PRIVATE ../include)
 target_link_libraries(test_cgroup sandbox)
 add_test(NAME cgroup COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_cgroup)
 set_tests_properties(cgroup PROPERTIES TIMEOUT 60)
+
+# Phase 13: metrics / health / ready endpoints (§10.13). No root.
+add_executable(test_metrics test_metrics.c)
+target_include_directories(test_metrics PRIVATE ../include)
+target_link_libraries(test_metrics sandbox)
+add_test(NAME metrics COMMAND test_metrics)
+set_tests_properties(metrics PROPERTIES TIMEOUT 30)

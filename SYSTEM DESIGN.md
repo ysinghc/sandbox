@@ -1276,6 +1276,15 @@ WantedBy=multi-user.target
 
 ### 11.1 Metrics (Prometheus format)
 
+Served by the daemon on `metrics_bind:metrics_port` (default `0.0.0.0:9180`;
+set `metrics_bind = ` empty to disable). Three endpoints:
+
+| Path | Behaviour |
+|---|---|
+| `/health` | `200` while the process is up (liveness) |
+| `/ready` | `200` when the warm pool is non-empty, else `503` (readiness) |
+| `/metrics` | Prometheus text |
+
 ```
 sandbox_pool_warm_count         # Current warm VMs in pool
 sandbox_pool_restoring_count    # VMs currently being restored
@@ -1284,21 +1293,34 @@ sandbox_pool_exhaustion_total   # Cumulative pool exhaustions
 sandbox_provision_latency_ms    # Histogram: sandbox_create() latency
 sandbox_uffd_faults_total       # Cumulative page faults served
 sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
+sandbox_process_open_fds        # Daemon self-stat (fd leak detection)
+sandbox_process_virtual_memory_bytes
+sandbox_process_resident_memory_bytes
+```
+
+The broker exposes its own counters on an optional listener
+(`SANDBOX_BROKER_METRICS_PORT`):
+
+```
+broker_requests_total{status="2xx|4xx|5xx"}
+broker_upstream_latency_seconds  # histogram
 ```
 
 ### 11.2 Structured Logging
 
+One JSON object per line on stderr; journald captures and rotates it
+(`StandardError=journal`). Field names are standardised across the daemon, IPC
+server and broker:
+
 ```json
-{
-  "timestamp": "2025-09-12T10:15:32Z",
-  "level": "INFO",
-  "component": "pool_manager",
-  "event": "provision_from_pool",
-  "sandbox_id": 42,
-  "latency_ms": 87,
-  "pool_state": {"warm": 4, "restoring": 1, "overflow": 0}
-}
+{"ts":"2026-10-17T10:15:32.123Z","level":"INFO","component":"broker",
+ "event":"proxy","sandbox_id":42,"host":"api.openai.com","status":200,
+ "latency_ms":87}
 ```
+
+`level` is filtered by `log_level` (`debug|info|warn|error`, from `engine.conf`,
+`--log-level`, or `SANDBOX_LOG_LEVEL`). Emission goes through `src/log.c`
+(`LOGF(level, component, event, "<extra fields>")`).
 
 ---
 
@@ -1328,6 +1350,10 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
       Phase 12.10, §15.14
 - [x] Per-VM resource enforcement (cgroup v2 memory/CPU/OOM-group) — Phase
       12.11, §15.14
+- [x] Structured logs with levels, captured/rotated by journald — Phase 12.12,
+      §15.15
+- [x] Liveness/readiness probes + process self-metrics — Phase 13.13, §15.15
+- [x] CI builds + ASan/UBSan + fuzz smoke — Phase 13.14, §15.15
 - [ ] Broker TLS cert validation enabled (HTTPS to upstream)
 - [ ] Session token entropy (getrandom, not /dev/urandom)
 
@@ -1954,3 +1980,36 @@ authoritative.
   unmetered with a log. Verified on the Pi: the restored Firecracker pid appears
   in `<jail>/../active/<vm-id>/cgroup.procs`. New config keys `cgroup_enable`,
   `cgroup_slack_mib`, `cgroup_cpu_max`; new ctest `cgroup`.
+
+### 15.15 Phase 13 — Observability, Hardening & Docs (§10.12–§10.15)
+- **Structured logging (§10.12).** New `include/log.h` + `src/log.c`. One JSON
+  line per event with standardised fields (`ts` = RFC3339 UTC ms, `level`,
+  `component`, `event`, plus per-event fields). `log_level` is
+  `debug|info|warn|error` from `engine.conf`, `--log-level`, or
+  `SANDBOX_LOG_LEVEL`. Migrated the daemon/broker/ipc-server JSON logs (10
+  call sites) from ad-hoc `fprintf` to `LOGF(...)`; journald captures/rotates
+  stderr (`StandardError=journal`). `log.c` is compiled into both `sandbox` and
+  `sandbox_broker_core`.
+- **Metrics/health/ready (§10.13).** `telemetry_serve()` now routes
+  `/health` (always 200), `/ready` (200 iff warm pool non-empty, else 503),
+  `/metrics`, else 404. The metrics port is on by default
+  (`0.0.0.0:9180`; empty `metrics_bind` disables). Added process self-stats
+  (`sandbox_process_open_fds`, `..._virtual_memory_bytes`,
+  `..._resident_memory_bytes`). The broker gained
+  `broker_requests_total{status}` + a `broker_upstream_latency_seconds`
+  histogram, exposed on an optional `SANDBOX_BROKER_METRICS_PORT` listener.
+  New ctest `metrics`; `test_broker` asserts the broker counters render.
+- **CI + sanitizers + fuzzing + chunked bodies (§10.14).** `.github/workflows/ci.yml`
+  runs three jobs: build+test, ASan+UBSan
+  (`-DSANDBOX_SANITIZE=address,undefined`), and a libFuzzer smoke job (clang).
+  New CMake options `SANDBOX_SANITIZE` and `SANDBOX_BUILD_FUZZERS`; `fuzz/`
+  holds three harnesses (`fuzz_http`, `fuzz_config`, `fuzz_proto`) with seed
+  corpora. Without clang they build with a standalone file/stdin driver, so the
+  same corpus runs under ASan/UBSan (verified on the Pi). `config_parse_buffer()`
+  was extracted so the config parser is fuzzable in memory. The broker now
+  **decodes chunked request bodies** (bounded to 8 MiB), re-frames them with a
+  `Content-Length`, and forwards them; malformed input returns 400.
+- **Operations docs (§10.15).** `docs/RUNBOOK.md` (daily checks, failure
+  playbook, cleanup), `docs/UPGRADE.md` (drain → install → **rebuild templates**
+  → verify → rollback; manifest compatibility table), `docs/BACKUP.md` (what to
+  back up, integrity, secrets, cadence).

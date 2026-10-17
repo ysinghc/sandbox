@@ -3,6 +3,7 @@
 
 #include "telemetry.h"
 
+#include <dirent.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
@@ -23,6 +24,34 @@ void telemetry_pool_state(int warm, int restoring, int overflow) {
     atomic_store(&g_pool_warm, warm);
     atomic_store(&g_pool_restoring, restoring);
     atomic_store(&g_pool_overflow, overflow);
+}
+
+// §10.13: process self-stats from /proc/self (fd count, virtual + resident mem).
+static long proc_open_fds(void) {
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) return -1;
+    long n = 0;
+    struct dirent* e;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] != '.') n++;
+    }
+    closedir(d);
+    return n;
+}
+
+static void proc_memory(unsigned long* virt_kb, unsigned long* rss_kb) {
+    *virt_kb = 0;
+    *rss_kb = 0;
+    FILE* f = fopen("/proc/self/statm", "r");
+    if (!f) return;
+    unsigned long size = 0, resident = 0;
+    if (fscanf(f, "%lu %lu", &size, &resident) == 2) {
+        long ps = sysconf(_SC_PAGESIZE);
+        unsigned long kb = (ps > 0) ? (unsigned long)ps / 1024 : 4;  // pages->KiB
+        *virt_kb = size * kb;
+        *rss_kb = resident * kb;
+    }
+    fclose(f);
 }
 
 void telemetry_provision_latency(uint64_t latency_ms) {
@@ -78,28 +107,77 @@ int telemetry_render(char* buf, int cap) {
     EMIT("sandbox_uffd_faults_total %ld\n", atomic_load(&g_uffd_faults));
     EMIT("# TYPE sandbox_vmm_crashes_total counter\n");
     EMIT("sandbox_vmm_crashes_total %ld\n", atomic_load(&g_vmm_crashes));
+    // §10.13: process self-stats so operators can spot fd/memory leaks.
+    unsigned long virt_kb = 0, rss_kb = 0;
+    proc_memory(&virt_kb, &rss_kb);
+    EMIT("# TYPE sandbox_process_open_fds gauge\n");
+    EMIT("sandbox_process_open_fds %ld\n", proc_open_fds());
+    EMIT("# TYPE sandbox_process_virtual_memory_bytes gauge\n");
+    EMIT("sandbox_process_virtual_memory_bytes %lu\n", virt_kb * 1024);
+    EMIT("# TYPE sandbox_process_resident_memory_bytes gauge\n");
+    EMIT("sandbox_process_resident_memory_bytes %lu\n", rss_kb * 1024);
 #undef EMIT
     return off;
 }
 
+// §10.13: HTTP endpoint for orchestrator probes + Prometheus scraping.
+//   GET /health  -> 200 always (liveness)
+//   GET /ready   -> 200 when the pool has >= 1 warm VM, else 503
+//   GET /metrics -> Prometheus text
+//   anything else -> 404
+static void serve_http(int cfd) {
+    char req[1024];
+    ssize_t r = recv(cfd, req, sizeof(req) - 1, 0);
+    if (r <= 0) return;
+    req[r] = '\0';
+
+    // First request line: "GET /path HTTP/1.x".
+    char method[8] = {0}, path[256] = {0};
+    sscanf(req, "%7s %255s", method, path);
+
+    const char* status = "200 OK";
+    const char* ctype = "text/plain; version=0.0.4";
+    char body[16384];
+    int n = 0;
+
+    if (strcmp(path, "/health") == 0 || strcmp(path, "/healthz") == 0) {
+        ctype = "text/plain";
+        n = snprintf(body, sizeof(body), "ok\n");
+    } else if (strcmp(path, "/ready") == 0 || strcmp(path, "/readyz") == 0) {
+        ctype = "text/plain";
+        if (atomic_load(&g_pool_warm) > 0) {
+            n = snprintf(body, sizeof(body), "ready\n");
+        } else {
+            status = "503 Service Unavailable";
+            n = snprintf(body, sizeof(body), "not ready\n");
+        }
+    } else if (strcmp(path, "/metrics") == 0 || strcmp(path, "/") == 0) {
+        n = telemetry_render(body, sizeof(body));
+    } else {
+        status = "404 Not Found";
+        ctype = "text/plain";
+        n = snprintf(body, sizeof(body), "not found\n");
+    }
+
+    char hdr[192];
+    int hn = snprintf(hdr, sizeof(hdr),
+                      "HTTP/1.0 %s\r\nContent-Type: %s\r\nContent-Length: %d\r\n"
+                      "Connection: close\r\n\r\n",
+                      status, ctype, n);
+    ssize_t w = send(cfd, hdr, (size_t)hn, MSG_NOSIGNAL);
+    (void)w;
+    if (n > 0) {
+        w = send(cfd, body, (size_t)n, MSG_NOSIGNAL);
+        (void)w;
+    }
+}
+
 int telemetry_serve(int listen_fd) {
     if (listen_fd < 0) return -1;
-    char body[8192];
     for (;;) {
         int cfd = accept(listen_fd, NULL, NULL);
         if (cfd < 0) return -1;
-        int n = telemetry_render(body, sizeof(body));
-        char hdr[128];
-        int hn = snprintf(hdr, sizeof(hdr),
-                          "HTTP/1.0 200 OK\r\nContent-Type: text/plain; "
-                          "version=0.0.4\r\nContent-Length: %d\r\n\r\n",
-                          n);
-        ssize_t w = send(cfd, hdr, (size_t)hn, MSG_NOSIGNAL);
-        (void)w;
-        if (n > 0) {
-            w = send(cfd, body, (size_t)n, MSG_NOSIGNAL);
-            (void)w;
-        }
+        serve_http(cfd);
         close(cfd);
     }
 }

@@ -33,7 +33,8 @@ int main(void) {
     config_defaults(&c);
     CHECK(c.pool_size == 5, "default pool_size");
     CHECK(c.jailer_uid == 65534 && c.jailer_gid == 65534, "default jailer ids");
-    CHECK(c.metrics_port == 0, "default metrics disabled");
+    CHECK(c.metrics_port == 9180, "default metrics port");
+    CHECK_STR(c.metrics_bind, "0.0.0.0", "default metrics bind");
 
     // 2. A synthetic file with [sections], comments and every key.
     const char* tmp = "/tmp/sbtest-config-XXXXXX";
@@ -59,6 +60,7 @@ int main(void) {
         "cgroup_enable = 0\n"
         "cgroup_slack_mib = 12\n"
         "cgroup_cpu_max = 50000 100000\n"
+        "log_level = warn\n"
         "[pool]\n"
         "target_size = 7\n"
         "max_queue_depth = 11\n"
@@ -91,6 +93,7 @@ int main(void) {
     CHECK(c.cgroup_enable == 0, "file cgroup_enable");
     CHECK(c.cgroup_slack_mib == 12, "file cgroup_slack_mib");
     CHECK_STR(c.cgroup_cpu_max, "50000 100000", "file cgroup_cpu_max");
+    CHECK_STR(c.log_level, "warn", "file log_level");
     CHECK_STR(c.allowed_uids, "0, 1000", "file allowed_uids");
     CHECK_STR(c.allowed_services, "a.example, b.example", "file allowed_services");
     CHECK_STR(c.jail_root, "/var/j", "file jail_root");
@@ -115,6 +118,7 @@ int main(void) {
     CHECK(c.cgroup_enable == 1, "packaged cgroup_enable");
     CHECK(c.cgroup_slack_mib == 64, "packaged cgroup_slack_mib");
     CHECK_STR(c.cgroup_cpu_max, "max", "packaged cgroup_cpu_max");
+    CHECK_STR(c.log_level, "info", "packaged log_level");
     CHECK_STR(c.jail_root, "/var/lib/sandbox-engine/jail", "packaged jail_root");
     CHECK_STR(c.snapshot_root, "/var/lib/sandbox-engine/snapshots",
               "packaged snapshot_root");

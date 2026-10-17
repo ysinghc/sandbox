@@ -105,12 +105,22 @@ bool broker_host_allowed(char* const* allowed_services, const char* host);
 // or -1 on transport failure (an error may already be written to client_fd).
 int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd);
 
+// §10.14: forward a request whose body has already been buffered in memory
+// (used after decoding a chunked request body). `body` may be NULL when len 0.
+int broker_forward_upstream_mem(const http_request_t* req, int client_fd,
+                                const char* body, size_t body_len);
+
 // Handle one proxied request on client_fd (never closes it). Returns the HTTP
 // status it sent. engine_fd is the validation socket.
 int broker_handle_request(int client_fd, const credential_store_t* creds, int engine_fd);
 
 // Bind + accept loop for the production process. Blocks.
 int broker_run(void);
+
+// §10.13: broker metrics (Prometheus text). broker_metrics_serve() blocks,
+// answering every connection with the metrics text (run in its own thread).
+int broker_metrics_render(char* buf, int cap);
+int broker_metrics_serve(int listen_fd);
 
 // Env-derived config (defaults are the production values).
 const char* broker_listen_addr(void);       // SANDBOX_BROKER_LISTEN

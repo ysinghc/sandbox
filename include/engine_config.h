@@ -35,6 +35,7 @@ typedef struct {
     int cgroup_enable;           // §10.11 per-VM cgroup enforcement (0/1)
     int cgroup_slack_mib;        // memory.max headroom over guest size
     char cgroup_cpu_max[ENGINE_CONFIG_VAL_MAX];  // cpu.max ("max" = unlimited)
+    char log_level[16];          // §10.12 debug|info|warn|error
 } engine_config_t;
 
 // Fill c with built-in defaults.
@@ -44,6 +45,10 @@ void config_defaults(engine_config_t* c);
 void config_set_key(engine_config_t* c, const char* key, const char* val);
 
 // Load a "key = value" file (missing file logs and leaves defaults).
+// Parse a whole config body from memory (used by the file loader and by the
+// config fuzzer). `text` is NUL-terminated.
+void config_parse_buffer(engine_config_t* c, const char* text);
+
 void config_load_file(engine_config_t* c, const char* path);
 
 // Overlay SANDBOX_* environment variables (below CLI, above the file).

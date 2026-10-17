@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # Tests that need real root + /dev/kvm + Firecracker + guest assets + the
+  # template fixture cannot run on hosted runners; they SKIP or are excluded.
+  CI_TEST_EXCLUDE: "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libprotobuf-dev protobuf-compiler libprotoc-dev \
+            libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -E "$CI_TEST_EXCLUDE"
+
+  asan-ubsan:
+    runs-on: ubuntu-24.04
+    env:
+      # Leak detection is noisy with protobuf/libcurl global caches.
+      ASAN_OPTIONS: detect_leaks=0
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libprotobuf-dev protobuf-compiler libprotoc-dev \
+            libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
+      - name: Configure (ASan + UBSan)
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+          -DSANDBOX_SANITIZE=address,undefined
+      - name: Build
+        run: cmake --build build-asan -j
+      - name: Test
+        run: ctest --test-dir build-asan --output-on-failure -E "$CI_TEST_EXCLUDE"
+
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake pkg-config \
+            libprotobuf-dev protobuf-compiler libprotoc-dev \
+            libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
+      - name: Configure (libFuzzer)
+        run: cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
+          -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug \
+          -DSANDBOX_BUILD_FUZZERS=ON -DSANDBOX_SANITIZE=address,undefined
+      - name: Build fuzzers
+        run: cmake --build build-fuzz -j --target fuzz_http fuzz_config fuzz_proto
+      - name: Smoke-fuzz (short)
+        run: |
+          for t in http config proto; do
+            echo "=== fuzz_$t ==="
+            ./build-fuzz/fuzz/fuzz_$t -max_total_time=20 -runs=200000 \
+              fuzz/corpus/$t || exit 1
+          done

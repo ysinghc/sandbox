@@ -5,13 +5,16 @@
 #define _GNU_SOURCE
 
 #include "broker.h"
+#include "log.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
 #include <grp.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -217,6 +220,9 @@ struct fwd_ctx {
     int client_fd;
     int body_fd;
     uint64_t body_remaining;
+    const char* mem;    // §10.14: in-memory body (chunked decode); NULL otherwise
+    size_t mem_len;
+    size_t mem_off;
     long status;
 };
 
@@ -254,6 +260,14 @@ static size_t fwd_header_cb(char* buffer, size_t size, size_t nitems, void* ud) 
 static size_t fwd_read_cb(char* buffer, size_t size, size_t nmemb, void* ud) {
     struct fwd_ctx* c = ud;
     size_t want = size * nmemb;
+    if (c->mem) {  // §10.14: serve a decoded, buffered body
+        size_t left = c->mem_len - c->mem_off;
+        if (want > left) want = left;
+        if (want == 0) return 0;
+        memcpy(buffer, c->mem + c->mem_off, want);
+        c->mem_off += want;
+        return want;
+    }
     if ((uint64_t)want > c->body_remaining) want = (size_t)c->body_remaining;
     if (want == 0) return 0;
     ssize_t r = read(c->body_fd, buffer, want);
@@ -271,7 +285,8 @@ static uint64_t request_content_length(const http_request_t* req) {
     return (uint64_t)v;
 }
 
-int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd) {
+static int forward_impl(const http_request_t* req, int client_fd, int body_fd,
+                        const char* mem, size_t mem_len) {
     if (!req || client_fd < 0) return -1;
     const char* host = http_get_header(req, "Host");
     if (!host || !*host) return -1;
@@ -298,11 +313,14 @@ int broker_forward_upstream(const http_request_t* req, int client_fd, int body_f
     }
     hdrs = curl_slist_append(hdrs, "Expect:");  // suppress 100-continue
 
-    uint64_t blen = request_content_length(req);
+    uint64_t blen = mem ? (uint64_t)mem_len : request_content_length(req);
     struct fwd_ctx ctx = {
         .client_fd = client_fd,
         .body_fd = body_fd,
         .body_remaining = blen,
+        .mem = mem,
+        .mem_len = mem_len,
+        .mem_off = 0,
         .status = 0,
     };
 
@@ -343,9 +361,180 @@ int broker_forward_upstream(const http_request_t* req, int client_fd, int body_f
     return (int)status;
 }
 
+int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd) {
+    return forward_impl(req, client_fd, body_fd, NULL, 0);
+}
+
+int broker_forward_upstream_mem(const http_request_t* req, int client_fd,
+                                const char* body, size_t body_len) {
+    return forward_impl(req, client_fd, -1, body, body_len);
+}
+
+// §10.14: decode a chunked request body into memory. Bounded (8 MiB) so a
+// hostile guest cannot exhaust the broker. Returns 0 with a malloc'd buffer in
+// *out (NUL-terminate not required; caller frees) or -1 on malformed/oversized.
+#define CHUNKED_MAX_BODY (8u * 1024u * 1024u)
+
+static int recv_crlf_line(int fd, char* line, size_t cap) {
+    size_t li = 0;
+    for (;;) {
+        char ch;
+        ssize_t r = recv(fd, &ch, 1, 0);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;
+        if (li + 1 >= cap) return -1;
+        line[li++] = ch;
+        if (li >= 2 && line[li - 2] == '\r' && line[li - 1] == '\n') break;
+    }
+    line[li] = '\0';
+    return (int)li;
+}
+
+static int read_chunked_body(int fd, char** out, size_t* out_len) {
+    char* buf = NULL;
+    size_t cap = 0, len = 0;
+    char line[256];
+    for (;;) {
+        if (recv_crlf_line(fd, line, sizeof(line)) < 0) goto fail;
+        char* semi = strchr(line, ';');  // drop any chunk extension
+        if (semi) *semi = '\0';
+        char* end = NULL;
+        errno = 0;
+        unsigned long long sz = strtoull(line, &end, 16);
+        if (end == line || errno != 0) goto fail;
+        if (sz == 0) break;  // final chunk; trailers follow
+        if (sz > CHUNKED_MAX_BODY || len + sz > CHUNKED_MAX_BODY) goto fail;
+        if (len + sz > cap) {
+            size_t ncap = cap ? cap : 8192;
+            while (ncap < len + sz) ncap *= 2;
+            char* nb = realloc(buf, ncap);
+            if (!nb) goto fail;
+            buf = nb;
+            cap = ncap;
+        }
+        size_t got = 0;
+        while (got < sz) {
+            ssize_t r = recv(fd, buf + len + got, sz - got, 0);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                goto fail;
+            }
+            if (r == 0) goto fail;
+            got += (size_t)r;
+        }
+        len += got;
+        char crlf[2];
+        size_t ci = 0;
+        while (ci < 2) {
+            ssize_t r = recv(fd, crlf + ci, 1, 0);
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                goto fail;
+            }
+            if (r == 0) goto fail;
+            ci++;
+        }
+        if (crlf[0] != '\r' || crlf[1] != '\n') goto fail;
+    }
+    // Consume trailer headers up to the terminating empty line.
+    for (;;) {
+        if (recv_crlf_line(fd, line, sizeof(line)) < 0) goto fail;
+        if (line[0] == '\r') break;
+    }
+    *out = buf;
+    *out_len = len;
+    return 0;
+fail:
+    free(buf);
+    return -1;
+}
+
 // ---------------------------------------------------------------------------
 // Request pipeline
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// §10.13 broker metrics
+// ---------------------------------------------------------------------------
+
+static atomic_long g_req_2xx = 0, g_req_4xx = 0, g_req_5xx = 0;
+static atomic_ulong g_up_lat_count = 0, g_up_lat_sum_ms = 0;
+#define BROKER_LAT_BUCKETS 11
+static const double g_lat_bounds[BROKER_LAT_BUCKETS] = {
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10};
+static atomic_long g_up_lat_buckets[BROKER_LAT_BUCKETS];
+
+static void broker_metrics_observe(int status, long ms) {
+    if (status >= 500) atomic_fetch_add(&g_req_5xx, 1);
+    else if (status >= 400) atomic_fetch_add(&g_req_4xx, 1);
+    else if (status > 0) atomic_fetch_add(&g_req_2xx, 1);
+    atomic_fetch_add(&g_up_lat_count, 1);
+    atomic_fetch_add(&g_up_lat_sum_ms, (unsigned long)ms);
+    double sec = (double)ms / 1000.0;
+    for (int i = 0; i < BROKER_LAT_BUCKETS; i++) {
+        if (sec <= g_lat_bounds[i]) {
+            atomic_fetch_add(&g_up_lat_buckets[i], 1);
+            break;
+        }
+    }
+}
+
+int broker_metrics_render(char* buf, int cap) {
+    if (!buf || cap <= 0) return 0;
+    int off = 0;
+#define EMIT(...)                                                      \
+    do {                                                               \
+        int w = snprintf(buf + off, (size_t)(cap - off), __VA_ARGS__); \
+        if (w < 0) return off;                                         \
+        off += w;                                                      \
+        if (off >= cap) return cap;                                    \
+    } while (0)
+    EMIT("# TYPE broker_requests_total counter\n");
+    EMIT("broker_requests_total{status=\"2xx\"} %ld\n", atomic_load(&g_req_2xx));
+    EMIT("broker_requests_total{status=\"4xx\"} %ld\n", atomic_load(&g_req_4xx));
+    EMIT("broker_requests_total{status=\"5xx\"} %ld\n", atomic_load(&g_req_5xx));
+    EMIT("# TYPE broker_upstream_latency_seconds histogram\n");
+    for (int i = 0; i < BROKER_LAT_BUCKETS; i++) {
+        EMIT("broker_upstream_latency_seconds_bucket{le=\"%g\"} %ld\n",
+             g_lat_bounds[i], atomic_load(&g_up_lat_buckets[i]));
+    }
+    EMIT("broker_upstream_latency_seconds_bucket{le=\"+Inf\"} %ld\n",
+         atomic_load(&g_up_lat_count));
+    EMIT("broker_upstream_latency_seconds_sum %g\n",
+         (double)atomic_load(&g_up_lat_sum_ms) / 1000.0);
+    EMIT("broker_upstream_latency_seconds_count %ld\n",
+         atomic_load(&g_up_lat_count));
+#undef EMIT
+    return off;
+}
+
+int broker_metrics_serve(int listen_fd) {
+    if (listen_fd < 0) return -1;
+    char body[8192];
+    for (;;) {
+        int cfd = accept4(listen_fd, NULL, NULL, SOCK_CLOEXEC);
+        if (cfd < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        int n = broker_metrics_render(body, sizeof(body));
+        char hdr[160];
+        int hn = snprintf(hdr, sizeof(hdr),
+                          "HTTP/1.0 200 OK\r\nContent-Type: text/plain; "
+                          "version=0.0.4\r\nContent-Length: %d\r\n\r\n",
+                          n);
+        ssize_t w = send(cfd, hdr, (size_t)hn, MSG_NOSIGNAL);
+        (void)w;
+        if (n > 0) {
+            w = send(cfd, body, (size_t)n, MSG_NOSIGNAL);
+            (void)w;
+        }
+        close(cfd);
+    }
+}
 
 static void log_request(uint32_t sandbox_id, const char* host, int status, long ms) {
     char safe[256];
@@ -355,17 +544,18 @@ static void log_request(uint32_t sandbox_id, const char* host, int status, long 
         safe[j++] = (c == '"' || c == '\\' || c < 0x20) ? '_' : (char)c;
     }
     safe[j] = '\0';
-    fprintf(stderr,
-            "{\"component\":\"broker\",\"event\":\"proxy\",\"sandbox_id\":%u,"
-            "\"host\":\"%s\",\"status\":%d,\"latency_ms\":%ld}\n",
-            sandbox_id, safe, status, ms);
+    int level = (status >= 500) ? LOG_ERROR
+                               : (status >= 400 ? LOG_WARN : LOG_INFO);
+    LOGF(level, "broker", "proxy",
+         "\"sandbox_id\":%u,\"host\":\"%s\",\"status\":%d,\"latency_ms\":%ld",
+         sandbox_id, safe, status, ms);
 }
 
 static long elapsed_ms(const struct timespec* a, const struct timespec* b) {
     return (b->tv_sec - a->tv_sec) * 1000L + (b->tv_nsec - a->tv_nsec) / 1000000L;
 }
 
-int broker_handle_request(int client_fd, const credential_store_t* creds, int engine_fd) {
+static int broker_handle_request_inner(int client_fd, const credential_store_t* creds, int engine_fd) {
     if (client_fd < 0) return 500;
     http_request_t* req = calloc(1, sizeof(*req));
     if (!req) {
@@ -429,20 +619,31 @@ int broker_handle_request(int client_fd, const credential_store_t* creds, int en
     http_remove_header(req, "X-Sandbox-Token");
     http_set_header(req, "Authorization", real_cred);
 
-    // 6. Chunked request bodies are not supported (bounded streaming only).
-    if (http_get_header(req, "Transfer-Encoding")) {
-        session_info_free(&session);
-        send_http_error(client_fd, 502, "Chunked request bodies unsupported");
-        free(req);
-        return 502;
+    // 6. §10.14: decode a chunked request body into memory (bounded) so it can
+    // be re-framed with a Content-Length for the upstream.
+    char* body_mem = NULL;
+    size_t body_len = 0;
+    const char* te = http_get_header(req, "Transfer-Encoding");
+    if (te && strcasestr(te, "chunked")) {
+        if (read_chunked_body(client_fd, &body_mem, &body_len) < 0) {
+            session_info_free(&session);
+            send_http_error(client_fd, 400, "Malformed chunked body");
+            free(req);
+            return 400;
+        }
+        http_remove_header(req, "Transfer-Encoding");
     }
 
     // 7. Forward upstream, streaming the response back to the guest.
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int status = broker_forward_upstream(req, client_fd, client_fd);
+    int status = body_mem
+                     ? broker_forward_upstream_mem(req, client_fd, body_mem,
+                                                   body_len)
+                     : broker_forward_upstream(req, client_fd, client_fd);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = elapsed_ms(&t0, &t1);
+    free(body_mem);
 
     if (status < 0) {
         // Best-effort: only meaningful if no upstream bytes were relayed yet.
@@ -455,12 +656,22 @@ int broker_handle_request(int client_fd, const credential_store_t* creds, int en
     return status;
 }
 
+// Public entry point: wrap the pipeline so every request is counted (including
+// token/allowlist rejections) and total handler latency is recorded.
+int broker_handle_request(int client_fd, const credential_store_t* creds, int engine_fd) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int status = broker_handle_request_inner(client_fd, creds, engine_fd);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    broker_metrics_observe(status, elapsed_ms(&t0, &t1));
+    return status;
+}
+
 // ---------------------------------------------------------------------------
 // Production run loop
 // ---------------------------------------------------------------------------
 
-static int parse_listen(const char* spec, char* host, size_t hn, int* port) {
-    const char* colon = strrchr(spec, ':');
+static int parse_listen(const char* spec, char* host, size_t hn, int* port) {    const char* colon = strrchr(spec, ':');
     if (!colon) return -1;
     size_t hl = (size_t)(colon - spec);
     if (hl + 1 > hn) return -1;
@@ -493,6 +704,42 @@ static int drop_broker_privileges(void) {
         return -1;
     }
     return 0;
+}
+
+static void* broker_metrics_thread(void* arg) {
+    broker_metrics_serve((int)(intptr_t)arg);
+    return NULL;
+}
+
+// §10.13: optional broker /metrics listener (SANDBOX_BROKER_METRICS_PORT).
+static void start_broker_metrics(void) {
+    const char* mp = getenv("SANDBOX_BROKER_METRICS_PORT");
+    if (!mp || !*mp) return;
+    int port = atoi(mp);
+    if (port <= 0 || port > 65535) return;
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) return;
+    int one = 1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    sa.sin_port = htons((uint16_t)port);
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(fd, 16) < 0) {
+        fprintf(stderr, "[broker] metrics bind :%d failed: %s\n", port,
+                strerror(errno));
+        close(fd);
+        return;
+    }
+    pthread_t t;
+    if (pthread_create(&t, NULL, broker_metrics_thread,
+                       (void*)(intptr_t)fd) == 0) {
+        pthread_detach(t);
+        LOGF(LOG_INFO, "broker", "metrics", "\"port\":%d", port);
+    } else {
+        close(fd);
+    }
 }
 
 int broker_run(void) {
@@ -543,6 +790,8 @@ int broker_run(void) {
     }
     fprintf(stderr, "[broker] listening on %s, credentials %s, engine %s\n",
             broker_listen_addr(), broker_credentials_path(), broker_control_path());
+
+    start_broker_metrics();  // §10.13 (before the privilege drop, if any)
 
     if (drop_broker_privileges() != 0) {
         close(lfd);

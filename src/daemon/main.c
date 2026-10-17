@@ -9,6 +9,7 @@
 #include "engine_config.h"
 #include "cgroup.h"
 #include "ipc_server.h"
+#include "log.h"
 #include "network_manager.h"
 #include "pool_manager.h"
 #include "snapshot_manager.h"
@@ -247,6 +248,8 @@ int main(int argc, char** argv) {
             config_set_key(&cfg, "jail_root", argv[++i]);
         else if ((strcmp(a, "--snapshot-root") == 0) && v)
             config_set_key(&cfg, "snapshot_root", argv[++i]);
+        else if ((strcmp(a, "--log-level") == 0) && v)
+            config_set_key(&cfg, "log_level", argv[++i]);
         else if (strcmp(a, "--validate-config") == 0) do_validate = true;
         else if (strcmp(a, "--version") == 0) {
             printf("sandboxd %s\n", SANDBOX_VERSION);
@@ -258,9 +261,17 @@ int main(int argc, char** argv) {
                    "[--allowed-services CSV] [--allowed-uids CSV] "
                    "[--metrics-port N] [--metrics-bind ADDR] "
                    "[--jail-root DIR] [--snapshot-root DIR] "
+                   "[--log-level LEVEL] "
                    "[--validate-config] [--version]\n");
             return 0;
         }
+    }
+
+    // §10.12: apply the resolved level before anything logs.
+    {
+        int lvl = log_parse_level(cfg.log_level);
+        if (lvl >= 0) log_set_level(lvl);
+        else log_init();
     }
 
     apply_paths_to_env(&cfg);
@@ -282,10 +293,9 @@ int main(int argc, char** argv) {
     ensure_parent_dir(cfg.socket_path);
     ensure_parent_dir(cfg.broker_control_socket);
 
-    fprintf(stderr,
-            "{\"component\":\"daemon\",\"event\":\"start\",\"template\":\"%s\","
-            "\"pool_size\":%d,\"socket\":\"%s\"}\n",
-            cfg.template_name, cfg.pool_size, cfg.socket_path);
+    LOGF(LOG_INFO, "daemon", "start",
+         "\"template\":\"%s\",\"pool_size\":%d,\"socket\":\"%s\"",
+         cfg.template_name, cfg.pool_size, cfg.socket_path);
 
     if (network_manager_init() < 0) {
         fprintf(stderr, "[sandboxd] network_manager_init failed: %s\n",
@@ -327,21 +337,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (cfg.metrics_port > 0) {
+    // §10.13: metrics/health/ready endpoint. On by default (port 9180, bind
+    // 0.0.0.0); an empty metrics_bind disables it.
+    if (cfg.metrics_port > 0 && cfg.metrics_bind[0]) {
         int mfd = start_metrics(cfg.metrics_bind, cfg.metrics_port);
         if (mfd >= 0) {
             pthread_t t;
             if (pthread_create(&t, NULL, metrics_thread,
                                (void*)(intptr_t)mfd) == 0) {
                 pthread_detach(t);
-                fprintf(stderr, "[sandboxd] metrics on %s:%d\n",
-                        cfg.metrics_bind, cfg.metrics_port);
+                LOGF(LOG_INFO, "daemon", "metrics",
+                     "\"bind\":\"%s\",\"port\":%d,"
+                     "\"endpoints\":[\"/metrics\",\"/health\",\"/ready\"]",
+                     cfg.metrics_bind, cfg.metrics_port);
             } else {
                 close(mfd);
             }
         } else {
-            fprintf(stderr, "[sandboxd] metrics bind :%d failed\n",
-                    cfg.metrics_port);
+            fprintf(stderr, "[sandboxd] metrics bind %s:%d failed\n",
+                    cfg.metrics_bind, cfg.metrics_port);
         }
     }
 
@@ -365,6 +379,6 @@ int main(int argc, char** argv) {
     ipc_server_stop();
     pool_manager_set_live(NULL);
     pool_manager_destroy(&pool);
-    fprintf(stderr, "{\"component\":\"daemon\",\"event\":\"stop\"}\n");
+    LOGF(LOG_INFO, "daemon", "stop", "");
     return 0;
 }

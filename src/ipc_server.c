@@ -18,6 +18,7 @@
 #include "ipc_codec.h"
 #include "ipc_internal.h"
 #include "lifecycle.h"
+#include "log.h"
 #include "pool_manager.h"
 #include "telemetry.h"
 #include "vmm_manager.h"
@@ -464,10 +465,7 @@ static void pidfd_handle(int idx) {
     g.vms[idx].sandbox_id = 0;
 
     telemetry_vmm_crash();
-    fprintf(stderr,
-            "{\"component\":\"ipc_server\",\"event\":\"vmm_crash\","
-            "\"sandbox_id\":%u}\n",
-            id);
+    LOGF(LOG_WARN, "ipc_server", "vmm_crash", "\"sandbox_id\":%u", id);
 
     vm_handle_t* vm = lifecycle_get(id);
     if (vm) {
@@ -577,15 +575,11 @@ static void* create_worker_fn(void* arg) {
         } else {
             if (job->env[0]) {
                 if (vmm_inject_env(vm, (const char* const*)job->env) == 0) {
-                    fprintf(stderr,
-                            "{\"component\":\"ipc_server\",\"event\":\"env_injected\","
-                            "\"sandbox_id\":%u}\n",
-                            vm->sandbox_id);
+                    LOGF(LOG_DEBUG, "ipc_server", "env_injected",
+                         "\"sandbox_id\":%u", vm->sandbox_id);
                 } else {
-                    fprintf(stderr,
-                            "{\"component\":\"ipc_server\",\"event\":"
-                            "\"env_inject_failed\",\"sandbox_id\":%u}\n",
-                            vm->sandbox_id);
+                    LOGF(LOG_WARN, "ipc_server", "env_inject_failed",
+                         "\"sandbox_id\":%u", vm->sandbox_id);
                 }
             }
             if (token_issue(vm->sandbox_id, r->token) < 0) {
@@ -700,10 +694,8 @@ static void complete_result(create_result_t* r) {
         resp.kind = IPC_REQ_CREATE;
         resp.sandbox_id = vm->sandbox_id;
         snprintf(resp.session_token, sizeof(resp.session_token), "%s", r->token);
-        fprintf(stderr,
-                "{\"component\":\"ipc_server\",\"event\":\"create\","
-                "\"sandbox_id\":%u}\n",
-                vm->sandbox_id);
+        LOGF(LOG_INFO, "ipc_server", "create", "\"sandbox_id\":%u",
+             vm->sandbox_id);
         send_response(s->fd, &resp);
     }
     free_job(job);
@@ -911,10 +903,8 @@ static void accept_clients(int lfd) {
             continue;
         }
         if (!uid_allowed(cred.uid)) {
-            fprintf(stderr,
-                    "{\"component\":\"ipc_server\",\"event\":\"peer_rejected\","
-                    "\"uid\":%d,\"pid\":%d}\n",
-                    (int)cred.uid, (int)cred.pid);
+            LOGF(LOG_WARN, "ipc_server", "peer_rejected",
+                 "\"uid\":%d,\"pid\":%d", (int)cred.uid, (int)cred.pid);
             close(cfd);
             continue;
         }
@@ -971,14 +961,11 @@ int ipc_server_run(const char* socket_path) {
     fprintf(stderr, "[ipc] listening on %s (template %s)\n", socket_path,
             g.template_name[0] ? g.template_name : "<none>");
     if (g.n_allowed_uids == 0) {
-        fprintf(stderr,
-                "{\"component\":\"ipc_server\",\"event\":\"peer_auth\","
-                "\"mode\":\"any_uid\",\"warning\":\"no allowed_uids configured\"}\n");
+        LOGF(LOG_WARN, "ipc_server", "peer_auth",
+             "\"mode\":\"any_uid\",\"warning\":\"no allowed_uids configured\"");
     } else {
-        fprintf(stderr,
-                "{\"component\":\"ipc_server\",\"event\":\"peer_auth\","
-                "\"mode\":\"allowlist\",\"count\":%d}\n",
-                g.n_allowed_uids);
+        LOGF(LOG_INFO, "ipc_server", "peer_auth",
+             "\"mode\":\"allowlist\",\"count\":%d", g.n_allowed_uids);
     }
 
     uint8_t* payload = malloc(IPC_FRAME_MAX);

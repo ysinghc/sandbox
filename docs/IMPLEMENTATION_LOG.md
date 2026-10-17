@@ -508,3 +508,29 @@ Plan reference: production-readiness plan items 10.8–10.11.
   pad case) and a verify/corrupt-manifest case; `test_config` covers the new
   keys; `test_cgroup` checks the hierarchy + limit files + id sanitization;
   `test_vmm` asserts cgroup placement. Full `ctest` 12/12 as root on the Pi.
+
+## Phase 13 — Observability, Hardening & Docs (§10.12–§10.15, §15.15)
+
+Plan reference: production-readiness plan items 10.12–10.15.
+
+- **10.12 logging.** New `include/log.h` + `src/log.c`: JSON-per-line with
+  standardised fields (`ts`, `level`, `component`, `event`, + extras), level
+  filtering via `log_level` / `--log-level` / `SANDBOX_LOG_LEVEL`. Migrated the
+  10 JSON `fprintf` sites in `daemon/main.c`, `ipc_server.c`, `broker/core.c` to
+  `LOGF(...)`. `log.c` added to both `sandbox` and `sandbox_broker_core` (the
+  broker is a separate process); journald rotates via `StandardError=journal`.
+- **10.13 metrics.** `telemetry_serve()` routes `/health` (200), `/ready`
+  (200 iff warm>0 else 503), `/metrics`, else 404. Metrics on by default at
+  `0.0.0.0:9180` (empty `metrics_bind` disables); added process self-stats.
+  Broker: `broker_requests_total{status}` + `broker_upstream_latency_seconds`
+  histogram, served on optional `SANDBOX_BROKER_METRICS_PORT`. New ctest
+  `metrics`.
+- **10.14 CI + ASan/UBSan + fuzz + chunked.** New `.github/workflows/ci.yml`
+  (build+test, asan+ubsan, fuzz smoke); CMake `SANDBOX_SANITIZE` and
+  `SANDBOX_BUILD_FUZZERS`; `fuzz/{fuzz_http,fuzz_config,fuzz_proto}.c` +
+  `standalone_driver.c` + seed corpora. `config_parse_buffer()` extracted for
+  fuzzing. Broker decodes chunked request bodies (8 MiB cap) and re-frames them
+  with `Content-Length`; `test_broker` gained a `chunked` case.
+- **10.15 docs.** Added `docs/RUNBOOK.md`, `docs/UPGRADE.md`, `docs/BACKUP.md`.
+- **Tests.** `ctest` 13/13 as root on the Pi (adds `metrics`); fuzzers built and
+  run clean under ASan+UBSan (standalone driver) on the corpus + random input.

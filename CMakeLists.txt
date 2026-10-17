@@ -21,6 +21,17 @@ if(SANDBOX_TSAN)
     add_link_options(-fsanitize=thread)
 endif()
 
+# §10.14: ASan/UBSan build variant (CI). Comma-separated, e.g.
+# -DSANDBOX_SANITIZE=address,undefined. Default build unaffected.
+set(SANDBOX_SANITIZE "" CACHE STRING "Comma-separated sanitizers (address,undefined)")
+if(SANDBOX_SANITIZE)
+    add_compile_options(-fsanitize=${SANDBOX_SANITIZE} -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=${SANDBOX_SANITIZE})
+endif()
+
+# §10.14: libFuzzer targets (fuzz/). Off by default; CI enables it with clang.
+option(SANDBOX_BUILD_FUZZERS "Build fuzz targets (fuzz/)" OFF)
+
 # Use system protobuf (3.12.4 on Ubuntu 22.04) to avoid GLIBC version mismatches
 # Local protobuf in /tmp uses C23 functions not available in GLIBC 2.35
 # Use MODULE mode since system package doesn't provide Config.cmake
@@ -58,6 +69,7 @@ add_library(sandbox SHARED
     src/seccomp.c
     src/sha256.c
     src/cgroup.c
+    src/log.c
     src/lifecycle.c
     src/telemetry.c
     src/ipc_server.c
@@ -115,6 +127,7 @@ add_library(sandbox_broker_core STATIC
     src/broker/http.c
     src/broker/credentials.c
     src/broker/core.c
+    src/log.c
 )
 target_include_directories(sandbox_broker_core PUBLIC include)
 target_link_libraries(sandbox_broker_core PUBLIC CURL::libcurl)
@@ -165,3 +178,9 @@ install(FILES systemd/sandboxd.service
 # Tests
 enable_testing()
 add_subdirectory(tests)
+
+# Fuzz targets (§10.14). Built only when SANDBOX_BUILD_FUZZERS=ON; the CI
+# fuzz job configures a separate build dir with clang + libFuzzer.
+if(SANDBOX_BUILD_FUZZERS)
+    add_subdirectory(fuzz)
+endif()

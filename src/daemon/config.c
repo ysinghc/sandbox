@@ -22,8 +22,8 @@ void config_defaults(engine_config_t* c) {
     c->pool_wait_timeout_ms = 0;
     c->allowed_services[0] = '\0';
     c->allowed_uids[0] = '\0';
-    c->metrics_port = 0;
-    snprintf(c->metrics_bind, sizeof(c->metrics_bind), "127.0.0.1");
+    c->metrics_port = 9180;  // §10.13: metrics on by default
+    snprintf(c->metrics_bind, sizeof(c->metrics_bind), "0.0.0.0");
     c->jail_root[0] = '\0';
     c->snapshot_root[0] = '\0';
     c->jailer_uid = 65534;
@@ -35,6 +35,7 @@ void config_defaults(engine_config_t* c) {
     c->cgroup_enable = 1;
     c->cgroup_slack_mib = 64;
     snprintf(c->cgroup_cpu_max, sizeof(c->cgroup_cpu_max), "%s", "max");
+    snprintf(c->log_level, sizeof(c->log_level), "%s", "info");
 }
 
 void config_set_key(engine_config_t* c, const char* key, const char* val) {
@@ -85,8 +86,46 @@ void config_set_key(engine_config_t* c, const char* key, const char* val) {
         c->cgroup_slack_mib = atoi(val);
     } else if (strcmp(key, "cgroup_cpu_max") == 0) {
         snprintf(c->cgroup_cpu_max, sizeof(c->cgroup_cpu_max), "%s", val);
+    } else if (strcmp(key, "log_level") == 0) {
+        snprintf(c->log_level, sizeof(c->log_level), "%s", val);
     } else {
         fprintf(stderr, "[sandboxd] unknown config key '%s'\n", key);
+    }
+}
+
+// Trim + classify one already-NUL-terminated line and apply it. Shared by the
+// file loader and config_parse_buffer (so the parser is fuzzable in memory).
+static void config_parse_line(engine_config_t* c, char* line) {
+    char* p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '#' || *p == ';' || *p == '[' || *p == '\n' || *p == '\0')
+        return;  // comments and [section] headers
+    char* eq = strchr(p, '=');
+    if (!eq) return;
+    *eq = '\0';
+    char* key = p;
+    char* val = eq + 1;
+    char* end = key + strlen(key);
+    while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+    while (*val == ' ' || *val == '\t') val++;
+    end = val + strlen(val);
+    while (end > val && (end[-1] == '\n' || end[-1] == '\r' ||
+                         end[-1] == ' ' || end[-1] == '\t')) {
+        *--end = '\0';
+    }
+    if (*key) config_set_key(c, key, val);
+}
+
+void config_parse_buffer(engine_config_t* c, const char* text) {
+    if (!c || !text) return;
+    char line[2048];
+    const char* p = text;
+    while (*p) {
+        size_t i = 0;
+        while (*p && *p != '\n' && i + 1 < sizeof(line)) line[i++] = *p++;
+        if (*p == '\n') p++;
+        line[i] = '\0';
+        config_parse_line(c, line);
     }
 }
 
@@ -98,26 +137,7 @@ void config_load_file(engine_config_t* c, const char* path) {
         return;
     }
     char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == ';' || *p == '[' || *p == '\n' || *p == '\0')
-            continue;  // comments and [section] headers
-        char* eq = strchr(p, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char* key = p;
-        char* val = eq + 1;
-        char* end = key + strlen(key);
-        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
-        while (*val == ' ' || *val == '\t') val++;
-        end = val + strlen(val);
-        while (end > val && (end[-1] == '\n' || end[-1] == '\r' ||
-                             end[-1] == ' ' || end[-1] == '\t')) {
-            *--end = '\0';
-        }
-        if (*key) config_set_key(c, key, val);
-    }
+    while (fgets(line, sizeof(line), f)) config_parse_line(c, line);
     fclose(f);
 }
 
@@ -162,4 +182,6 @@ void config_apply_env(engine_config_t* c) {
         config_set_key(c, "cgroup_slack_mib", v);
     if ((v = getenv("SANDBOX_CGROUP_CPU_MAX")) && *v)
         config_set_key(c, "cgroup_cpu_max", v);
+    if ((v = getenv("SANDBOX_LOG_LEVEL")) && *v)
+        config_set_key(c, "log_level", v);
 }
