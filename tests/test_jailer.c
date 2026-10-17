@@ -239,9 +239,31 @@ static void userns_sequence_child(const char* jail, const char* probe_in_jail,
     _exit(7);
 }
 
+// Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor
+// (kernel.apparmor_restrict_unprivileged_userns=1): unshare(CLONE_NEWUSER) may
+// still succeed, but chroot() is then denied, so the unprivileged jailer
+// sequence cannot run. Detect that and SKIP rather than fail. As root the
+// restriction does not apply, so the full sequence runs for real.
+static bool unprivileged_userns_restricted(void) {
+    if (geteuid() == 0) return false;
+    FILE* f = fopen("/proc/sys/kernel/apparmor_restrict_unprivileged_userns", "r");
+    if (!f) return false;
+    char b[8] = {0};
+    size_t n = fread(b, 1, sizeof(b) - 1, f);
+    fclose(f);
+    return n > 0 && b[0] == '1';
+}
+
 static void test_jailer_sequence(void) {
     printf("[test] jailer_sequence...\n");
     fflush(stdout);
+    if (unprivileged_userns_restricted()) {
+        printf("[test] jailer_sequence: SKIP (unprivileged user namespaces are "
+               "restricted on this host, e.g. AppArmor; run as root for full "
+               "coverage)\n");
+        fflush(stdout);
+        return;
+    }
     char tmp[PATH_MAX];
     snprintf(tmp, sizeof(tmp), "/tmp/jailseq-%d", (int)getpid());
     CHECK_RC(mkdir_recursive(tmp, 0755), "tmpdir");

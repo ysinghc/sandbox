@@ -6,14 +6,15 @@ on:
 
 env:
   # Tests that need real root + /dev/kvm + Firecracker + guest assets + the
-  # template fixture cannot run on hosted runners; they SKIP or are excluded.
+  # template fixture cannot run on hosted runners, so they are excluded here
+  # (they run on the privileged lab host). See docs/TESTING.md.
   CI_TEST_EXCLUDE: "pool|network|tmpl_setup|vmm|ipc|cgroup"
 
 jobs:
   build-and-test:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -34,7 +35,7 @@ jobs:
       ASAN_OPTIONS: detect_leaks=0
       UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -42,8 +43,7 @@ jobs:
             libprotobuf-dev protobuf-compiler libprotoc-dev \
             libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
       - name: Configure (ASan + UBSan)
-        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-          -DSANDBOX_SANITIZE=address,undefined
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DSANDBOX_SANITIZE=address,undefined
       - name: Build
         run: cmake --build build-asan -j
       - name: Test
@@ -52,7 +52,7 @@ jobs:
   fuzz-smoke:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -60,15 +60,12 @@ jobs:
             libprotobuf-dev protobuf-compiler libprotoc-dev \
             libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
       - name: Configure (libFuzzer)
-        run: cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang \
-          -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug \
-          -DSANDBOX_BUILD_FUZZERS=ON -DSANDBOX_SANITIZE=address,undefined
+        run: cmake -S . -B build-fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Debug -DSANDBOX_BUILD_FUZZERS=ON -DSANDBOX_SANITIZE=address,undefined
       - name: Build fuzzers
         run: cmake --build build-fuzz -j --target fuzz_http fuzz_config fuzz_proto
       - name: Smoke-fuzz (short)
         run: |
           for t in http config proto; do
             echo "=== fuzz_$t ==="
-            ./build-fuzz/fuzz/fuzz_$t -max_total_time=20 -runs=200000 \
-              fuzz/corpus/$t || exit 1
+            ./build-fuzz/fuzz/fuzz_$t -max_total_time=20 -runs=200000 fuzz/corpus/$t
           done
