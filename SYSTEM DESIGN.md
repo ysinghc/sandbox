@@ -1574,9 +1574,12 @@ authoritative.
   Phase 8** — see §15.9 for the ground-truth deviations from the LLD.
 - pidfd-based VMM crash detection was implemented in **Phase 9** (§15.10), and
   the §11 gauges/counters were wired there too.
-- Still not implemented: **per-VM environment injection** (see §15.9/§15.11)
-  and a hierarchical config layer (`config/` still ships only `engine.conf` +
-  `credentials.conf.example`).
+- **per-VM environment injection** (§6.1 `env_vars`) was implemented in
+  **Phase 9b** (§15.11).
+- Still not implemented: a *hierarchical* config layer — `config/` ships
+  `engine.conf` + `credentials.conf.example`, and the parser is flat (section
+  headers are accepted but ignored; keys are matched by name). Defaults are
+  supplied in code, so a partial file is valid.
 
 ### 15.7 aarch64 / Test Environment (§9)
 - Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
@@ -1642,11 +1645,13 @@ authoritative.
   relayed **verbatim** (transfer/content decoding disabled) so the guest sees
   the upstream's own `Transfer-Encoding`/`Content-Encoding` framing.
 - **Body handling:** request headers are read byte-by-byte so the body is never
-  consumed early (the LLD's "no buffering of body"), then the body is streamed
-  upstream through a libcurl read callback bounded by `Content-Length`.
-  **Chunked request bodies are rejected with 502.** The allow-list and the
-  credential lookup both key on the `Host` value with any `:port` stripped and
-  case folded; an allowed host with no credential entry gets 403.
+  consumed early; a `Content-Length` body is streamed upstream through a libcurl
+  read callback. **Chunked request bodies** are decoded in memory (bounded to
+  8 MiB, `CHUNKED_MAX_BODY`), stripped of `Transfer-Encoding`, re-framed with a
+  `Content-Length`, and forwarded (Phase 13, §15.15); malformed input → `400`.
+  The allow-list and the credential lookup both key on the `Host` value with any
+  `:port` stripped and case folded; an allowed host with no credential entry
+  gets 403.
 - **Extra source file:** `src/broker/core.c` holds the pipeline (the LLD lists
   only `main/http/credentials`). It is compiled into the `sandbox_broker_core`
   static library so `tests/test_broker.c` can drive one request in-process
