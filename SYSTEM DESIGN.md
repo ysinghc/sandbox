@@ -1462,6 +1462,19 @@ authoritative.
 - Devices are fresh `mknod` + `chown` nodes (`/dev/kvm`, `/dev/net/tun`,
   optionally `/dev/userfaultfd`), NOT LLD bind-mounts (bind preserves
   root-only modes). `mount_jail_devices()` remains only for tests.
+- **Those `mknod` devices require a device-node-capable jail filesystem.** The
+  jail must live on a mount that does not set `nodev` (and, because
+  `/firecracker` is `exec`'d from it, not `noexec`). Opening an `mknod`'d node on
+  a `nodev` mount fails with `EACCES` ("Permission denied") regardless of
+  ownership, which is exactly how Firecracker surfaces it (`Open tap device
+  failed: Couldn't open /dev/net/tun: Permission denied (os error 13)`) — it
+  opens `/dev/net/tun` when the NIC is configured, *before* it opens `/dev/kvm`
+  at `InstanceStart`, so the first symptom is the tap, not KVM. The production
+  default `jail_root` (`/var/lib/sandbox-engine/jail`) is on the root filesystem;
+  anything that redirects `SANDBOX_JAIL_ROOT` must avoid `nodev` paths. This bit
+  `scripts/benchmark.sh`, which had defaulted its workspace to a `nodev` tmpfs
+  `/tmp`; it now parses `/proc/self/mountinfo` and picks a usable parent
+  (`/var/tmp`, `$HOME`, `/tmp`), rejecting `nodev`/`noexec`.
 - `spawn_jailed()` signature is extended vs LLD: `(jail_root, config, bin,
   argv, mount_devices, apply_seccomp, files{jail-bind kernel/rootfs/vmstate/
   memory.snap/out_dir}, serial_log)` with child exit codes 1–16

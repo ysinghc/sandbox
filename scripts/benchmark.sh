@@ -14,8 +14,13 @@
 #   sudo scripts/benchmark.sh --pool 5 --count 10
 #
 # Runs as root (the jailer needs chroot + setuid). Everything happens in an
-# isolated /tmp workspace with its own daemon; the workspace is removed at the
+# isolated workspace with its own daemon; the workspace is removed at the
 # end unless --keep is given.
+#
+# The workspace must live on a filesystem that allows device nodes: the jail
+# mknod's /dev/kvm and /dev/net/tun, and opening either on a `nodev` mount
+# fails with EACCES (Permission denied). /tmp is mounted nodev on many hosts,
+# so a dev-capable parent (e.g. /var/tmp) is selected automatically.
 
 set -uo pipefail
 
@@ -39,6 +44,7 @@ TEMPLATE="bench"
 KEEP=0
 
 WORKDIR=""
+WORKDIR_OPT="${SANDBOX_BENCH_WORKDIR:-}"
 SNAP_ROOT=""
 JAIL_ROOT=""
 SOCK=""
@@ -67,8 +73,13 @@ Options:
   --memory MiB    guest memory                      (default 256)
   --vcpus N       guest vCPUs                       (default 1)
   --template NAME   snapshot template name          (default bench)
+  --workdir DIR   parent dir for the workspace      (default: auto)
   --keep          keep the workspace after the run
   -h, --help      this help
+
+The workspace parent must be on a filesystem that permits device nodes (not
+mounted `nodev`). If --workdir is omitted the first dev-capable of
+/var/tmp, $HOME, /tmp is used.
 EOF
 }
 
@@ -80,6 +91,7 @@ parse_args() {
             --memory)   VM_MEMORY="$2"; shift 2 ;;
             --vcpus)    VM_VCPUS="$2"; shift 2 ;;
             --template) TEMPLATE="$2"; shift 2 ;;
+            --workdir)  WORKDIR_OPT="$2"; shift 2 ;;
             --keep)     KEEP=1; shift ;;
             -h|--help)  usage; exit 0 ;;
             *) die "unknown option: $1 (try --help)" ;;
@@ -102,6 +114,49 @@ preflight() {
     command -v curl >/dev/null 2>&1 || die "curl is required"
 }
 
+# Longest-prefix mount options governing DIR, from /proc/self/mountinfo
+# (field 6 = per-mount flags: rw/nosuid/nodev/noexec/...).
+mount_opts_for() {
+    awk -v d="$1" '
+        {
+            mp = $5; gsub(/\\040/, " ", mp)
+            if (d == mp || mp == "/" || index(d, mp "/") == 1) {
+                if (length(mp) > best) {
+                    best = length(mp); opts = $6
+                }
+            }
+        }
+        END { print opts }
+    ' /proc/self/mountinfo
+}
+
+# The jail gets /dev/kvm and /dev/net/tun via fresh mknod (not bind mounts), so
+# its filesystem must allow device nodes: opening them on a `nodev` mount fails
+# with EACCES regardless of ownership. Firecracker is also copied into the jail
+# and exec'd, and the probe is exec'd from the workspace, so `noexec` is
+# rejected too.
+dir_is_usable() {
+    local dir="$1" opts
+    [ -d "$dir" ] && [ -w "$dir" ] || return 1
+    opts="$(mount_opts_for "$dir")"
+    [ -n "$opts" ] || return 1
+    case ",$opts," in
+        *,nodev,*)  return 1 ;;
+        *,noexec,*) return 1 ;;
+    esac
+    return 0
+}
+
+# First writable, dev-capable directory among the conventional candidates.
+pick_workdir_parent() {
+    local cand
+    for cand in /var/tmp "$HOME" /tmp; do
+        [ -n "$cand" ] && [ -d "$cand" ] && [ -w "$cand" ] || continue
+        if dir_is_usable "$cand"; then printf '%s\n' "$cand"; return 0; fi
+    done
+    return 1
+}
+
 free_port() {
     command -v python3 >/dev/null 2>&1 || { echo 19180; return; }
     python3 - <<'PY'
@@ -111,7 +166,17 @@ PY
 }
 
 prepare() {
-    WORKDIR="$(mktemp -d /tmp/sandbox-bench.XXXXXX)"
+    local parent
+    if [ -n "$WORKDIR_OPT" ]; then
+        mkdir -p "$WORKDIR_OPT" 2>/dev/null || die "cannot create workspace dir: $WORKDIR_OPT"
+        dir_is_usable "$WORKDIR_OPT" \
+            || die "workspace $WORKDIR_OPT forbids device nodes (nodev) or exec (noexec); the jail needs mknod'd /dev/kvm and /dev/net/tun"
+        parent="$WORKDIR_OPT"
+    else
+        parent="$(pick_workdir_parent)" \
+            || die "no device-node-capable workspace (tried /var/tmp, \$HOME, /tmp — all nodev); pass --workdir DIR"
+    fi
+    WORKDIR="$(mktemp -d "${parent%/}/sandbox-bench.XXXXXX")" || die "mktemp failed in $parent"
     SNAP_ROOT="${WORKDIR}/snapshots"
     JAIL_ROOT="${WORKDIR}/jails"
     SOCK="${WORKDIR}/engine.sock"
