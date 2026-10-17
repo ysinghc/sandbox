@@ -263,8 +263,10 @@ start_daemon() {
         [ -n "${warm:-}" ] && [ "$warm" -ge "$POOL" ] 2>/dev/null && break
         sleep 0.1
     done
-    [ -n "${warm:-}" ] && [ "$warm" -ge "$POOL" ] 2>/dev/null \
-        || die "pool did not reach ${POOL} warm sandboxes (got ${warm:-unknown})"
+    [ -n "${warm:-}" ] && [ "$warm" -ge "$POOL" ] 2>/dev/null || {
+        tail -n 80 "${WORKDIR}/daemon.log" >&2 2>/dev/null || true
+        die "pool did not reach ${POOL} warm sandboxes (got ${warm:-unknown}); daemon log: ${WORKDIR}/daemon.log"
+    }
     ok "pool warm: ${warm} sandboxes"
 }
 
