@@ -12,6 +12,13 @@ add_executable(jailer_probe jailer_probe.c ../src/seccomp.c)
 target_include_directories(jailer_probe PRIVATE ../include)
 target_link_libraries(jailer_probe ${SECCOMP_STATIC_LIB})
 target_link_options(jailer_probe PRIVATE -static)
+# A sanitizer build cannot link a fully-static binary (no sanitizer runtime is
+# available statically), which the probe requires to run inside an empty chroot.
+# It is a tiny seccomp harness, so build it unsanitized in sanitizer builds.
+if(SANDBOX_SANITIZE)
+    target_compile_options(jailer_probe PRIVATE -fno-sanitize=all)
+    target_link_options(jailer_probe PRIVATE -fno-sanitize=all)
+endif()
 add_executable(test_jailer test_jailer.c)
 target_include_directories(test_jailer PRIVATE ../include)
 target_link_libraries(test_jailer sandbox)
@@ -117,3 +124,11 @@ target_include_directories(test_metrics PRIVATE ../include)
 target_link_libraries(test_metrics sandbox)
 add_test(NAME metrics COMMAND test_metrics)
 set_tests_properties(metrics PROPERTIES TIMEOUT 30)
+
+# C++ wrapper linkage: libsandbox.h must expose the C API as extern "C" so the
+# wrapper resolves the unmangled symbols (no root, needs no daemon).
+add_executable(test_cpp_wrap test_cpp.cpp)
+target_include_directories(test_cpp_wrap PRIVATE ../include)
+target_link_libraries(test_cpp_wrap sandbox++)
+add_test(NAME cpp_wrap COMMAND test_cpp_wrap)
+set_tests_properties(cpp_wrap PROPERTIES TIMEOUT 30)

@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Opaque handle to a running sandbox
 typedef struct sandbox_handle_t sandbox_handle_t;
 
@@ -58,5 +62,9 @@ sandbox_error_t sandbox_inspect(sandbox_handle_t* handle, sandbox_status_t* out_
 
 // Disconnect from daemon (destroys all sandboxes owned by this session)
 void sandbox_cleanup(void);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
 
 #endif // LIBSANDBOX_H
