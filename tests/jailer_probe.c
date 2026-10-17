@@ -2,9 +2,10 @@
 // <ptrace|ioctl|allowed>
 // Exit 10: outside path reachable (chroot broken). Exit 11: uid mismatch.
 // Exit 13: allowed syscall failed post-filter. Exit 14: filter load failed.
-// Exit 0: "allowed" mode — every permitted syscall (incl. the jailer's dup2 and
-//         musl's arch_prctl at startup) succeeded. Otherwise dies by SIGSYS on
-//         the fatal call (Release), or exits with errno (Debug).
+// Exit 0: "allowed" mode — every permitted syscall (incl. the jailer's dup2,
+//         musl's arch_prctl, and Firecracker's startup poll) succeeded.
+//         Otherwise dies by SIGSYS on the fatal call (Release), or exits with
+//         errno (Debug).
 //
 // NOTE: socket()/TCGETS are deliberately *not* probed as fatal — Firecracker's
 // runtime set needs both (UDS API server, UFFD handshake, terminal restore), so
@@ -13,6 +14,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,6 +56,9 @@ int main(int argc, char** argv) {
     int efd = epoll_create1(EPOLL_CLOEXEC);
     if (efd < 0) return 13;
     close(efd);
+    // Firecracker polls stdin/stdout/stderr during startup; with nfds == 0 this
+    // returns immediately and just proves the syscall is permitted.
+    if (poll(NULL, 0, 0) < 0) return 13;
 
     // dup2() must be permitted: the jailer dup2s its serial fd *after*
     // installing this filter (jailer.c). x86_64 has a dup2 syscall distinct

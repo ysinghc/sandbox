@@ -1491,15 +1491,22 @@ authoritative.
   UFFD-restore + pool run.
 - **The whitelist is architecture-aware.** The base set above was derived from
   Firecracker's *aarch64* policy on the original Pi target. Booting the same
-  engine on x86_64 killed every jailed Firecracker with SIGSYS, because four
-  syscalls differ on that arch: the jailer `dup2`s its serial fd *after*
-  installing the filter and x86_64 has a real `dup2` syscall (glibc does not
-  lower it to `dup3` as on aarch64); static-pie musl installs its thread pointer
-  via `arch_prctl(ARCH_SET_FS)` at startup (aarch64 sets `TPIDR_EL0` with no
-  syscall); and Firecracker's x86_64 policy uses `open`/`stat` where its aarch64
-  policy uses `openat`/`newfstatat` (the exact delta between the two v1.17
-  policies). `seccomp.c` adds exactly these four under `#if defined(__x86_64__)`;
-  no aarch64 rule changes and the common list is a superset on both arches.
+  engine on x86_64 killed every jailed Firecracker with SIGSYS, because the
+  aarch64 policy does not describe x86_64. Four rules were arch-specific: the
+  jailer `dup2`s its serial fd *after* installing the filter and x86_64 has a
+  real `dup2` syscall (glibc does not lower it to `dup3` as on aarch64);
+  static-pie musl installs its thread pointer via `arch_prctl(ARCH_SET_FS)` at
+  startup (aarch64 sets `TPIDR_EL0` with no syscall); and Firecracker's x86_64
+  policy uses `open`/`stat` where its aarch64 policy uses
+  `openat`/`newfstatat` (the exact delta between the two v1.17 policies). A
+  fifth, `poll`, is *not* arch-exclusive but was still missing: x86_64
+  Firecracker polls stdin/stdout/stderr during startup, a call the aarch64
+  policy never exercised, so it returned EPERM under the Debug filter and
+  SIGSYS under the Release one. `seccomp.c` adds `dup2`/`arch_prctl`/`open`/
+  `stat` under `#if defined(__x86_64__)` and `poll` unconditionally; no aarch64
+  rule changes and the common list stays a superset on both arches. The failure
+  was located by running Firecracker under the real filter with `strace` on the
+  x86_64 host (the missing syscall is the last one before the kill).
 - The Phase-2 probe now proves filter death on `ptrace` and on an unlisted
   `ioctl` (`FIONREAD`); `socket`/`TCGETS` are deliberately allowed (FC needs
   both), so they are no longer the fatal calls. It also has an `allowed` mode

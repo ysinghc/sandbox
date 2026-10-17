@@ -8,9 +8,12 @@
 // api and vcpu thread filters) plus those pre-filter calls. Verified against a
 // full cold-boot + snapshot + UFFD-restore + pool run under SCMP_ACT_LOG.
 //
-// x86_64 additionally needs dup2 (jailer), arch_prctl (musl TLS at FC startup)
-// and open/stat; see the __x86_64__ block below. These are guarded so aarch64
-// builds are unaffected.
+// x86_64 additionally needs dup2 (jailer), arch_prctl (musl TLS at FC
+// startup), open/stat (its policy delta vs aarch64) and poll (an FC startup
+// call the aarch64 policy never exercised). Found by running Firecracker under
+// the real filter with strace on x86_64; see the comments at each rule. dup2,
+// arch_prctl, open and stat are guarded so aarch64 builds are unaffected; poll
+// is allowed on both (it is a no-op addition there).
 #define _GNU_SOURCE  // CLONE_VM under strict C11
 
 #include "sandbox_seccomp.h"
@@ -106,6 +109,7 @@ int apply_seccomp_filter(void) {
     ALLOW(newfstatat);
     ALLOW(openat);
     ALLOW(ppoll);
+    ALLOW(poll);         // pre-filter startup check on stdin/stdout/stderr (x86_64)
     ALLOW(prlimit64);    // Rust stdlib init reads resource limits
     ALLOW(read);
     ALLOW(readv);
