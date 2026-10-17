@@ -47,34 +47,37 @@ int network_subnet_addrs(const char* vm_id, uint32_t* out_host_ip,
     return 0;
 }
 
-// Execute one nft command (no "nft" prefix). When out is non-NULL the command's
-// stdout is captured (used to list rules); otherwise output is discarded.
-// Returns 0 iff the command succeeded.
+// Execute one nft command (no "nft" prefix). nft's stdout is ALWAYS captured:
+// a non-NULL out receives it, otherwise it is discarded. Capturing must not be
+// conditional — an un-buffered libnftables context writes command output (e.g.
+// the `list chain` probes in ensure_chain) straight to the process stdout,
+// which leaked into the daemon log. Returns 0 iff the command succeeded.
 static int nft_exec(const char* cmd, char* out, size_t outlen) {
 #ifdef SANDBOX_HAVE_LIBNFTABLES
     struct nft_ctx* ctx = nft_ctx_new(NFT_CTX_DEFAULT);
     if (!ctx) return -1;
-    if (out && outlen) {
-        nft_ctx_buffer_output(ctx);
-        nft_ctx_output_set_flags(ctx, NFT_CTX_OUTPUT_HANDLE);
-    }
+    nft_ctx_buffer_output(ctx);
+    if (out && outlen) nft_ctx_output_set_flags(ctx, NFT_CTX_OUTPUT_HANDLE);
     int rc = nft_run_cmd_from_buffer(ctx, cmd);
     if (out && outlen) {
         const char* o = nft_ctx_get_output_buffer(ctx);
         snprintf(out, outlen, "%s", o ? o : "");
-        nft_ctx_unbuffer_output(ctx);
     }
+    nft_ctx_unbuffer_output(ctx);
     nft_ctx_free(ctx);
     return rc;
 #else
+    char full[1024];
     if (out && outlen) {
-        FILE* fp = popen(cmd, "r");
+        snprintf(full, sizeof(full), "nft %s", cmd);
+        FILE* fp = popen(full, "r");
         if (!fp) return -1;
         size_t n = fread(out, 1, outlen - 1, fp);
         out[n] = '\0';
         return (pclose(fp) == 0) ? 0 : -1;
     }
-    int rc = system(cmd);
+    snprintf(full, sizeof(full), "nft %s >/dev/null 2>&1", cmd);
+    int rc = system(full);
     return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
 #endif
 }

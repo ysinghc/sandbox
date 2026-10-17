@@ -196,6 +196,7 @@ prepare() {
 build_template() {
     export SANDBOX_SNAPSHOT_ROOT="$SNAP_ROOT"
     export SANDBOX_JAIL_ROOT="$JAIL_ROOT"
+    export SANDBOX_TEMPLATE_NAME="$TEMPLATE"   # must match [daemon] template
     export FIRECRACKER_BIN="$FC_BIN"
     if [ -f "${SNAP_ROOT}/READY" ] && [ -d "${SNAP_ROOT}/${TEMPLATE}" ]; then
         ok "reusing template '${TEMPLATE}'"
