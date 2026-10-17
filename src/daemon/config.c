@@ -28,6 +28,13 @@ void config_defaults(engine_config_t* c) {
     c->snapshot_root[0] = '\0';
     c->jailer_uid = 65534;
     c->jailer_gid = 65534;
+    c->vsock_settle_ms = 1000;
+    c->create_workers = 4;
+    c->max_creates_per_session = 16;
+    c->max_creates_per_uid = 64;
+    c->cgroup_enable = 1;
+    c->cgroup_slack_mib = 64;
+    snprintf(c->cgroup_cpu_max, sizeof(c->cgroup_cpu_max), "%s", "max");
 }
 
 void config_set_key(engine_config_t* c, const char* key, const char* val) {
@@ -64,6 +71,20 @@ void config_set_key(engine_config_t* c, const char* key, const char* val) {
         c->jailer_uid = atoi(val);
     } else if (strcmp(key, "jailer_gid") == 0) {
         c->jailer_gid = atoi(val);
+    } else if (strcmp(key, "vsock_settle_ms") == 0) {
+        c->vsock_settle_ms = atoi(val);
+    } else if (strcmp(key, "create_workers") == 0) {
+        c->create_workers = atoi(val);
+    } else if (strcmp(key, "max_creates_per_session") == 0) {
+        c->max_creates_per_session = atoi(val);
+    } else if (strcmp(key, "max_creates_per_uid") == 0) {
+        c->max_creates_per_uid = atoi(val);
+    } else if (strcmp(key, "cgroup_enable") == 0) {
+        c->cgroup_enable = atoi(val);
+    } else if (strcmp(key, "cgroup_slack_mib") == 0) {
+        c->cgroup_slack_mib = atoi(val);
+    } else if (strcmp(key, "cgroup_cpu_max") == 0) {
+        snprintf(c->cgroup_cpu_max, sizeof(c->cgroup_cpu_max), "%s", val);
     } else {
         fprintf(stderr, "[sandboxd] unknown config key '%s'\n", key);
     }
@@ -127,4 +148,18 @@ void config_apply_env(engine_config_t* c) {
         config_set_key(c, "jailer_uid", v);
     if ((v = getenv("SANDBOX_JAILER_GID")) && *v)
         config_set_key(c, "jailer_gid", v);
+    if ((v = getenv("SANDBOX_VSOCK_SETTLE_MS")) && *v)
+        config_set_key(c, "vsock_settle_ms", v);
+    if ((v = getenv("SANDBOX_CREATE_WORKERS")) && *v)
+        config_set_key(c, "create_workers", v);
+    if ((v = getenv("SANDBOX_MAX_CREATES_PER_SESSION")) && *v)
+        config_set_key(c, "max_creates_per_session", v);
+    if ((v = getenv("SANDBOX_MAX_CREATES_PER_UID")) && *v)
+        config_set_key(c, "max_creates_per_uid", v);
+    if ((v = getenv("SANDBOX_CGROUP_ENABLE")) && *v)
+        config_set_key(c, "cgroup_enable", v);
+    if ((v = getenv("SANDBOX_CGROUP_SLACK_MIB")) && *v)
+        config_set_key(c, "cgroup_slack_mib", v);
+    if ((v = getenv("SANDBOX_CGROUP_CPU_MAX")) && *v)
+        config_set_key(c, "cgroup_cpu_max", v);
 }

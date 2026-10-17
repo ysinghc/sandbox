@@ -30,6 +30,10 @@ void ipc_server_set_allowed_uids(const char* csv);
 // Phase 11: default pool wait (ms) applied when a CreateRequest sends 0.
 void ipc_server_set_default_pool_wait_ms(uint32_t ms);
 
+// §10.8: Create worker pool size and per-session / per-uid concurrency caps.
+// Non-positive arguments keep the built-in default.
+void ipc_server_set_create_limits(int workers, int per_session, int per_uid);
+
 // Engine-side half of §5.8: the credential broker validates session tokens
 // over broker-control.sock. Runs in its own thread.
 int ipc_server_start_broker_control(const char* socket_path);

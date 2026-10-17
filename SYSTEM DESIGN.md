@@ -1311,8 +1311,8 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
 | Guest kernel escape | KVM hardware boundary | Zero-day in KVM itself |
 | VMM compromise | Jailer (chroot + seccomp + unprivileged uid) | Bug in Jailer setup code |
 | Credential exfiltration | Session tokens only, broker validates | Token leaked within sandbox lifetime |
-| Host DoS via resource exhaustion | Cgroups on VMM process, pool size limit | Engine daemon itself has no resource limit |
-| Snapshot poisoning | Atomic rename, checksum in manifest | TOCTOU if snapshot dir writable by attacker |
+| Host DoS via resource exhaustion | Per-VM cgroups (memory/CPU/OOM-group, §10.11) + pool size limit | Engine daemon itself has no resource limit |
+| Snapshot poisoning | Atomic rename, SHA-256 of memory.snap/vmstate in manifest (§10.10), verified on restore | TOCTOU if snapshot dir writable by attacker |
 
 ### 12.2 Audit Checklist (Pre-Production)
 
@@ -1324,6 +1324,10 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
 - [ ] Network policy tested (guest cannot reach internet directly)
 - [x] nftables rules applied without a shell (libnftables) — Phase 10.5, §15.12
 - [x] Engine socket authenticates peers (SO_PEERCRED allowlist) — Phase 10.1, §15.9
+- [x] Snapshot integrity verified (SHA-256 in manifest, checked on restore) —
+      Phase 12.10, §15.14
+- [x] Per-VM resource enforcement (cgroup v2 memory/CPU/OOM-group) — Phase
+      12.11, §15.14
 - [ ] Broker TLS cert validation enabled (HTTPS to upstream)
 - [ ] Session token entropy (getrandom, not /dev/urandom)
 
@@ -1351,7 +1355,7 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
 ---
 
 **Document Version:** 1.1
-**Last Updated:** 2026-10-15
+**Last Updated:** 2026-10-17
 **Status:** Implementation-ready + ground-truth deviations (see §15)
 
 ---
@@ -1410,8 +1414,9 @@ authoritative.
   conceptual). `spawn_jailed()` is an in-daemon `fork()`; the forked child does
   the jail setup and then directly `execve`s `/firecracker`. Cgroup placement is
   `write_cgroup_procs(cgroup_path, getpid())` into a caller-provided
-  `cgroup.procs` (the daemon does not create the hierarchy); the VMM paths pass
-  `cgroup_path = NULL`, so **no cgroup is applied yet**.
+  `cgroup.procs`; since Phase 12 (§15.14) `vmm_restore` creates the per-VM leaf
+  and passes its path, so each Firecracker runs inside
+  `<root>/sandboxd/active/<vm-id>/`.
 - `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` (required by the
   later setuid/setgid per LLD order) plus `CAP_SYS_PTRACE` (Firecracker UFFD
   creation gate where `unprivileged_userfaultfd=0`; `ptrace()` itself stays
@@ -1638,13 +1643,13 @@ authoritative.
   and `ResumeResponse` (field 6). The LLD schema has no reply for
   pause/resume, so the client would block forever waiting for a frame. The
   addition is backward-compatible.
-- **Event loop is single-threaded epoll; Phase 9 added pidfd crash watching**
-  (§15.10). A `Create`
-  blocks the loop for the duration of the pool restore (~0.1 s warm / ~1 s cold)
-  — acceptable at this scale. `epoll` multiplexes the listener, the wake
-  `eventfd` and every client fd; SEQPACKET + level-triggered EPOLLIN guarantees
-  a whole frame is ready when read. `ipc_server_request_stop()` (async-signal-
-  safe) is what a SIGTERM handler calls.
+- **Event loop is epoll-based; Phase 9 added pidfd crash watching** (§15.10) and
+  Phase 12 (§15.14) moved pool restores off the loop. A `Create` no longer blocks:
+  it is queued and executed by `create_workers` worker threads, and the loop only
+  consumes their results via the wake `eventfd`. `epoll` multiplexes the listener,
+  the wake `eventfd` and every client fd; SEQPACKET + level-triggered EPOLLIN
+  guarantees a whole frame is ready when read. `ipc_server_request_stop()`
+  (async-signal-safe) is what a SIGTERM handler calls.
 - **Session/token model:** a connection *is* a session; it owns every sandbox it
   created and reclaims them on disconnect (`sandbox_cleanup()` /
   peer EOF). Tokens are 256 bits of `getrandom` (hex-encoded in
@@ -1898,3 +1903,54 @@ authoritative.
   set tightened to the runtime minimum (§15.12) including `CAP_SETPCAP`
   (needed by the jailer's bounding-set drop) and `CAP_SYS_PTRACE` (ambient UFFD
   cap).
+
+### 15.14 Phase 12 — Reliability (§10.8–§10.11)
+- **Async `Create` (§10.8).** The epoll loop no longer runs the pool restore
+  inline. A `Create` is copied into a `create_job_t` (env `strdup`'d) and handed
+  to a small worker pool; the worker does `pool_provision` + env inject +
+  `token_issue`, posts a `create_result_t` to a mutex-guarded queue, and wakes
+  the loop through the existing `eventfd`. The loop consumes results on
+  `EP_WAKE` and does all lifecycle mutation (`lifecycle_track`, `session_own`,
+  `pidfd_track`, response send) — those structures stay single-threaded. Per
+  session, only the head of a FIFO is dispatched at a time, so a client's
+  responses remain in request order; a stale result is matched by
+  `(session_fd, epoch)` so a reused fd slot is never misattributed. New config
+  keys `create_workers` (default 4), `max_creates_per_session` (16),
+  `max_creates_per_uid` (64) bound concurrency (over-limit → `POOL_EXHAUSTED`).
+  Note the protocol still has no request-id, hence the per-session
+  serialization; true concurrent creates from one session would need one.
+- **Env-inject readiness + confirmation (§10.9).** The unconditional 1 s sleep
+  before the first vsock `CONNECT` is gone. Instead the daemon polls the
+  restored VM's `serial.log` for a post-restore guest marker
+  (`SANDBOX-TICK`/`SANDBOX-VSOCK-`) for up to `SANDBOX_VSOCK_SETTLE_MS`
+  (default 1000, config `vsock_settle_ms`) and falls back to that fixed settle
+  only if nothing appears. After a successful write it waits up to
+  `SANDBOX_VSOCK_CONFIRM_MS` (default 2000) for the agent's `SANDBOX-ENV-END`
+  echo, turning best-effort injection into confirmed delivery; the marker is
+  emitted *after* the agent applies the payload. (Deviation: the plan said poll
+  `SANDBOX-READY`, but a restored guest resumes *past* that line — the agent
+  prints it once at cold boot — so a liveness marker it re-emits on the busy
+  loop is used instead.)
+- **Snapshot integrity (§10.10).** `snap_manifest_t` gains `header_size`
+  (format guard, validated on every read) and 32-byte SHA-256 digests of
+  `memory.snap` and `vmstate`. `build_manifest()` hashes the memory file while
+  scanning it; `create_snapshot_template()` hashes the captured vmstate. A new
+  self-contained SHA-256 (`src/sha256.c`) backs it (no OpenSSL dependency).
+  `snapshot_verify()` / `snapshot_verify_manifest()` recompute and compare;
+  `vmm_restore()` refuses a mismatched snapshot before the UFFD handler can
+  serve garbage pages, and `sandbox-cli verify --template NAME` +
+  `--validate-config` expose the same check. Verification can be skipped with
+  `SANDBOX_VERIFY_SNAPSHOT=0`. Existing manifests are rejected cleanly (the
+  header guard), so templates must be rebuilt.
+- **Per-VM cgroups (§10.11).** New `src/cgroup.c` owns a cgroup v2 hierarchy
+  `<root>/sandboxd/active/<vm-id>/`. `cgroup_init()` creates it and enables
+  `memory`/`cpu`/`pids` down the chain (`cgroup.subtree_control`); `vmm_restore`
+  creates one leaf per VM and passes its `cgroup.procs` to the jailer (which
+  already wrote it pre-chroot), so Firecracker lands in its own group.
+  `memory.max = guest size + slack` (default 64 MiB, `cgroup_slack_mib`),
+  `memory.swap.max = 0`, `memory.oom.group = 1` (OOM kills the VMM, never the
+  daemon), `cpu.max` from `cgroup_cpu_max` (default `max` = unlimited).
+  `vmm_destroy` removes the leaf after reaping. Best-effort: unavailable →
+  unmetered with a log. Verified on the Pi: the restored Firecracker pid appears
+  in `<jail>/../active/<vm-id>/cgroup.procs`. New config keys `cgroup_enable`,
+  `cgroup_slack_mib`, `cgroup_cpu_max`; new ctest `cgroup`.

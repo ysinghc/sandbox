@@ -3,6 +3,7 @@
 // behind). Prints a JSON line with the id, then waits for SIGINT/SIGTERM.
 
 #include "libsandbox.h"
+#include "snapshot_manager.h"
 
 #include <signal.h>
 #include <stdio.h>
@@ -17,8 +18,10 @@ static void on_signal(int sig) {
 }
 
 static void usage(void) {
-    printf("usage: sandbox-cli [--socket PATH] run --template NAME "
-           "[--memory MIB] [--vcpus N] [--wait MS]\n");
+    printf("usage:\n"
+           "  sandbox-cli run --template NAME [--socket PATH] [--memory MIB] "
+           "[--vcpus N] [--wait MS]\n"
+           "  sandbox-cli verify --template NAME\n");
 }
 
 int main(int argc, char** argv) {
@@ -28,11 +31,13 @@ int main(int argc, char** argv) {
     uint32_t vcpus = 1;
     uint32_t wait_ms = 500;
     int do_run = 0;
+    int do_verify = 0;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* v = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (strcmp(a, "run") == 0) do_run = 1;
+        else if (strcmp(a, "verify") == 0) do_verify = 1;
         else if (strcmp(a, "--socket") == 0 && v) socket_path = argv[++i];
         else if (strcmp(a, "--template") == 0 && v) template_name = argv[++i];
         else if (strcmp(a, "--memory") == 0 && v) memory_mib = strtoull(argv[++i], NULL, 10);
@@ -42,6 +47,15 @@ int main(int argc, char** argv) {
             usage();
             return 0;
         }
+    }
+
+    // §10.10: pre-flight integrity check (used by ops and --validate-config).
+    if (do_verify) {
+        if (!template_name) {
+            usage();
+            return 2;
+        }
+        return snapshot_verify(template_name) == 0 ? 0 : 1;
     }
 
     if (!do_run || !template_name) {

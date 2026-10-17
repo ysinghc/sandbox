@@ -102,3 +102,11 @@ target_compile_definitions(test_config PRIVATE
     SANDBOX_TEST_CONFIG_FILE="${CMAKE_SOURCE_DIR}/config/engine.conf")
 add_test(NAME config COMMAND test_config)
 set_tests_properties(config PROPERTIES TIMEOUT 30)
+
+# Phase 12: per-VM cgroup hierarchy (§10.11). SKIPs when cgroup v2 is not
+# writable. Runs as root so the default /sys/fs/cgroup root can be populated.
+add_executable(test_cgroup test_cgroup.c)
+target_include_directories(test_cgroup PRIVATE ../include)
+target_link_libraries(test_cgroup sandbox)
+add_test(NAME cgroup COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_cgroup)
+set_tests_properties(cgroup PROPERTIES TIMEOUT 60)

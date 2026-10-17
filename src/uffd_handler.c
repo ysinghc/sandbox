@@ -80,6 +80,7 @@ int uffd_setup_region(vm_handle_t* vm, const char* snap_path,
         snap_manifest_t hdr;
         ssize_t n = read(mfd, &hdr, sizeof(hdr));
         if (n == (ssize_t)sizeof(hdr) && hdr.magic == SNAP_MAGIC &&
+            hdr.header_size == (uint32_t)sizeof(snap_manifest_t) &&
             hdr.page_size == (uint32_t)ps) {
             size_t total = sizeof(hdr) + (hdr.page_count + 7u) / 8u;
             manifest = malloc(total);

@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pool_manager.h"
+#include "sha256.h"
 #include "snapshot_manager.h"
 #include "vmm_manager.h"
 
@@ -310,10 +311,82 @@ static void test_version_check(void) {
     fflush(stdout);
 }
 
+static void test_sha256_kat(void) {
+    printf("[test] sha256...\n");
+    fflush(stdout);
+    uint8_t d[32];
+    char hex[65];
+    sha256("abc", 3, d);
+    sha256_hex(d, hex);
+    assert(strcmp(hex,
+                  "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
+           == 0);
+    sha256("", 0, d);
+    sha256_hex(d, hex);
+    assert(strcmp(hex,
+                  "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
+           == 0);
+    // 56-byte boundary exercises the two-block padding path.
+    sha256("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, d);
+    sha256_hex(d, hex);
+    assert(strcmp(hex,
+                  "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1")
+           == 0);
+    printf("[test] sha256: PASS\n");
+    fflush(stdout);
+}
+
+static void test_verify(void) {
+    printf("[test] verify...\n");
+    fflush(stdout);
+    char vroot[PATH_MAX], vdir[PATH_MAX];
+    snprintf(vroot, sizeof(vroot), "%s/ver", g_root);
+    CHECK_RC(mkdir(vroot, 0755), "mkdir ver");
+    snprintf(vdir, sizeof(vdir), "%s/vtpl", vroot);
+    CHECK_RC(mkdir(vdir, 0755), "mkdir vtpl");
+    setenv("SANDBOX_SNAPSHOT_ROOT", vroot, 1);
+
+    char mem[PATH_MAX], state[PATH_MAX], mp[PATH_MAX];
+    snprintf(mem, sizeof(mem), "%s/memory.snap", vdir);
+    int fd = open(mem, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) abort();
+    if (ftruncate(fd, 4 * 4096) < 0) abort();
+    uint8_t v = 0x33;
+    if (pwrite(fd, &v, 1, 50) != 1) abort();
+    close(fd);
+    snprintf(state, sizeof(state), "%s/vmstate", vdir);
+    fd = open(state, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) abort();
+    if (write(fd, "VMSTATE-DATA", 12) != 12) abort();
+    close(fd);
+
+    snap_manifest_t* m = build_manifest(mem);
+    if (!m) abort();
+    m->version = 1;
+    if (sha256_file(state, m->vmstate_sha256) < 0) abort();
+    snprintf(mp, sizeof(mp), "%s/manifest.bin", vdir);
+    CHECK_RC(write_manifest(mp, m), "write verify manifest");
+    free(m);
+
+    assert(snapshot_verify("vtpl") == 0);
+    // Corrupt memory.snap -> mismatch -> refused.
+    fd = open(mem, O_WRONLY);
+    if (fd < 0) abort();
+    uint8_t z = 0x99;
+    if (pwrite(fd, &z, 1, 4096) != 1) abort();
+    close(fd);
+    assert(snapshot_verify("vtpl") < 0);
+    setenv("SANDBOX_SNAPSHOT_ROOT", g_root, 1);
+    printf("[test] verify: PASS\n");
+    fflush(stdout);
+}
+
 int main(void) {
     make_root();
+    test_sha256_kat();
     test_manifest_bitmap();
     test_write_read_roundtrip();
+    test_verify();
     test_atomic_publish();
     test_create_hygiene();
     test_version_check();

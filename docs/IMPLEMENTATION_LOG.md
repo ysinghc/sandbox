@@ -455,3 +455,56 @@ Plan reference: production-readiness plan items 10.6–10.7.
 - **Tests.** New `tests/test_config.c` (ctest `config`) parses a synthetic file
   and the packaged `engine.conf` and checks env precedence. Full `ctest` 11/11
   as root.
+
+## Phase 12 — Reliability (§10.8–§10.11, §15.14)
+
+Plan reference: production-readiness plan items 10.8–10.11.
+
+- **10.8 async Create.** `src/ipc_server.c` no longer runs `pool_provision`
+  inline in the epoll loop. `handle_create` became `submit_create`: it validates,
+  copies the request into a heap `create_job_t` (env values `strdup`'d), appends
+  it to a per-session FIFO, and dispatches the head to a `create_workers`-strong
+  worker pool (`create_worker_fn`) only when the previous job for that session is
+  done — so per-session responses stay in order despite concurrency across
+  sessions. Workers run restore + env inject + `token_issue` and push a
+  `create_result_t`; the loop consumes them on the existing `eventfd`
+  (`drain_results` in `EP_WAKE`) and does every lifecycle mutation
+  (`lifecycle_track`/`session_own`/`pidfd_track`/send) on the loop thread, so the
+  registry stays single-threaded. Stale results are guarded by
+  `(session_fd, session_epoch)`; `drop_session` frees queued (undispatched) jobs
+  and clears per-uid accounting. New config/env: `create_workers` (4),
+  `max_creates_per_session` (16), `max_creates_per_uid` (64) →
+  `ipc_server_set_create_limits()`. **Deviation:** no request-id exists in the
+  protocol, so cross-session concurrency is real but a single session is
+  serialized to preserve response ordering; a client that needs parallel creates
+  from one connection needs a request-id (recipe for V2).
+- **10.9 env inject readiness/confirm.** `vmm_inject_env` replaced `sleep(1)`
+  with `wait_markers(vm, {"SANDBOX-TICK","SANDBOX-VSOCK-"}, settle_ms)`, falling
+  back to a `SANDBOX_VSOCK_SETTLE_MS` (1000 ms) sleep; after a successful write
+  it waits `SANDBOX_VSOCK_CONFIRM_MS` (2000 ms) for the agent's
+  `SANDBOX-ENV-END` echo and returns -1 if absent. **Deviation:** readiness uses
+  a re-emitted liveness marker, not `SANDBOX-READY` (a restored guest resumes
+  past that line). New config `vsock_settle_ms`.
+- **10.10 snapshot integrity.** `include/sha256.h` + `src/sha256.c` add a
+  self-contained SHA-256. `snap_manifest_t` gained `header_size` (validated in
+  `read_manifest` and the UFFD handler's direct read) and `memory_sha256`/
+  `vmstate_sha256`; `build_manifest` hashes `memory.snap`, `create_snapshot_template`
+  hashes `vmstate`. `snapshot_verify()` + `snapshot_verify_manifest()` recompute
+  and compare; `vmm_restore` refuses a mismatch (skippable via
+  `SANDBOX_VERIFY_SNAPSHOT=0`). `sandbox-cli verify --template NAME` and
+  `--validate-config` run the check. Manifest format is incompatible with
+  pre-Phase-12 templates → rebuild required (fixtures rebuild automatically).
+- **10.11 per-VM cgroups.** New `include/cgroup.h` + `src/cgroup.c` (cgroup v2):
+  `cgroup_init()` creates `<root>/sandboxd/active` and enables
+  `memory/cpu/pids` via `cgroup.subtree_control` at each level; `vmm_restore`
+  makes a leaf per VM and hands its `cgroup.procs` to the jailer (pre-chroot
+  write already supported). Limits: `memory.max` = guest + `cgroup_slack_mib`
+  (64), `memory.swap.max = 0`, `memory.oom.group = 1`, `cpu.max` from
+  `cgroup_cpu_max` (default `max`). `vmm_destroy` removes the leaf. New config
+  `cgroup_enable`/`cgroup_slack_mib`/`cgroup_cpu_max`; new ctest `cgroup`.
+  Verified on the Pi (vmm test asserts the restored FC pid is in its cgroup).
+- **Version.** `SANDBOX_VERSION` 0.10.0 → 0.12.0.
+- **Tests.** `test_snapshot` gained a SHA-256 KAT (incl. the 56-byte two-block
+  pad case) and a verify/corrupt-manifest case; `test_config` covers the new
+  keys; `test_cgroup` checks the hierarchy + limit files + id sanitization;
+  `test_vmm` asserts cgroup placement. Full `ctest` 12/12 as root on the Pi.

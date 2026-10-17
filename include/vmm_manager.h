@@ -36,6 +36,7 @@ typedef struct vm_handle_t {
     char api_sock_path[108];  // host view of the jail API socket
     char jail_root[PATH_MAX];
     char vsock_uds[PATH_MAX];  // host path to the per-VM vsock UDS ("" = none)
+    char cgroup_dir[PATH_MAX];  // per-VM cgroup dir (§10.11); "" = none
     vm_network_t net;  // per-VM tap; reclaimed by vmm_destroy
     bool has_net;
     pthread_t uffd_thread;

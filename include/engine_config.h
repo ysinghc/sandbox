@@ -11,6 +11,7 @@
 #define ENGINE_CONFIG_UIDS_MAX 512
 #define ENGINE_CONFIG_TEMPLATE_MAX 128
 #define ENGINE_CONFIG_BIND_MAX 64
+#define ENGINE_CONFIG_VAL_MAX 64
 
 typedef struct {
     char socket_path[ENGINE_CONFIG_PATH_MAX];
@@ -27,6 +28,13 @@ typedef struct {
     char snapshot_root[ENGINE_CONFIG_PATH_MAX];  // "" = env/default
     int jailer_uid;
     int jailer_gid;
+    int vsock_settle_ms;  // §10.9 env-inject settle fallback (ms)
+    int create_workers;          // §10.8 Create worker pool size
+    int max_creates_per_session; // §10.8 per-session concurrency cap
+    int max_creates_per_uid;     // §10.8 per-uid concurrency cap
+    int cgroup_enable;           // §10.11 per-VM cgroup enforcement (0/1)
+    int cgroup_slack_mib;        // memory.max headroom over guest size
+    char cgroup_cpu_max[ENGINE_CONFIG_VAL_MAX];  // cpu.max ("max" = unlimited)
 } engine_config_t;
 
 // Fill c with built-in defaults.

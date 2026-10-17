@@ -12,9 +12,12 @@
 typedef struct snap_manifest_t {
     uint32_t magic;          // 0x534E4150 ("SNAP")
     uint32_t version;        // Incremented on every template rebuild
+    uint32_t header_size;    // sizeof(snap_manifest_t) — format guard (§10.10)
     uint64_t guest_mem_size; // Total guest memory bytes
     uint32_t page_size;      // Always 4096
     uint32_t page_count;     // guest_mem_size / page_size
+    uint8_t  memory_sha256[32];   // SHA-256 of memory.snap (§10.10)
+    uint8_t  vmstate_sha256[32];  // SHA-256 of vmstate (§10.10)
     uint8_t  page_bitmap[];  // 1 bit per page: 1=present, 0=zero (packed)
 } snap_manifest_t;
 
@@ -40,5 +43,16 @@ bool snapshot_page_present(const snap_manifest_t* manifest, uint64_t offset);
 int snapshot_check_version(pool_manager_t* pool, const char* template_name);
 // Atomic publish of a staged temp dir (direct rename or backup-swap).
 int snapshot_publish(const char* temp_dir, const char* final_dir);
+
+// §10.10: recompute SHA-256 of memory.snap and vmstate and compare against the
+// manifest. Returns 0 if intact, -1 if missing/corrupt/unreadable. Verbose
+// reason goes to stderr.
+int snapshot_verify(const char* template_name);
+
+// Same checks but against an already-loaded manifest (used on the restore
+// path). Honours SANDBOX_VERIFY_SNAPSHOT=0 to skip the (expensive) hash pass;
+// returns 0 when disabled.
+int snapshot_verify_manifest(const char* template_name,
+                             const snap_manifest_t* manifest);
 
 #endif // SNAPSHOT_MANAGER_H

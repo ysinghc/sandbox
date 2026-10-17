@@ -23,6 +23,7 @@
 #include "pool_manager.h"
 #include "snapshot_manager.h"
 #include "vmm_manager.h"
+#include "cgroup.h"
 
 #define CHECK_RC(rc, what) do { int _rc = (rc); if (_rc != 0) { \
     fprintf(stderr, "FAIL %s: rc=%d errno=%d (%s:%d)\n", (what), _rc, errno, \
@@ -125,6 +126,32 @@ static void test_restore(void) {
     printf("[test] restore_ms=%lu\n", (unsigned long)restore_ms);
     fflush(stdout);
     check_state(vm, "Running", "restored state");
+    // §10.11: the VMM must have been placed in its per-VM cgroup.
+    if (cgroup_enabled()) {
+        if (!vm->cgroup_dir[0]) {
+            fprintf(stderr, "FAIL: cgroup dir not set for %s\n", vm_id);
+            abort();
+        }
+        char procs[PATH_MAX];
+        snprintf(procs, sizeof(procs), "%s/cgroup.procs", vm->cgroup_dir);
+        FILE* cf = fopen(procs, "r");
+        if (!cf) {
+            fprintf(stderr, "FAIL: open %s\n", procs);
+            abort();
+        }
+        int found = 0;
+        char line[64];
+        while (fgets(line, sizeof(line), cf)) {
+            if (strtol(line, NULL, 10) == vm->vmm_pid) { found = 1; break; }
+        }
+        fclose(cf);
+        if (!found) {
+            fprintf(stderr, "FAIL: vmm pid %d not in %s\n", vm->vmm_pid, procs);
+            abort();
+        }
+        printf("[test] cgroup placement: pid %d in %s\n", vm->vmm_pid,
+               vm->cgroup_dir);
+    }
     // Post-restore guest execution: the resumed guest continues its heartbeat
     // loop, so a fresh SANDBOX-TICK appears in the restore serial log.
     CHECK_RC(vmm_wait_ready(vm, "SANDBOX-TICK", 30000), "post-restore ticks");
@@ -202,6 +229,8 @@ int main(void) {
         printf("SKIP (template fixture not ready)\n");
         return 0;
     }
+    // §10.11: enable cgroups so the restore path exercises per-VM placement.
+    cgroup_init();
     test_lifecycle();
     test_restore();
     test_pool_e2e();

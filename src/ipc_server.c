@@ -47,14 +47,54 @@
 #define IPC_MAX_ALLOWED_UIDS 64
 #define TOKEN_MAX_SERVICES 64
 
+// §10.8 async Create: the epoll loop must never block on a pool restore.
+// Create requests are copied into a job, handed to a small worker pool, and the
+// loop completes them from the result queue on an eventfd wakeup. Per-session
+// serialization (one dispatched job at a time, FIFO) preserves response order.
+#define IPC_CREATE_WORKERS 4
+#define IPC_CREATE_QUEUE_MAX 16  // outstanding creates per session
+#define IPC_CREATE_UID_MAX 64    // outstanding creates per peer uid
+
 // epoll data.u64 tag: low byte = kind, upper bits = payload (fd or table index).
 enum { EP_LISTEN = 1, EP_WAKE = 2, EP_CLIENT = 3, EP_PIDFD = 4 };
+
+// One in-flight (or queued) Create. Copied off the wire request so the loop can
+// return to epoll immediately; env values are strdup'd (the request is cleared).
+typedef struct create_job {
+    int session_fd;
+    uint64_t session_epoch;
+    uid_t uid;
+    uint64_t memory_mib;
+    uint32_t vcpu_count;
+    uint32_t pool_wait_ms;
+    char template_name[IPC_MAX_TEMPLATE];
+    char* env[IPC_MAX_ENV + 1];  // NULL-terminated
+    struct create_job* next;
+} create_job_t;
+
+// A finished job, posted by a worker and consumed by the loop thread.
+typedef struct create_result {
+    create_job_t* job;
+    sandbox_error_t code;   // SANDBOX_OK on success
+    vm_handle_t* vm;        // owned by the loop thread on receipt
+    char token[IPC_TOKEN_HEX_LEN + 1];
+    struct create_result* next;
+} create_result_t;
 
 typedef struct {
     int fd;
     uid_t uid;  // peer uid from SO_PEERCRED (Phase 10.1); for logging/quotas
+    uint64_t epoch;  // distinguishes reused fd slots across disconnects
     uint32_t owned[IPC_MAX_OWNED];
     int n_owned;
+
+    // §10.8: per-session Create FIFO. cq_head is only dispatched when the
+    // previous job's result has been consumed (cq_active), so a single session's
+    // responses stay in request order.
+    create_job_t* cq_head;
+    create_job_t* cq_tail;
+    int n_outstanding;  // queued + active
+    bool cq_active;
 } session_t;
 
 typedef struct token_entry {
@@ -103,8 +143,32 @@ static struct {
 
     pthread_mutex_t tok_lock;
     token_entry_t* tokens;
+
+    // §10.8 async Create machinery.
+    pthread_mutex_t q_lock;
+    pthread_cond_t q_cond;
+    create_job_t* q_head;
+    create_job_t* q_tail;
+    int q_len;
+    bool q_stop;
+    pthread_mutex_t r_lock;
+    create_result_t* r_head;
+    create_result_t* r_tail;
+    pthread_t workers[IPC_CREATE_WORKERS];
+    int n_workers;
+    int create_workers_cfg;   // desired worker count (default IPC_CREATE_WORKERS)
+    int per_session_max;      // default IPC_CREATE_QUEUE_MAX
+    int per_uid_max;          // default IPC_CREATE_UID_MAX
+    uint64_t session_epoch;   // bumped per accepted connection
+    struct { uid_t uid; int n; } uid_inflight[IPC_MAX_ALLOWED_UIDS];
 } g = { .listen_fd = -1, .epfd = -1, .wake_fd = -1, .bc_listen_fd = -1,
-        .bc_wake_fd = -1, .tok_lock = PTHREAD_MUTEX_INITIALIZER };
+        .bc_wake_fd = -1, .tok_lock = PTHREAD_MUTEX_INITIALIZER,
+        .q_lock = PTHREAD_MUTEX_INITIALIZER,
+        .q_cond = PTHREAD_COND_INITIALIZER,
+        .r_lock = PTHREAD_MUTEX_INITIALIZER,
+        .create_workers_cfg = IPC_CREATE_WORKERS,
+        .per_session_max = IPC_CREATE_QUEUE_MAX,
+        .per_uid_max = IPC_CREATE_UID_MAX };
 
 // ---------------------------------------------------------------------------
 // small helpers
@@ -279,10 +343,41 @@ static session_t* session_alloc(int fd) {
         if (g.sessions[i].fd < 0) {
             memset(&g.sessions[i], 0, sizeof(g.sessions[i]));
             g.sessions[i].fd = fd;
+            g.sessions[i].epoch = ++g.session_epoch;
             return &g.sessions[i];
         }
     }
     return NULL;
+}
+
+// §10.8 per-uid outstanding-create accounting (loop-thread only).
+static int uid_inflight_get(uid_t uid) {
+    for (int i = 0; i < IPC_MAX_ALLOWED_UIDS; i++) {
+        if (g.uid_inflight[i].n && g.uid_inflight[i].uid == uid)
+            return g.uid_inflight[i].n;
+    }
+    return 0;
+}
+
+static void uid_inflight_add(uid_t uid, int delta) {
+    for (int i = 0; i < IPC_MAX_ALLOWED_UIDS; i++) {
+        if (g.uid_inflight[i].n && g.uid_inflight[i].uid == uid) {
+            g.uid_inflight[i].n += delta;
+            if (g.uid_inflight[i].n <= 0) {
+                g.uid_inflight[i].n = 0;
+                g.uid_inflight[i].uid = 0;
+            }
+            return;
+        }
+    }
+    if (delta <= 0) return;
+    for (int i = 0; i < IPC_MAX_ALLOWED_UIDS; i++) {
+        if (g.uid_inflight[i].n == 0) {
+            g.uid_inflight[i].uid = uid;
+            g.uid_inflight[i].n = delta;
+            return;
+        }
+    }
 }
 
 static bool session_owns(const session_t* s, uint32_t id) {
@@ -409,7 +504,130 @@ static void reply_error(int fd, sandbox_error_t code, const char* msg) {
     send_response(fd, &resp);
 }
 
-static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
+// ---------------------------------------------------------------------------
+// §10.8 async Create: job/result queues + worker pool
+// ---------------------------------------------------------------------------
+
+static void free_job(create_job_t* j) {
+    if (!j) return;
+    for (int i = 0; j->env[i]; i++) free(j->env[i]);
+    free(j);
+}
+
+static create_job_t* build_job(const ipc_request_t* req, session_t* s) {
+    create_job_t* j = calloc(1, sizeof(*j));
+    if (!j) return NULL;
+    j->session_fd = s->fd;
+    j->session_epoch = s->epoch;
+    j->uid = s->uid;
+    j->memory_mib = req->memory_mib ? req->memory_mib : 128;
+    j->vcpu_count = req->vcpu_count ? req->vcpu_count : 1;
+    j->pool_wait_ms = req->pool_wait_ms ? req->pool_wait_ms
+                                        : g.default_pool_wait_ms;
+    snprintf(j->template_name, sizeof(j->template_name), "%s", g.template_name);
+    int n = 0;
+    for (int i = 0; i < req->n_env && i < IPC_MAX_ENV; i++) {
+        if (!req->env_vars[i]) break;
+        j->env[n] = strdup(req->env_vars[i]);
+        if (!j->env[n]) { free_job(j); return NULL; }
+        n++;
+    }
+    j->env[n] = NULL;
+    return j;
+}
+
+// A pool restore + env inject + token mint. Runs off the epoll loop; the only
+// shared mutation is the token registry (token_lock) and the result queue.
+static void* create_worker_fn(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g.q_lock);
+        while (!g.q_stop && !g.q_head)
+            pthread_cond_wait(&g.q_cond, &g.q_lock);
+        if (g.q_stop && !g.q_head) {
+            pthread_mutex_unlock(&g.q_lock);
+            break;
+        }
+        create_job_t* job = g.q_head;
+        g.q_head = job->next;
+        if (!g.q_head) g.q_tail = NULL;
+        g.q_len--;
+        pthread_mutex_unlock(&g.q_lock);
+
+        create_result_t* r = calloc(1, sizeof(*r));
+        if (!r) { free_job(job); continue; }  // OOM: drop the request
+        r->job = job;
+        r->code = SANDBOX_ERR_INTERNAL;
+
+        sandbox_spec_t spec;
+        memset(&spec, 0, sizeof(spec));
+        spec.memory_mib = job->memory_mib;
+        spec.vcpu_count = job->vcpu_count;
+        spec.template_name = job->template_name;
+        spec.env_vars = (const char**)job->env;
+        spec.pool_wait_ms = job->pool_wait_ms;
+
+        uint64_t t0 = now_ms();
+        vm_handle_t* vm = NULL;
+        sandbox_error_t err = pool_provision(g.pool, &spec, &vm);
+        telemetry_provision_latency(now_ms() - t0);
+        if (err != SANDBOX_OK || !vm) {
+            r->code = (err != SANDBOX_OK) ? err : SANDBOX_ERR_INTERNAL;
+            telemetry_pool_exhausted();
+        } else {
+            if (job->env[0]) {
+                if (vmm_inject_env(vm, (const char* const*)job->env) == 0) {
+                    fprintf(stderr,
+                            "{\"component\":\"ipc_server\",\"event\":\"env_injected\","
+                            "\"sandbox_id\":%u}\n",
+                            vm->sandbox_id);
+                } else {
+                    fprintf(stderr,
+                            "{\"component\":\"ipc_server\",\"event\":"
+                            "\"env_inject_failed\",\"sandbox_id\":%u}\n",
+                            vm->sandbox_id);
+                }
+            }
+            if (token_issue(vm->sandbox_id, r->token) < 0) {
+                r->code = SANDBOX_ERR_INTERNAL;  // loop destroys vm
+                r->vm = vm;
+            } else {
+                r->code = SANDBOX_OK;
+                r->vm = vm;
+            }
+        }
+
+        pthread_mutex_lock(&g.r_lock);
+        if (g.r_tail) g.r_tail->next = r;
+        else g.r_head = r;
+        g.r_tail = r;
+        pthread_mutex_unlock(&g.r_lock);
+        uint64_t one = 1;
+        ssize_t w = write(g.wake_fd, &one, sizeof(one));
+        (void)w;
+    }
+    return NULL;
+}
+
+// Hand the head of a session's Create FIFO to the worker pool (loop thread).
+static void dispatch_cq_head(session_t* s) {
+    create_job_t* j = s->cq_head;
+    if (!j) { s->cq_active = false; return; }
+    s->cq_head = j->next;
+    if (!s->cq_head) s->cq_tail = NULL;
+    j->next = NULL;
+    s->cq_active = true;
+    pthread_mutex_lock(&g.q_lock);
+    if (g.q_tail) g.q_tail->next = j;
+    else g.q_head = j;
+    g.q_tail = j;
+    g.q_len++;
+    pthread_cond_signal(&g.q_cond);
+    pthread_mutex_unlock(&g.q_lock);
+}
+
+// Validate and enqueue a Create. Replies immediately only on rejection.
+static void submit_create(int fd, session_t* s, const ipc_request_t* req) {
     if (req->template_name[0] && !valid_name(req->template_name)) {
         reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "invalid template name");
         return;
@@ -423,68 +641,111 @@ static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
         reply_error(fd, SANDBOX_ERR_INTERNAL, "pool not configured");
         return;
     }
+    // §10.8 rate limiting: bound outstanding creates per session and per uid.
+    if (s->n_outstanding >= g.per_session_max) {
+        reply_error(fd, SANDBOX_ERR_POOL_EXHAUSTED, "too many concurrent creates");
+        return;
+    }
+    if (uid_inflight_get(s->uid) >= g.per_uid_max) {
+        reply_error(fd, SANDBOX_ERR_POOL_EXHAUSTED, "uid create limit reached");
+        return;
+    }
+    create_job_t* j = build_job(req, s);
+    if (!j) {
+        reply_error(fd, SANDBOX_ERR_INTERNAL, "out of memory");
+        return;
+    }
+    if (s->cq_tail) s->cq_tail->next = j;
+    else s->cq_head = j;
+    s->cq_tail = j;
+    s->n_outstanding++;
+    uid_inflight_add(s->uid, +1);
+    if (!s->cq_active) dispatch_cq_head(s);
+}
 
-    sandbox_spec_t spec;
-    memset(&spec, 0, sizeof(spec));
-    spec.memory_mib = req->memory_mib ? req->memory_mib : 128;
-    spec.vcpu_count = req->vcpu_count ? req->vcpu_count : 1;
-    spec.template_name = g.template_name;
-    spec.env_vars = (const char**)req->env_vars;
-    spec.pool_wait_ms = req->pool_wait_ms ? req->pool_wait_ms
-                                          : g.default_pool_wait_ms;
+// Consume a finished job (loop thread): track + reply + dispatch the next.
+static void complete_result(create_result_t* r) {
+    create_job_t* job = r->job;
+    session_t* s = session_find(job->session_fd);
+    if (s && s->epoch != job->session_epoch) s = NULL;  // fd was reused
+    uid_inflight_add(job->uid, -1);
 
-    uint64_t t0 = now_ms();
-    vm_handle_t* vm = NULL;
-    sandbox_error_t err = pool_provision(g.pool, &spec, &vm);
-    telemetry_provision_latency(now_ms() - t0);
-
-    if (err != SANDBOX_OK || !vm) {
-        reply_error(fd, err != SANDBOX_OK ? err : SANDBOX_ERR_INTERNAL,
-                    "pool provision failed");
-        telemetry_pool_exhausted();
+    if (!s) {
+        // Client disconnected while the create was in flight: reclaim.
+        if (r->vm) {
+            if (r->code == SANDBOX_OK) token_revoke(r->vm->sandbox_id);
+            vmm_destroy(r->vm);
+        }
+        free_job(job);
         return;
     }
 
-    lifecycle_track(vm);
-    session_own(s, vm->sandbox_id);
-    if (pidfd_track(vm->vmm_pid, fd, vm->sandbox_id) < 0) {
-        // Crash detection degraded but the sandbox is still usable.
-        fprintf(stderr, "[ipc] pidfd_track failed for sandbox %u\n",
-                vm->sandbox_id);
-    }
+    s->cq_active = false;
+    if (s->n_outstanding > 0) s->n_outstanding--;
 
-    // Per-VM env injection (Phase 9b): best-effort delivery to the guest agent.
-    if (req->env_vars[0]) {
-        if (vmm_inject_env(vm, (const char* const*)req->env_vars) == 0) {
-            fprintf(stderr,
-                    "{\"component\":\"ipc_server\",\"event\":\"env_injected\","
-                    "\"sandbox_id\":%u}\n",
-                    vm->sandbox_id);
-        } else {
-            fprintf(stderr,
-                    "{\"component\":\"ipc_server\",\"event\":\"env_inject_failed\","
-                    "\"sandbox_id\":%u}\n",
+    if (r->code != SANDBOX_OK || !r->vm) {
+        if (r->vm) vmm_destroy(r->vm);
+        reply_error(s->fd, r->code != SANDBOX_OK ? r->code : SANDBOX_ERR_INTERNAL,
+                    "pool provision failed");
+    } else {
+        vm_handle_t* vm = r->vm;
+        lifecycle_track(vm);
+        session_own(s, vm->sandbox_id);
+        if (pidfd_track(vm->vmm_pid, s->fd, vm->sandbox_id) < 0) {
+            fprintf(stderr, "[ipc] pidfd_track failed for sandbox %u\n",
                     vm->sandbox_id);
         }
+        ipc_response_t resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.kind = IPC_REQ_CREATE;
+        resp.sandbox_id = vm->sandbox_id;
+        snprintf(resp.session_token, sizeof(resp.session_token), "%s", r->token);
+        fprintf(stderr,
+                "{\"component\":\"ipc_server\",\"event\":\"create\","
+                "\"sandbox_id\":%u}\n",
+                vm->sandbox_id);
+        send_response(s->fd, &resp);
     }
+    free_job(job);
+    if (!g.q_stop && s->cq_head) dispatch_cq_head(s);
+}
 
-    ipc_response_t resp;
-    memset(&resp, 0, sizeof(resp));
-    resp.kind = IPC_REQ_CREATE;
-    resp.sandbox_id = vm->sandbox_id;
-    if (token_issue(vm->sandbox_id, resp.session_token) < 0) {
-        // Roll back: the sandbox exists but has no usable token.
-        lifecycle_remove(vm->sandbox_id);
-        session_disown(s, vm->sandbox_id);
-        vmm_destroy(vm);
-        reply_error(fd, SANDBOX_ERR_INTERNAL, "token generation failed");
-        return;
+// Drain the worker result queue (loop thread, on EP_WAKE).
+static void drain_results(void) {
+    pthread_mutex_lock(&g.r_lock);
+    create_result_t* r = g.r_head;
+    g.r_head = g.r_tail = NULL;
+    pthread_mutex_unlock(&g.r_lock);
+    while (r) {
+        create_result_t* next = r->next;
+        complete_result(r);
+        free(r);
+        r = next;
     }
-    fprintf(stderr,
-            "{\"component\":\"ipc_server\",\"event\":\"create\",\"sandbox_id\":%u}"
-            "\n",
-            vm->sandbox_id);
-    send_response(fd, &resp);
+}
+
+static int start_create_workers(void) {
+    int want = g.create_workers_cfg;
+    if (want < 1) want = 1;
+    if (want > IPC_CREATE_WORKERS) want = IPC_CREATE_WORKERS;
+    for (int i = 0; i < want; i++) {
+        if (pthread_create(&g.workers[i], NULL, create_worker_fn, NULL) != 0) {
+            fprintf(stderr, "[ipc] failed to start create worker %d\n", i);
+            break;
+        }
+        g.n_workers++;
+    }
+    return g.n_workers > 0 ? 0 : -1;
+}
+
+static void stop_create_workers(void) {
+    pthread_mutex_lock(&g.q_lock);
+    g.q_stop = true;
+    pthread_cond_broadcast(&g.q_cond);
+    pthread_mutex_unlock(&g.q_lock);
+    for (int i = 0; i < g.n_workers; i++) pthread_join(g.workers[i], NULL);
+    g.n_workers = 0;
+    g.q_stop = false;
 }
 
 static void handle_destroy(int fd, session_t* s, uint32_t id) {
@@ -562,7 +823,7 @@ static void handle_message(int fd, session_t* s, const uint8_t* payload,
         return;
     }
     switch (req.kind) {
-        case IPC_REQ_CREATE:  handle_create(fd, s, &req); break;
+        case IPC_REQ_CREATE:  submit_create(fd, s, &req); break;
         case IPC_REQ_DESTROY: handle_destroy(fd, s, req.sandbox_id); break;
         case IPC_REQ_PAUSE:   handle_pause_resume(fd, s, req.sandbox_id, true); break;
         case IPC_REQ_RESUME:  handle_pause_resume(fd, s, req.sandbox_id, false); break;
@@ -585,6 +846,18 @@ static void drop_session(session_t* s) {
         pidfd_untrack(id);
         token_revoke(id);
     }
+    // §10.8: drop Create requests this session queued but never dispatched. The
+    // active job (if any) is owned by the worker/result path, which reclaims it
+    // when it finds no such session.
+    while (s->cq_head) {
+        create_job_t* j = s->cq_head;
+        s->cq_head = j->next;
+        uid_inflight_add(j->uid, -1);
+        free_job(j);
+    }
+    s->cq_tail = NULL;
+    s->n_outstanding = 0;
+    s->cq_active = false;
     if (g.epfd >= 0) {
         epoll_ctl(g.epfd, EPOLL_CTL_DEL, s->fd, NULL);
     }
@@ -667,6 +940,7 @@ static void accept_clients(int lfd) {
 int ipc_server_run(const char* socket_path) {
     if (!socket_path) return -1;
     for (int i = 0; i < IPC_MAX_SESSIONS; i++) g.sessions[i].fd = -1;
+    memset(g.uid_inflight, 0, sizeof(g.uid_inflight));
     for (int i = 0; i < IPC_MAX_PIDFDS; i++) {
         g.vms[i].pidfd = -1;
         g.vms[i].session_fd = -1;
@@ -716,6 +990,18 @@ int ipc_server_run(const char* socket_path) {
         return -1;
     }
 
+    // §10.8: start the Create worker pool before accepting connections.
+    if (start_create_workers() < 0) {
+        fprintf(stderr, "[ipc] no create workers; refusing to serve\n");
+        free(payload);
+        close(g.listen_fd);
+        close(g.wake_fd);
+        close(g.epfd);
+        g.listen_fd = g.wake_fd = g.epfd = -1;
+        unlink(socket_path);
+        return -1;
+    }
+
     g.running = 1;
     struct epoll_event evs[64];
     while (g.running) {
@@ -730,6 +1016,7 @@ int ipc_server_run(const char* socket_path) {
             if (kind == EP_WAKE) {
                 uint64_t v;
                 if (read(g.wake_fd, &v, sizeof(v)) < 0) { /* drained */ }
+                drain_results();  // §10.8: completed Creates
                 continue;
             }
             if (kind == EP_LISTEN) {
@@ -753,6 +1040,10 @@ int ipc_server_run(const char* socket_path) {
     }
 
     free(payload);
+    // §10.8: stop workers, then drain whatever results they produced before
+    // reclaiming sessions (dispatch is suppressed once q_stop is set).
+    stop_create_workers();
+    drain_results();
     // Reclaim all sessions.
     for (int i = 0; i < IPC_MAX_SESSIONS; i++) drop_session(&g.sessions[i]);
     close(g.listen_fd);
@@ -823,6 +1114,14 @@ void ipc_server_set_allowed_services(const char* csv) {
 
 void ipc_server_set_default_pool_wait_ms(uint32_t ms) {
     g.default_pool_wait_ms = ms;
+}
+
+// §10.8: tune the Create worker pool / per-session / per-uid concurrency caps.
+// Non-positive arguments leave the corresponding default in place.
+void ipc_server_set_create_limits(int workers, int per_session, int per_uid) {
+    if (workers > 0) g.create_workers_cfg = workers;
+    if (per_session > 0) g.per_session_max = per_session;
+    if (per_uid > 0) g.per_uid_max = per_uid;
 }
 
 // ---------------------------------------------------------------------------

@@ -12,6 +12,7 @@
 
 #include "vmm_manager.h"
 
+#include "cgroup.h"
 #include "jailer.h"
 #include "sandbox_seccomp.h"
 #include "snapshot_manager.h"
@@ -88,6 +89,63 @@ static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+// §10.9: tunable settle/confirm windows (host-specific; see engine.conf).
+static int env_int_ms(const char* name, int dflt) {
+    const char* e = getenv(name);
+    if (!e || !*e) return dflt;
+    int v = atoi(e);
+    return v >= 0 ? v : dflt;
+}
+
+// Does buf contain any of the NUL-terminated markers? O(n*m), n is a serial log.
+static bool scan_markers(const char* buf, size_t n,
+                         const char* const* markers, int nm) {
+    for (int m = 0; m < nm; m++) {
+        size_t ml = strlen(markers[m]);
+        if (!ml) continue;
+        for (size_t i = 0; i + ml <= n; i++) {
+            if (memcmp(buf + i, markers[m], ml) == 0) return true;
+        }
+    }
+    return false;
+}
+
+// Poll a VM's serial.log (whole file, fresh per-VM) until any marker appears or
+// timeout_ms elapses. Returns 0 found, -1 timeout. §10.9 readiness/confirmation.
+static int wait_markers(vm_handle_t* vm, const char* const* markers, int nm,
+                        int timeout_ms) {
+    char logpath[PATH_MAX];
+    snprintf(logpath, sizeof(logpath), "%s/serial.log", vm->jail_root);
+    uint64_t end = now_ms() + (uint64_t)timeout_ms;
+    char* buf = NULL;
+    size_t cap = 0;
+    int found = 0;
+    for (;;) {
+        FILE* f = fopen(logpath, "r");
+        if (f) {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f);
+            if (sz > 0) {
+                if ((size_t)sz + 1 > cap) {
+                    cap = (size_t)sz + 1;
+                    buf = realloc(buf, cap);
+                }
+                if (buf) {
+                    fseek(f, 0, SEEK_SET);
+                    size_t r = fread(buf, 1, (size_t)sz, f);
+                    if (scan_markers(buf, r, markers, nm)) found = 1;
+                }
+            }
+            fclose(f);
+        }
+        if (found || now_ms() >= end) break;
+        struct timespec nap = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L };
+        nanosleep(&nap, NULL);
+    }
+    free(buf);
+    return found ? 0 : -1;
 }
 
 static int write_full(int fd, const void* buf, size_t n) {
@@ -586,13 +644,19 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
     }
     strncpy(addr.sun_path, vm->vsock_uds, sizeof(addr.sun_path) - 1);
 
-    // Let Firecracker's vsock muxer settle after resume before the first
-    // CONNECT. A host connection issued while the muxer is still setting up
-    // its restored endpoint is accepted but never answered, and that stuck
-    // half-open state wedges the port: every subsequent attempt then times
-    // out too (measured: ~10-20% of immediate connects wedge all 8 retries,
-    // while a 1 s settle before the first attempt succeeds in ~1 ms 10/10).
-    sleep(1);
+    // §10.9: instead of an unconditional ~1 s sleep (a host-specific magic
+    // constant), wait for evidence the guest agent resumed after the restore —
+    // it emits SANDBOX-TICK / SANDBOX-VSOCK-* on its busy loop. If nothing
+    // appears within the settle window, fall back to a fixed settle for
+    // Firecracker's vsock muxer (tunable via SANDBOX_VSOCK_SETTLE_MS).
+    int settle_ms = env_int_ms("SANDBOX_VSOCK_SETTLE_MS", 1000);
+    static const char* const ready_markers[] = { "SANDBOX-TICK",
+                                                 "SANDBOX-VSOCK-" };
+    if (wait_markers(vm, ready_markers, 2, settle_ms) != 0) {
+        struct timespec nap = { .tv_sec = settle_ms / 1000,
+                                .tv_nsec = (long)(settle_ms % 1000) * 1000000L };
+        nanosleep(&nap, NULL);
+    }
 
     // The backend UDS appears shortly after the load request, and the *guest*
     // side of the vsock can lag the host's UDS by a few hundred ms after a
@@ -680,8 +744,24 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
         if (wfail) continue;
         rc = 0;
     }
-    if (rc != 0) errno = EPROTO;
-    return rc;
+    if (rc != 0) {
+        errno = EPROTO;
+        return rc;
+    }
+    // §10.9: confirm delivery — the guest agent echoes SANDBOX-ENV-END to the
+    // serial console only after it has applied the payload. Turns best-effort
+    // injection into confirmed delivery within a bounded window.
+    static const char* const done_markers[] = { "SANDBOX-ENV-END" };
+    int confirm_ms = env_int_ms("SANDBOX_VSOCK_CONFIRM_MS", 2000);
+    if (wait_markers(vm, done_markers, 1, confirm_ms) != 0) {
+        fprintf(stderr,
+                "[vmm_inject_env] write OK but no SANDBOX-ENV-END within %dms "
+                "(unconfirmed)\n",
+                confirm_ms);
+        errno = EPROTO;
+        return -1;
+    }
+    return 0;
 }
 
 // Snapshot the paused VM's state+memory to jail-view paths.
@@ -732,6 +812,8 @@ int vmm_destroy(vm_handle_t* vm) {
         vm->has_net = false;
     }
     jail_cleanup(vm->jail_root);
+    // §10.11: the VMM is reaped, so its cgroup is empty and can be removed.
+    cgroup_remove_vm(vm->cgroup_dir);
     free(vm);
     return 0;
 }
@@ -754,6 +836,15 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     }
     snap_manifest_t* manifest = NULL;
     if (read_manifest(template_name, &manifest) < 0) return NULL;
+    // §10.10: refuse to restore a corrupt/truncated snapshot before handing it
+    // to the UFFD handler (which would otherwise serve garbage pages).
+    if (snapshot_verify_manifest(template_name, manifest) < 0) {
+        fprintf(stderr, "[vmm_restore] snapshot %s failed integrity check\n",
+                template_name);
+        free(manifest);
+        errno = EIO;
+        return NULL;
+    }
     long hps = sysconf(_SC_PAGESIZE);
     if (manifest->page_size != (uint32_t)(hps > 0 ? hps : 4096)) {
         free(manifest);
@@ -823,8 +914,29 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     if (stat(tpl_rootfs, &st) == 0) files.rootfs_path = tpl_rootfs;
     char serial[PATH_MAX];
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
+    // §10.11: per-VM cgroup (memory/CPU limits + OOM isolation). The jailer
+    // writes cgroup.procs before chroot, so the VMM lands in its own group.
+    char cg_procs[PATH_MAX] = "";
+    if (cgroup_enabled()) {
+        cgroup_limits_t clim;
+        memset(&clim, 0, sizeof(clim));
+        uint64_t mem_mib = manifest->guest_mem_size / (1024 * 1024);
+        const char* slack = getenv("SANDBOX_CGROUP_SLACK_MIB");
+        uint64_t slack_mib = (slack && *slack) ? strtoull(slack, NULL, 10) : 64;
+        clim.memory_max_mib = mem_mib ? mem_mib + slack_mib : 0;
+        clim.memory_swap_max_mib = 0;  // no swap: keeps restore latency bounded
+        const char* cpu = getenv("SANDBOX_CGROUP_CPU_MAX");
+        clim.cpu_max = (cpu && *cpu) ? cpu : "max";
+        clim.oom_group = true;  // kill the VMM, never the daemon, on OOM
+        if (cgroup_add_vm(vm_id, &clim, vm->cgroup_dir,
+                          sizeof(vm->cgroup_dir)) == 0 &&
+            vm->cgroup_dir[0]) {
+            snprintf(cg_procs, sizeof(cg_procs), "%s/cgroup.procs",
+                     vm->cgroup_dir);
+        }
+    }
     jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
-                             .cgroup_path = NULL };
+                             .cgroup_path = cg_procs[0] ? cg_procs : NULL };
     char* argv[8];
     int ai = 0;
     argv[ai++] = (char*)"/firecracker";

@@ -7,9 +7,11 @@
 // file is a flat "key = value" list.
 
 #include "engine_config.h"
+#include "cgroup.h"
 #include "ipc_server.h"
 #include "network_manager.h"
 #include "pool_manager.h"
+#include "snapshot_manager.h"
 #include "telemetry.h"
 #include "version.h"
 #include "vmm_manager.h"
@@ -46,6 +48,14 @@ static void apply_paths_to_env(const engine_config_t* c) {
     setenv("SANDBOX_JAILER_UID", buf, 1);
     snprintf(buf, sizeof(buf), "%d", c->jailer_gid);
     setenv("SANDBOX_JAILER_GID", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", c->vsock_settle_ms);
+    setenv("SANDBOX_VSOCK_SETTLE_MS", buf, 1);
+    // §10.11 cgroups (consumed by vmm_manager/cgroup).
+    setenv("SANDBOX_CGROUP_ENABLE", c->cgroup_enable ? "1" : "0", 1);
+    snprintf(buf, sizeof(buf), "%d", c->cgroup_slack_mib);
+    setenv("SANDBOX_CGROUP_SLACK_MIB", buf, 1);
+    if (c->cgroup_cpu_max[0])
+        setenv("SANDBOX_CGROUP_CPU_MAX", c->cgroup_cpu_max, 1);
 }
 
 static const char* effective_root(const char* cfg_val, const char* env_name,
@@ -132,6 +142,14 @@ static int validate_config(const engine_config_t* c, const char* config_file) {
         printf("  jail root:     %s  ok\n", jail_root);
     } else {
         printf("  jail root:     %s  (will be created)\n", jail_root);
+    }
+
+    // §10.10: hash-check the snapshot files themselves, not just the manifest.
+    if (snapshot_verify(c->template_name) < 0) {
+        printf("  integrity:     FAIL (snapshot hash mismatch)\n");
+        ok = 0;
+    } else {
+        printf("  integrity:     ok (memory.snap + vmstate hashes match)\n");
     }
 
     printf("result: %s\n", ok ? "OK" : "FAILED");
@@ -245,6 +263,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    apply_paths_to_env(&cfg);
     if (do_validate) return validate_config(&cfg, config_file);
 
     if (cfg.pool_size <= 0 || cfg.pool_size > POOL_MAX_SIZE) {
@@ -259,7 +278,6 @@ int main(int argc, char** argv) {
     if (cfg.max_queue_depth > POOL_MAX_QUEUE_DEPTH)
         cfg.max_queue_depth = POOL_MAX_QUEUE_DEPTH;
 
-    apply_paths_to_env(&cfg);
 
     ensure_parent_dir(cfg.socket_path);
     ensure_parent_dir(cfg.broker_control_socket);
@@ -274,6 +292,9 @@ int main(int argc, char** argv) {
                 strerror(errno));
         // Non-fatal: a restore that needs the tap will fail per-VM.
     }
+
+    // §10.11: set up the per-VM cgroup hierarchy (best-effort).
+    cgroup_init();
 
     // Phase 10.4: prevent the daemon (and every forked jailer) from ever
     // gaining privileges via execve of setuid/file-cap binaries. Capabilities
@@ -297,6 +318,8 @@ int main(int argc, char** argv) {
     ipc_server_set_allowed_services(cfg.allowed_services);
     ipc_server_set_allowed_uids(cfg.allowed_uids);
     ipc_server_set_default_pool_wait_ms((uint32_t)cfg.pool_wait_timeout_ms);
+    ipc_server_set_create_limits(cfg.create_workers, cfg.max_creates_per_session,
+                                 cfg.max_creates_per_uid);
     pool_manager_set_live(&pool);
     if (ipc_server_start_broker_control(cfg.broker_control_socket) < 0) {
         fprintf(stderr, "[sandboxd] broker-control start failed\n");

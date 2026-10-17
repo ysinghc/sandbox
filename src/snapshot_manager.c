@@ -6,6 +6,7 @@
 
 #include "snapshot_manager.h"
 #include "pool_manager.h"
+#include "sha256.h"
 #include "vmm_manager.h"
 #include "jailer.h"
 
@@ -72,6 +73,7 @@ snap_manifest_t* build_manifest(const char* memory_path) {
     if (!m) { munmap(base, mem_size); return NULL; }
     m->magic = SNAP_MAGIC;
     m->version = 0;  // caller stamps read_current_version() + 1
+    m->header_size = (uint32_t)sizeof(snap_manifest_t);
     m->guest_mem_size = mem_size;
     m->page_size = SNAP_PAGE_SIZE;
     m->page_count = pages;
@@ -88,6 +90,11 @@ snap_manifest_t* build_manifest(const char* memory_path) {
         }
     }
     munmap(base, mem_size);
+    // §10.10: bind the page bitmap to the exact bytes it describes.
+    if (sha256_file(memory_path, m->memory_sha256) < 0) {
+        free(m);
+        return NULL;
+    }
     return m;
 }
 
@@ -125,6 +132,7 @@ int read_manifest(const char* template_name, snap_manifest_t** out_manifest) {
     snap_manifest_t hdr;
     ssize_t n = read(fd, &hdr, sizeof(hdr));
     if (n != (ssize_t)sizeof(hdr) || hdr.magic != SNAP_MAGIC ||
+        hdr.header_size != (uint32_t)sizeof(snap_manifest_t) ||
         hdr.page_size != SNAP_PAGE_SIZE || hdr.page_count == 0) {
         close(fd);
         errno = EINVAL;
@@ -178,6 +186,67 @@ uint32_t read_manifest_version(const char* template_name) {
     char path[PATH_MAX];
     snprintf(path, sizeof(path), "%s/%s/manifest.bin", snapshot_root(), template_name);
     return read_version_at(path);
+}
+
+// §10.10: compare the manifest's recorded hashes against the files on disk.
+static int verify_files(const char* template_name, const snap_manifest_t* m) {
+    char path[PATH_MAX];
+    uint8_t digest[32];
+    char got[65], want[65];
+
+    snprintf(path, sizeof(path), "%s/%s/memory.snap", snapshot_root(), template_name);
+    if (sha256_file(path, digest) < 0) {
+        fprintf(stderr, "[snapshot] verify %s: cannot read %s\n", template_name, path);
+        return -1;
+    }
+    if (memcmp(digest, m->memory_sha256, 32) != 0) {
+        sha256_hex(digest, got);
+        sha256_hex(m->memory_sha256, want);
+        fprintf(stderr,
+                "[snapshot] verify %s: memory.snap hash mismatch (got %s want %s)\n",
+                template_name, got, want);
+        return -1;
+    }
+
+    snprintf(path, sizeof(path), "%s/%s/vmstate", snapshot_root(), template_name);
+    if (sha256_file(path, digest) < 0) {
+        fprintf(stderr, "[snapshot] verify %s: cannot read %s\n", template_name, path);
+        return -1;
+    }
+    if (memcmp(digest, m->vmstate_sha256, 32) != 0) {
+        sha256_hex(digest, got);
+        sha256_hex(m->vmstate_sha256, want);
+        fprintf(stderr,
+                "[snapshot] verify %s: vmstate hash mismatch (got %s want %s)\n",
+                template_name, got, want);
+        return -1;
+    }
+    return 0;
+}
+
+int snapshot_verify_manifest(const char* template_name,
+                             const snap_manifest_t* manifest) {
+    if (!template_name || !manifest) { errno = EINVAL; return -1; }
+    const char* e = getenv("SANDBOX_VERIFY_SNAPSHOT");
+    if (e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0)) return 0;
+    return verify_files(template_name, manifest);
+}
+
+int snapshot_verify(const char* template_name) {
+    if (!template_name || !*template_name) { errno = EINVAL; return -1; }
+    snap_manifest_t* m = NULL;
+    if (read_manifest(template_name, &m) < 0) {
+        fprintf(stderr, "[snapshot] verify %s: manifest missing/corrupt\n",
+                template_name);
+        return -1;
+    }
+    int rc = verify_files(template_name, m);
+    if (rc == 0) {
+        fprintf(stderr, "[snapshot] verify %s: OK (v%u, %u pages)\n",
+                template_name, m->version, m->page_count);
+    }
+    free(m);
+    return rc;
 }
 
 // Version check (§5.6): adopt on first sight, drain + adopt on change.
@@ -322,6 +391,15 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     snap_manifest_t* manifest = build_manifest(memory_path);
     if (!manifest) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
     manifest->version = read_manifest_version(template_name) + 1;
+    // §10.10: bind the captured vmstate too (memory.snap was hashed in
+    // build_manifest). A truncated/corrupt capture is refused at restore.
+    if (sha256_file(vmstate_path, manifest->vmstate_sha256) < 0) {
+        fprintf(stderr, "[snapshot] failed to hash %s\n", vmstate_path);
+        free(manifest);
+        vmm_destroy(vm);
+        rm_rf(temp_dir);
+        return -1;
+    }
 
     char manifest_path[PATH_MAX];
     snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.bin", temp_dir);

@@ -51,6 +51,14 @@ int main(void) {
         "jailer_gid = 5678\n"
         "allowed_uids = 0, 1000\n"
         "allowed_services = a.example, b.example\n"
+        "vsock_settle_ms = 1500\n"
+        "create_workers = 2\n"
+        "max_creates_per_session = 5\n"
+        "max_creates_per_uid = 9\n"
+        "[cgroup]\n"
+        "cgroup_enable = 0\n"
+        "cgroup_slack_mib = 12\n"
+        "cgroup_cpu_max = 50000 100000\n"
         "[pool]\n"
         "target_size = 7\n"
         "max_queue_depth = 11\n"
@@ -76,6 +84,13 @@ int main(void) {
     CHECK(c.max_queue_depth == 11, "file max_queue_depth");
     CHECK(c.pool_wait_timeout_ms == 250, "file pool_wait_timeout_ms");
     CHECK(c.jailer_uid == 1234 && c.jailer_gid == 5678, "file jailer ids");
+    CHECK(c.vsock_settle_ms == 1500, "file vsock_settle_ms");
+    CHECK(c.create_workers == 2, "file create_workers");
+    CHECK(c.max_creates_per_session == 5, "file max_creates_per_session");
+    CHECK(c.max_creates_per_uid == 9, "file max_creates_per_uid");
+    CHECK(c.cgroup_enable == 0, "file cgroup_enable");
+    CHECK(c.cgroup_slack_mib == 12, "file cgroup_slack_mib");
+    CHECK_STR(c.cgroup_cpu_max, "50000 100000", "file cgroup_cpu_max");
     CHECK_STR(c.allowed_uids, "0, 1000", "file allowed_uids");
     CHECK_STR(c.allowed_services, "a.example, b.example", "file allowed_services");
     CHECK_STR(c.jail_root, "/var/j", "file jail_root");
@@ -93,6 +108,13 @@ int main(void) {
     CHECK(c.max_queue_depth == 50, "packaged max_queue_depth");
     CHECK(c.pool_wait_timeout_ms == 500, "packaged pool_wait_timeout_ms");
     CHECK(c.jailer_uid == 65534 && c.jailer_gid == 65534, "packaged jailer ids");
+    CHECK(c.vsock_settle_ms == 1000, "packaged vsock_settle_ms");
+    CHECK(c.create_workers == 4, "packaged create_workers");
+    CHECK(c.max_creates_per_session == 16, "packaged max_creates_per_session");
+    CHECK(c.max_creates_per_uid == 64, "packaged max_creates_per_uid");
+    CHECK(c.cgroup_enable == 1, "packaged cgroup_enable");
+    CHECK(c.cgroup_slack_mib == 64, "packaged cgroup_slack_mib");
+    CHECK_STR(c.cgroup_cpu_max, "max", "packaged cgroup_cpu_max");
     CHECK_STR(c.jail_root, "/var/lib/sandbox-engine/jail", "packaged jail_root");
     CHECK_STR(c.snapshot_root, "/var/lib/sandbox-engine/snapshots",
               "packaged snapshot_root");
