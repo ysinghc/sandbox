@@ -1,0 +1,72 @@
+name: Release
+
+# Builds a release tarball and publishes it as a GitHub Release.
+#   - Push a tag like v0.12.0 to trigger automatically, or
+#   - run this workflow manually and pass an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build (e.g. v0.12.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libprotobuf-dev protobuf-compiler libprotoc-dev \
+            libseccomp-dev libcurl4-openssl-dev libnftables-dev libsystemd-dev
+
+      - name: Configure
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSANDBOX_VERSION="${TAG#v}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Smoke test (unprivileged subset)
+        run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
+      - name: Stage install
+        run: DESTDIR="$PWD/stage" cmake --install build --prefix /usr/local
+
+      - name: Package tarball
+        id: pkg
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          ARCH="$(uname -m)"
+          TARBALL="sandbox-engine-${VER}-linux-${ARCH}.tar.gz"
+          # The staged tree mirrors the filesystem (usr/local, var/lib, ...), so
+          # it extracts over / for a default install.
+          tar -C stage -czf "$TARBALL" .
+          sha256sum "$TARBALL" > "$TARBALL.sha256"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+          echo "Packaged $TARBALL"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          name: Sandbox Engine ${{ github.event.inputs.tag || github.ref_name }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.tarball }}.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

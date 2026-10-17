@@ -175,6 +175,13 @@ install(FILES config/credentials.conf.example DESTINATION ${SANDBOX_ETC_DIR})
 install(FILES systemd/sandboxd.service
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
 
+# Documentation and license.
+install(FILES README.md LICENSE CHANGELOG.md CONTRIBUTING.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(DIRECTORY docs/ DESTINATION ${CMAKE_INSTALL_DOCDIR}/docs
+        FILES_MATCHING PATTERN "*.md")
+install(FILES "SYSTEM DESIGN.md" DESTINATION ${CMAKE_INSTALL_DOCDIR})
+
 # Tests
 enable_testing()
 add_subdirectory(tests)
