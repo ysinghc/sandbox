@@ -144,6 +144,12 @@ add_executable(sandbox-cli
 target_include_directories(sandbox-cli PRIVATE include)
 target_link_libraries(sandbox-cli sandbox++)
 
+# Benchmark client (bench/). A real-VM latency/throughput driver used by
+# scripts/bench.sh; build it with the normal tree.
+add_executable(bench_client bench/bench_client.c)
+target_include_directories(bench_client PRIVATE include)
+target_link_libraries(bench_client sandbox)
+
 # --- Installation (§10.2/§10.3) ---
 include(GNUInstallDirs)
 
