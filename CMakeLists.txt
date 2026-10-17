@@ -8,6 +8,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_C_FLAGS_DEBUG "-g -O0 -DDEBUG")
 set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
+# Single version string for --version output and packaging (include/version.h
+# carries the same fallback for non-CMake builds).
+set(SANDBOX_VERSION "0.10.0" CACHE STRING "Engine version")
+add_compile_definitions(SANDBOX_VERSION="${SANDBOX_VERSION}")
+
 # Phase 1: ThreadSanitizer variant for pool concurrency verification.
 # Configure a separate dir with -DSANDBOX_TSAN=ON; default build unaffected.
 option(SANDBOX_TSAN "Build with ThreadSanitizer (pool concurrency verification)" OFF)
@@ -23,6 +28,10 @@ find_package(Protobuf REQUIRED MODULE)
 find_library(SECCOMP_LIB seccomp REQUIRED)
 # Phase 7: credential broker proxies upstream calls over HTTPS via libcurl.
 find_package(CURL REQUIRED)
+# Phase 10.5: run nftables rules via libnftables (no shell) when available;
+# network_manager.c falls back to system() otherwise.
+find_path(NFTABLES_INCLUDE_DIR nftables/libnftables.h)
+find_library(NFTABLES_LIB nftables)
 
 # Explicitly use system protobuf libraries
 set(Protobuf_LIBRARIES protobuf)
@@ -55,6 +64,16 @@ add_library(sandbox SHARED
 )
 target_include_directories(sandbox PUBLIC include ${CMAKE_CURRENT_BINARY_DIR} ${Protobuf_INCLUDE_DIRS})
 target_link_libraries(sandbox ${SECCOMP_LIB} ${Protobuf_LIBRARIES} pthread)
+
+# Phase 10.5: prefer the libnftables API over shelling out to `nft`.
+if(NFTABLES_INCLUDE_DIR AND NFTABLES_LIB)
+    target_compile_definitions(sandbox PRIVATE SANDBOX_HAVE_LIBNFTABLES=1)
+    target_include_directories(sandbox PRIVATE ${NFTABLES_INCLUDE_DIR})
+    target_link_libraries(sandbox ${NFTABLES_LIB})
+    message(STATUS "libnftables found: ${NFTABLES_LIB}")
+else()
+    message(WARNING "libnftables not found: nftables rules will use system()")
+endif()
 
 # Set rpath: at build time libsandbox.so is in build-vm/, install puts it in lib/
 set_target_properties(sandbox PROPERTIES

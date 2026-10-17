@@ -23,6 +23,10 @@ void ipc_server_set_pool(pool_manager_t* pool);
 void ipc_server_set_template(const char* template_name);
 void ipc_server_set_allowed_services(const char* csv);
 
+// Phase 10.1: comma-separated allowlist of peer uids permitted to connect
+// (SO_PEERCRED). NULL/empty accepts any uid (logged as a warning at startup).
+void ipc_server_set_allowed_uids(const char* csv);
+
 // Engine-side half of §5.8: the credential broker validates session tokens
 // over broker-control.sock. Runs in its own thread.
 int ipc_server_start_broker_control(const char* socket_path);

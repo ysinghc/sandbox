@@ -7,15 +7,32 @@ Type=simple
 ExecStart=/usr/local/bin/sandboxd
 Restart=on-failure
 RestartSec=5s
+StandardError=journal
 
-# Security hardening
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT
-NoNewPrivileges=false
+# Security hardening (Phase 10.4). The daemon runs as root by design (it must
+# build taps, device nodes, and jailed Firecracker processes per VM at runtime),
+# but it sets PR_SET_NO_NEW_PRIVS in-process and never needs to gain privileges.
+NoNewPrivileges=true
+
+# Keep only the capabilities the runtime actually uses, and drop the bounding set
+# around them. All of these are required: SETPCAP for the jailer's bounding-set
+# drop, NET_ADMIN for the per-VM tap, MKNOD/CHOWN for jail device nodes,
+# SYS_ADMIN/SYS_CHROOT/SETUID/SETGID for chroot+uid drop, SYS_PTRACE so the
+# jailer can raise Firecracker's ambient UFFD cap, DAC_OVERRIDE/FOWNER for
+# root-owned jail paths, KILL for reclaiming VMMs.
+CapabilityBoundingSet=CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT \
+    CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SYS_PTRACE \
+    CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/sandbox-engine /var/run/sandbox-engine
+
+# Resource limits (Phase 11). The pool holds a bounded number of VMs; give the
+# daemon room for pool threads, uffd threads and client fds.
+LimitNOFILE=65536
+TasksMax=512
 
 [Install]
 WantedBy=multi-user.target

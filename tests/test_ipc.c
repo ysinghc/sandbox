@@ -90,6 +90,41 @@ int main(void) {
 
     CHECK(ipc_server_start_broker_control(g_bc_sock) == 0, "broker-control start");
 
+    sandbox_spec_t spec;
+    memset(&spec, 0, sizeof(spec));
+    spec.memory_mib = 128;
+    spec.vcpu_count = 1;
+    spec.template_name = "e2e";
+    spec.pool_wait_ms = 60000;
+    const char* envp[] = { "MYKEY=myvalue", "SANDBOX_MODE=test", NULL };
+    spec.env_vars = envp;
+
+    // --- Phase 10.1: SO_PEERCRED allowlist. With only an impossible uid
+    // allowed, a root (uid 0) client must be rejected. ---
+    ipc_server_set_allowed_uids("4294967294");  // any uid but 0
+    {
+        pthread_t ta;
+        if (pthread_create(&ta, NULL, server_main, NULL) != 0) {
+            fprintf(stderr, "FAIL: auth server thread\n");
+            pool_manager_destroy(&g_pool);
+            return 1;
+        }
+        int rejected = 0;
+        sandbox_error_t rca = connect_retry(g_engine_sock, 250);
+        if (rca != SANDBOX_OK) {
+            rejected = 1;  // refused before we could even talk
+        } else {
+            sandbox_handle_t* ha = NULL;
+            if (sandbox_create(&spec, &ha) != SANDBOX_OK) rejected = 1;
+            else sandbox_destroy(ha);
+        }
+        CHECK(rejected, "peercred: disallowed uid rejected");
+        sandbox_cleanup();
+        ipc_server_request_stop();  // keep broker-control alive
+        pthread_join(ta, NULL);
+    }
+    ipc_server_set_allowed_uids("");  // default (any) for the rest of the run
+
     pthread_t th;
     if (pthread_create(&th, NULL, server_main, NULL) != 0) {
         fprintf(stderr, "FAIL: server thread\n");
@@ -101,14 +136,6 @@ int main(void) {
     CHECK(rc == SANDBOX_OK, "client connect");
 
     sandbox_handle_t* h = NULL;
-    sandbox_spec_t spec;
-    memset(&spec, 0, sizeof(spec));
-    spec.memory_mib = 128;
-    spec.vcpu_count = 1;
-    spec.template_name = "e2e";
-    spec.pool_wait_ms = 60000;
-    const char* envp[] = { "MYKEY=myvalue", "SANDBOX_MODE=test", NULL };
-    spec.env_vars = envp;
 
     if (rc == SANDBOX_OK) {
         rc = sandbox_create(&spec, &h);
@@ -124,7 +151,7 @@ int main(void) {
         vm_handle_t* hvm = lifecycle_get(st.sandbox_id);
         int seen = 0;
         for (int i = 0; i < 300; i++) {
-            if (serial_has(hvm, "MYKEY=myvalue")) { seen = 1; break; }
+            if (serial_has(hvm, "MYKEY")) { seen = 1; break; }
             usleep(10000);
         }
         if (!seen && hvm) {
@@ -141,6 +168,9 @@ int main(void) {
         }
         CHECK(seen, "env: injected into guest");
         CHECK(serial_has(hvm, "SANDBOX-ENV-BEGIN"), "env: guest marker");
+        // Phase 10.2: the guest must not echo env *values* to the persistent
+        // serial console (only key names).
+        CHECK(!serial_has(hvm, "myvalue"), "env: value redacted in serial");
 
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,

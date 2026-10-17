@@ -1,5 +1,7 @@
 // Network Manager (§5.7): tap devices plus nftables rules forcing guest
-// traffic through the broker. nftables via system() per LLD (libnftables TODO).
+// traffic through the broker. Phase 10.5: rules and cleanup run through
+// libnftables (no shell). A system() fallback is kept for builds without the
+// library. Names flowing in here are validated at the IPC boundary.
 
 #include "network_manager.h"
 
@@ -17,6 +19,10 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifdef SANDBOX_HAVE_LIBNFTABLES
+#include <nftables/libnftables.h>
+#endif
 
 #define BROKER_PORT 8080
 
@@ -41,23 +47,49 @@ int network_subnet_addrs(const char* vm_id, uint32_t* out_host_ip,
     return 0;
 }
 
-static int run_cmd(const char* cmd) {
+// Execute one nft command (no "nft" prefix). When out is non-NULL the command's
+// stdout is captured (used to list rules); otherwise output is discarded.
+// Returns 0 iff the command succeeded.
+static int nft_exec(const char* cmd, char* out, size_t outlen) {
+#ifdef SANDBOX_HAVE_LIBNFTABLES
+    struct nft_ctx* ctx = nft_ctx_new(NFT_CTX_DEFAULT);
+    if (!ctx) return -1;
+    if (out && outlen) {
+        nft_ctx_buffer_output(ctx);
+        nft_ctx_output_set_flags(ctx, NFT_CTX_OUTPUT_HANDLE);
+    }
+    int rc = nft_run_cmd_from_buffer(ctx, cmd);
+    if (out && outlen) {
+        const char* o = nft_ctx_get_output_buffer(ctx);
+        snprintf(out, outlen, "%s", o ? o : "");
+        nft_ctx_unbuffer_output(ctx);
+    }
+    nft_ctx_free(ctx);
+    return rc;
+#else
+    if (out && outlen) {
+        FILE* fp = popen(cmd, "r");
+        if (!fp) return -1;
+        size_t n = fread(out, 1, outlen - 1, fp);
+        out[n] = '\0';
+        return (pclose(fp) == 0) ? 0 : -1;
+    }
     int rc = system(cmd);
     return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
+#endif
 }
 
 // LLD assumes the chains exist; create table + forward/input chains on use.
 static int ensure_chain(const char* chain, const char* hook) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft list chain ip sandbox_policy %s >/dev/null 2>&1",
-             chain);
-    if (run_cmd(cmd) == 0) return 0;
-    run_cmd("nft add table ip sandbox_policy >/dev/null 2>&1");
+    snprintf(cmd, sizeof(cmd), "list chain ip sandbox_policy %s", chain);
+    if (nft_exec(cmd, NULL, 0) == 0) return 0;
+    nft_exec("add table ip sandbox_policy", NULL, 0);
     snprintf(cmd, sizeof(cmd),
-             "nft add chain ip sandbox_policy %s "
-             "'{ type filter hook %s priority 0; policy accept; }'",
+             "add chain ip sandbox_policy %s "
+             "{ type filter hook %s priority 0; policy accept; }",
              chain, hook);
-    return run_cmd(cmd);
+    return nft_exec(cmd, NULL, 0);
 }
 
 static int ensure_policy_chains(void) {
@@ -179,14 +211,14 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
     const char* chains[2] = { "forward", "input" };
     for (int c = 0; c < 2; c++) {
         snprintf(nft_cmd, sizeof(nft_cmd),
-            "nft add rule ip sandbox_policy %s "
+            "add rule ip sandbox_policy %s "
             "iifname %s ip daddr %s tcp dport %d accept",
             chains[c], tap_name, host_ip_s, BROKER_PORT);
-        if (run_cmd(nft_cmd) < 0) goto fail_tap;
+        if (nft_exec(nft_cmd, NULL, 0) != 0) goto fail_tap;
         snprintf(nft_cmd, sizeof(nft_cmd),
-            "nft add rule ip sandbox_policy %s iifname %s drop",
+            "add rule ip sandbox_policy %s iifname %s drop",
             chains[c], tap_name);
-        if (run_cmd(nft_cmd) < 0) goto fail_tap;
+        if (nft_exec(nft_cmd, NULL, 0) != 0) goto fail_tap;
     }
 
     // 5. Return guest IP + tap name (no fd: Firecracker owns the device)
@@ -204,26 +236,31 @@ fail_tap:
 // cleanup time, so no handle tracking is needed in vm_network_t).
 static void delete_tap_rules(const char* chain, const char* tap_name) {
     char cmd[256];
-    snprintf(cmd, sizeof(cmd), "nft -a list chain ip sandbox_policy %s 2>/dev/null",
-             chain);
-    FILE* fp = popen(cmd, "r");
-    if (!fp) return;
-    char line[1024];
+    snprintf(cmd, sizeof(cmd), "list chain ip sandbox_policy %s", chain);
+    size_t cap = 65536;
+    char* out = malloc(cap);
+    if (!out) return;
+    out[0] = '\0';
+    if (nft_exec(cmd, out, cap) != 0) {
+        free(out);
+        return;
+    }
     long handles[64];
     int n = 0;
     char match[IFNAMSIZ + 16];
     snprintf(match, sizeof(match), "iifname \"%s\"", tap_name);
-    while (fgets(line, sizeof(line), fp) && n < 64) {
+    for (char* line = strtok(out, "\n"); line && n < 64;
+         line = strtok(NULL, "\n")) {
         if (!strstr(line, match)) continue;
         char* h = strstr(line, "# handle ");
         if (h) handles[n++] = atol(h + strlen("# handle "));
     }
-    pclose(fp);
+    free(out);
     for (int i = 0; i < n; i++) {
         snprintf(cmd, sizeof(cmd),
-                 "nft delete rule ip sandbox_policy %s handle %ld >/dev/null 2>&1",
+                 "delete rule ip sandbox_policy %s handle %ld",
                  chain, handles[i]);
-        run_cmd(cmd);
+        nft_exec(cmd, NULL, 0);
     }
 }
 

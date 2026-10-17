@@ -369,3 +369,58 @@ crash detection; Phase 9b covers per-VM environment injection (§15.11).
 - `ctest` 10/10 (root, seccomp on, MMIO); `test_ipc` 30/30 consecutive with
   zero injection failures and zero slow runs after the 1 s settle (before it:
   ~10–20% failed or burned the full 45 s retry budget).
+
+## Phase 10 — Security Hardening (§12, §15.12)
+
+Plan reference: production-readiness plan items 10.1–10.5.
+
+- **10.1 IPC SO_PEERCRED allowlist.** `make_seqpacket_listener` still `chmod
+  0660`s, but `accept_clients` now reads `SO_PEERCRED` on every accepted fd and
+  closes any peer whose uid is not in `allowed_uids` (logged
+  `peer_rejected`); the peer uid is stored on `session_t`. New
+  `ipc_server_set_allowed_uids()` (CSV) + `allowed_uids` config key / env
+  `SANDBOX_ALLOWED_UIDS` / `--allowed-uids`. Empty list = previous behaviour
+  (any uid) with a startup warning. **Deviation from the plan:** the test runs
+  the whole engine in-process as root, so the peer is always uid 0; the
+  rejection case therefore configures an allowlist that excludes 0 rather than
+  `seteuid`-ing a child.
+- **10.2 Secret hygiene.** `scripts/sandbox-agent.c` no longer echoes env
+  *values* to the serial console — it prints only key names, so
+  `serial.log`/`boot-serial.log` never retain injected secrets. The guest env
+  file `/tmp/sandbox-env` is now `0600` (was `0644`) and the host-side
+  `serial.log` is opened `0600` (was `0644`). `test_ipc` asserts `MYKEY` is
+  present and `myvalue` is absent.
+- **10.3 Jail dir 0700.** Per-VM jail roots are created `0700` (owner = jailed
+  uid) so `<jail>/vsock.sock` is reachable only by root and the VMM. vsock
+  HMAC was judged unnecessary for the single-tenant V1 (documented residual).
+- **10.4 `PR_SET_NO_NEW_PRIVS` + ambient CAP_SYS_PTRACE.** The daemon calls
+  `prctl(PR_SET_NO_NEW_PRIVS, 1)` after `network_manager_init()` and before the
+  pool spawns, so every forked jailer inherits it. **Important deviation from
+  the plan's "drop the ambient capability set to none":** the daemon must keep
+  `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_MKNOD`/`CAP_CHOWN`/`CAP_SETUID`/
+  `CAP_SETGID`/`CAP_SYS_CHROOT` because per-VM tap/device/chroot setup runs on
+  the event-loop threads; a blanket drop would break provisioning. Phase B
+  (privileged setup helper + unprivileged loop) is deferred to V2. The real
+  blocker surfaced here: `no_new_privs` makes `execve` **ignore file caps**, so
+  the old `security.capability` xattr on `/firecracker` would have silently
+  cost Firecracker `CAP_SYS_PTRACE` (and UFFD creation, since
+  `unprivileged_userfaultfd=0`). Replaced with an **ambient** capability:
+  `PR_SET_KEEPCAPS` before `setuid`, then `raise_ambient_sys_ptrace()` re-adds
+  `CAP_SYS_PTRACE` to permitted/effective/inheritable and raises it ambient.
+  Verified on the Pi with a throwaway program: at uid 65534 after exec, `CapAmb`
+  = effective = permitted = `0x80000`. This also drops the daemon's need for
+  `CAP_SETFCAP`.
+- **10.5 nftables without a shell.** `network_manager.c` runs every nft command
+  (chain check/create, accept/drop rules, `list chain` for handle discovery,
+  `delete rule`) through **libnftables** (`nft_ctx_new`/`nft_run_cmd_from_buffer`
+  with `NFT_CTX_OUTPUT_HANDLE`), replacing all `system()`/`popen()` shell-outs.
+  A `system()`/`popen()` path remains behind `#ifdef SANDBOX_HAVE_LIBNFTABLES`
+  for builds without the library; CMake `find_library(nftables)` auto-detects
+  it (installed `libnftables-dev` on the Pi). Defense in depth:
+  `handle_create` validates `template_name` as `[A-Za-z0-9_-]{1,20}` (a name
+  flows into tap names).
+- **Build.** CMake gained `SANDBOX_VERSION` (`add_compile_definitions`) and the
+  libnftables detection block; `include/version.h` carries the fallback.
+- **Tests.** `test_ipc` gained a Phase 10.1 case (allowlist excluding uid 0 ⇒
+  create rejected) and a redaction case; full `ctest` 10/10 as root, including
+  the libnftables network tests.

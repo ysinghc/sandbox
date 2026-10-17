@@ -1319,8 +1319,11 @@ sandbox_vmm_crashes_total       # VMM processes killed by seccomp or crashed
 - [ ] Seccomp filter tested against Firecracker syscall trace
 - [ ] Jailer chroot verified (no escape via /proc/self/root)
 - [ ] Credential config file permissions (chmod 600, root-owned)
-- [ ] Engine daemon runs with `PR_SET_NO_NEW_PRIVS` after setup
+- [x] Engine daemon runs with `PR_SET_NO_NEW_PRIVS` after setup — Phase 10.4,
+      see §15.12; CAP_SYS_PTRACE delivered as an ambient cap (§15.3)
 - [ ] Network policy tested (guest cannot reach internet directly)
+- [x] nftables rules applied without a shell (libnftables) — Phase 10.5, §15.12
+- [x] Engine socket authenticates peers (SO_PEERCRED allowlist) — Phase 10.1, §15.9
 - [ ] Broker TLS cert validation enabled (HTTPS to upstream)
 - [ ] Session token entropy (getrandom, not /dev/urandom)
 
@@ -1412,16 +1415,26 @@ authoritative.
 - `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` (required by the
   later setuid/setgid per LLD order) plus `CAP_SYS_PTRACE` (Firecracker UFFD
   creation gate where `unprivileged_userfaultfd=0`; `ptrace()` itself stays
-  seccomp-blocked). Bounding-set drops run BEFORE the `capset` clear, and a
-  `CAP_SYS_PTRACE` file-cap (`security.capability` xattr) is written onto the
-  jail `/firecracker` copy so it survives the uid transition + exec.
+  seccomp-blocked). Bounding-set drops run BEFORE the `capset` clear.
+- **CAP_SYS_PTRACE delivery is now an *ambient* capability, not a file cap**
+  (Phase 10.4). `PR_SET_KEEPCAPS` is set before `setuid`, then after the uid
+  transition `raise_ambient_sys_ptrace()` re-adds `CAP_SYS_PTRACE` to the
+  permitted/effective/inheritable sets and raises it in the ambient set, so it
+  survives `execve` into Firecracker. This replaces the previous
+  `security.capability` xattr because `PR_SET_NO_NEW_PRIVS` silently drops file
+  caps at exec (the daemon now runs with no_new_privs — §15.12); ambient caps
+  are carried across exec under no_new_privs. It also removes the daemon's need
+  for `CAP_SETFCAP` and any dependence on a writable/capable jail fs.
+- The per-VM jail directory is created `0700` (owner = jailed uid) so the vsock
+  injection UDS underneath it is reachable only by root and the VMM (§15.12).
+- `serial.log` is opened `0600` (was `0644`) — it can carry guest console output.
 - Devices are fresh `mknod` + `chown` nodes (`/dev/kvm`, `/dev/net/tun`,
   optionally `/dev/userfaultfd`), NOT LLD bind-mounts (bind preserves
   root-only modes). `mount_jail_devices()` remains only for tests.
 - `spawn_jailed()` signature is extended vs LLD: `(jail_root, config, bin,
   argv, mount_devices, apply_seccomp, files{jail-bind kernel/rootfs/vmstate/
-  memory.snap/out_dir}, serial_log)` with child exit codes 1–15
-  (1=mkdir … 14=seccomp 15=execve). Serial log is opened pre-chroot, `dup2`'d
+  memory.snap/out_dir}, serial_log)` with child exit codes 1–16
+  (1=mkdir … 14=seccomp, 15=execve, 16=ambient-cap). Serial log is opened pre-chroot, `dup2`'d
   post-setuid. Firecracker is launched with `--no-seccomp` (own libseccomp
   filter applied by us) toggled by `SANDBOX_FC_SECCOMP`.
 - Jail contents additionally include `/vmlinux`, `/rootfs.ext4`, `/vmstate`,
@@ -1644,16 +1657,26 @@ authoritative.
 - **`env_vars` are injected into the restored guest** over a per-VM virtio-vsock
   channel (Phase 9b, §15.11). They still round-trip through the protobuf and the
   client API; injection is best-effort and never fails `Create`.
+- **Peer authentication (Phase 10.1):** the listener still `chmod 0660`s the
+  socket, but every accepted connection is additionally checked with
+  `SO_PEERCRED`; if `allowed_uids` is non-empty, any peer whose uid is not in
+  the list is closed immediately and a `peer_rejected` log is emitted. The
+  peer uid is stored on the session for future per-tenant quotas. An empty
+  allowlist preserves the old group-gated behaviour and logs a warning.
+  `CreateRequest.template_name` is validated to `[A-Za-z0-9_-]{1,20}` before it
+  can reach any path/tap name (Phase 10.5).
 - **Ownership of `g.tok_lock`:** the registry is read by the broker-control
   thread and written by the IPC thread; `token_lookup` copies service strings
   under the lock and the socket I/O happens outside it.
 - **Config:** flat `key = value` file (no hierarchy) with precedence
   CLI > env > file > defaults. Keys: `socket(_path)`, `broker_control_socket`,
   `template(_name)`, `pool_size`/`target_size`, `allowed_services`,
-  `metrics_port`. Env: `SANDBOX_ENGINE_SOCK`, `SANDBOX_BROKER_CONTROL`,
-  `SANDBOX_TEMPLATE`, `SANDBOX_POOL_SIZE`, `SANDBOX_ALLOWED_SERVICES`,
-  `SANDBOX_METRICS_PORT`, plus the pre-existing `SANDBOX_FC_*`, `FIRECRACKER_BIN`,
-  `SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAIL_ROOT`.
+  `allowed_uids`, `metrics_port`, `metrics_bind`. Env: `SANDBOX_ENGINE_SOCK`,
+  `SANDBOX_BROKER_CONTROL`, `SANDBOX_TEMPLATE`, `SANDBOX_POOL_SIZE`,
+  `SANDBOX_ALLOWED_SERVICES`, `SANDBOX_ALLOWED_UIDS`, `SANDBOX_METRICS_PORT`,
+  `SANDBOX_METRICS_BIND`, plus the pre-existing `SANDBOX_FC_*`,
+  `FIRECRACKER_BIN`, `SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAIL_ROOT`. `--version`
+  prints `SANDBOX_VERSION` (CMake var, fallback `include/version.h`).
 - **Observability (§11):** `telemetry_render()` emits the §11.1 metric names in
   Prometheus text; the daemon serves them on `127.0.0.1:<metrics_port>` only
   when `--metrics-port` is set (`telemetry_serve` in a detached thread).
@@ -1742,8 +1765,10 @@ authoritative.
   listener on **port 5001**, prints `SANDBOX-READY` (the template readiness
   marker), then busy-loops: it serves the host's connection and periodically
   prints `SANDBOX-TICK`. On a connection it reads to EOF, writes the payload to
-  `/tmp/sandbox-env`, and echoes a delimited
-  `SANDBOX-ENV-BEGIN`/`…`/`SANDBOX-ENV-END` block to the serial console.
+  `/tmp/sandbox-env` (**mode `0600`**, Phase 10.2), and prints a delimited
+  `SANDBOX-ENV-BEGIN`/…/`SANDBOX-ENV-END` block to the serial console that
+  contains **only the key names** — values are never echoed because the serial
+  log is persistent and may hold credentials (Phase 10.2).
 - **The agent, not a shell, owns the heartbeat loop.** After a UFFD restore the
   aarch64 arch timer does not re-arm on this host (§15.7), so the scheduler tick
   stops: a CPU-hogging shell loop would starve every other guest process and a
@@ -1795,7 +1820,38 @@ authoritative.
   `SANDBOX-AGENT-*`/`SANDBOX-READY` lines survive for inspection.
 - **Test coverage.** `tests/test_ipc.c`'s create carries
   `env_vars = {MYKEY=myvalue, SANDBOX_MODE=test}`; after `Create` it polls the
-  restored VM's `serial.log` (via `lifecycle_get`) for `MYKEY=myvalue` and the
-  `SANDBOX-ENV-BEGIN` marker. `test_vmm`'s restore case waits for a fresh
-  `SANDBOX-TICK`, which now proves the agent (and thus the device) is alive
-  post-restore.
+  restored VM's `serial.log` (via `lifecycle_get`) for the `MYKEY` key name and
+  the `SANDBOX-ENV-BEGIN` marker, and asserts the value `myvalue` is **absent**
+  (redaction). `test_vmm`'s restore case waits for a fresh `SANDBOX-TICK`, which
+  now proves the agent (and thus the device) is alive post-restore.
+
+### 15.12 Phase 10 — Security Hardening (§12)
+- **IPC peer authentication (§15.9).** New `ipc_server_set_allowed_uids()`
+  (config `allowed_uids` / env `SANDBOX_ALLOWED_UIDS` / `--allowed-uids`); an
+  empty list keeps the previous group-only gate and warns at startup.
+- **Input validation (Phase 10.5).** `template_name` is constrained to
+  `[A-Za-z0-9_-]{1,20}` at `handle_create` before it reaches tap/path names.
+  This complements replacing the `system()` nftables shell-outs.
+- **nftables via libnftables, not `system()`.** `network_manager.c` now runs
+  every rule/cleanup/`list` command through `libnftables`
+  (`nft_ctx_new`/`nft_run_cmd_from_buffer`, output captured with the
+  `NFT_CTX_OUTPUT_HANDLE` flag for `# handle` parsing). A `system()`/`popen()`
+  fallback remains behind `SANDBOX_HAVE_LIBNFTABLES` for builds without the
+  library; CMake auto-detects it. No shell is involved on the normal path, so a
+  malformed name cannot inject a command.
+- **`PR_SET_NO_NEW_PRIVS` in the daemon, ambient CAP_SYS_PTRACE in the jailer**
+  (§15.3). Set after `network_manager_init()` and before the pool spawns, so
+  every forked jailer inherits it. Because file caps are ignored under
+  no_new_privs, the jailer re-grants `CAP_SYS_PTRACE` as an ambient capability
+  after `setuid` (verified: `CapAmb`/effective/permitted = `0x80000` at uid
+  65534).
+- **Secret hygiene.** Guest agent echoes env **key names only** to serial;
+  `/tmp/sandbox-env` is `0600`; `serial.log` is opened `0600`; the jail dir is
+  `0700`.
+- **Deferred (§15.12 non-goals).** Privilege *separation* (a privileged setup
+  helper + unprivileged event loop) is not done: the daemon must keep
+  `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_MKNOD`/`CAP_CHOWN`/`CAP_SETUID`/
+  `CAP_SETGID`/`CAP_SYS_CHROOT` to create taps, device nodes and jailers at
+  runtime, so a blanket capability drop would break per-VM provisioning.
+  `no_new_privs` + uid allowlist + name validation + no-shell nftables are the
+  Phase-10 subset. vsock payload HMAC and per-tenant quotas remain V2.

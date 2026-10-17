@@ -10,6 +10,7 @@
 #include "network_manager.h"
 #include "pool_manager.h"
 #include "telemetry.h"
+#include "version.h"
 #include "vmm_manager.h"
 
 #include <errno.h>
@@ -22,6 +23,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -31,7 +33,9 @@ typedef struct {
     char template_name[128];
     int pool_size;
     char allowed_services[1024];
+    char allowed_uids[512];  // Phase 10.1: CSV of peer uids; empty = any
     int metrics_port;  // 0 = disabled
+    char metrics_bind[64];  // "" = disabled, else bind address
 } engine_config_t;
 
 static void config_defaults(engine_config_t* c) {
@@ -43,7 +47,9 @@ static void config_defaults(engine_config_t* c) {
     snprintf(c->template_name, sizeof(c->template_name), "python-agent");
     c->pool_size = 4;
     c->allowed_services[0] = '\0';
+    c->allowed_uids[0] = '\0';
     c->metrics_port = 0;
+    snprintf(c->metrics_bind, sizeof(c->metrics_bind), "127.0.0.1");
 }
 
 static void set_key(engine_config_t* c, const char* key, const char* val) {
@@ -62,6 +68,10 @@ static void set_key(engine_config_t* c, const char* key, const char* val) {
         c->pool_size = atoi(val);
     } else if (strcmp(key, "allowed_services") == 0) {
         snprintf(c->allowed_services, sizeof(c->allowed_services), "%s", val);
+    } else if (strcmp(key, "allowed_uids") == 0) {
+        snprintf(c->allowed_uids, sizeof(c->allowed_uids), "%s", val);
+    } else if (strcmp(key, "metrics_bind") == 0) {
+        snprintf(c->metrics_bind, sizeof(c->metrics_bind), "%s", val);
     } else if (strcmp(key, "metrics_port") == 0) {
         c->metrics_port = atoi(val);
     } else {
@@ -108,8 +118,12 @@ static void config_apply_env(engine_config_t* c) {
     if ((v = getenv("SANDBOX_POOL_SIZE")) && *v) set_key(c, "pool_size", v);
     if ((v = getenv("SANDBOX_ALLOWED_SERVICES")))
         set_key(c, "allowed_services", v);
+    if ((v = getenv("SANDBOX_ALLOWED_UIDS")))
+        set_key(c, "allowed_uids", v);
     if ((v = getenv("SANDBOX_METRICS_PORT")) && *v)
         set_key(c, "metrics_port", v);
+    if ((v = getenv("SANDBOX_METRICS_BIND")) && *v)
+        set_key(c, "metrics_bind", v);
 }
 
 static void ensure_parent_dir(const char* path) {
@@ -133,7 +147,7 @@ static void on_signal(int sig) {
     ipc_server_request_stop();  // async-signal-safe
 }
 
-static int start_metrics(int port) {
+static int start_metrics(const char* bind_addr, int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     int one = 1;
@@ -141,8 +155,13 @@ static int start_metrics(int port) {
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
-    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     sa.sin_port = htons((uint16_t)port);
+    if (!bind_addr || !*bind_addr || strcmp(bind_addr, "*") == 0) {
+        sa.sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, bind_addr, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
     if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0 || listen(fd, 16) < 0) {
         close(fd);
         return -1;
@@ -187,12 +206,21 @@ int main(int argc, char** argv) {
             set_key(&cfg, "pool_size", argv[++i]);
         else if ((strcmp(a, "--allowed-services") == 0) && v)
             set_key(&cfg, "allowed_services", argv[++i]);
+        else if ((strcmp(a, "--allowed-uids") == 0) && v)
+            set_key(&cfg, "allowed_uids", argv[++i]);
         else if ((strcmp(a, "--metrics-port") == 0) && v)
             set_key(&cfg, "metrics_port", argv[++i]);
+        else if ((strcmp(a, "--metrics-bind") == 0) && v)
+            set_key(&cfg, "metrics_bind", argv[++i]);
+        else if (strcmp(a, "--version") == 0) {
+            printf("sandboxd %s\n", SANDBOX_VERSION);
+            return 0;
+        }
         else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
             printf("usage: sandboxd [--config FILE] [--socket PATH] "
                    "[--broker-control PATH] [--template NAME] [--pool-size N] "
-                   "[--allowed-services CSV] [--metrics-port N]\n");
+                   "[--allowed-services CSV] [--allowed-uids CSV] "
+                   "[--metrics-port N] [--metrics-bind ADDR] [--version]\n");
             return 0;
         }
     }
@@ -220,6 +248,15 @@ int main(int argc, char** argv) {
         // Non-fatal: a restore that needs the tap will fail per-VM.
     }
 
+    // Phase 10.4: prevent the daemon (and every forked jailer) from ever
+    // gaining privileges via execve of setuid/file-cap binaries. Capabilities
+    // the daemon already holds (needed for mknod/chroot/tap/cgroup) are
+    // unaffected; Firecracker's CAP_SYS_PTRACE is delivered via ambient caps.
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
+        fprintf(stderr, "[sandboxd] PR_SET_NO_NEW_PRIVS failed: %s\n",
+                strerror(errno));
+    }
+
     pool_set_restore_source(cfg.template_name);
     pool_manager_t pool;
     if (pool_manager_init(&pool, cfg.pool_size) < 0) {
@@ -230,6 +267,7 @@ int main(int argc, char** argv) {
     ipc_server_set_pool(&pool);
     ipc_server_set_template(cfg.template_name);
     ipc_server_set_allowed_services(cfg.allowed_services);
+    ipc_server_set_allowed_uids(cfg.allowed_uids);
     pool_manager_set_live(&pool);
     if (ipc_server_start_broker_control(cfg.broker_control_socket) < 0) {
         fprintf(stderr, "[sandboxd] broker-control start failed\n");
@@ -238,14 +276,14 @@ int main(int argc, char** argv) {
     }
 
     if (cfg.metrics_port > 0) {
-        int mfd = start_metrics(cfg.metrics_port);
+        int mfd = start_metrics(cfg.metrics_bind, cfg.metrics_port);
         if (mfd >= 0) {
             pthread_t t;
             if (pthread_create(&t, NULL, metrics_thread,
                                (void*)(intptr_t)mfd) == 0) {
                 pthread_detach(t);
-                fprintf(stderr, "[sandboxd] metrics on 127.0.0.1:%d\n",
-                        cfg.metrics_port);
+                fprintf(stderr, "[sandboxd] metrics on %s:%d\n",
+                        cfg.metrics_bind, cfg.metrics_port);
             } else {
                 close(mfd);
             }

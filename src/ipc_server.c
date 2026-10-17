@@ -44,6 +44,7 @@
 #define IPC_MAX_SESSIONS 64
 #define IPC_MAX_OWNED 128
 #define IPC_MAX_PIDFDS 256
+#define IPC_MAX_ALLOWED_UIDS 64
 #define TOKEN_MAX_SERVICES 64
 
 // epoll data.u64 tag: low byte = kind, upper bits = payload (fd or table index).
@@ -51,6 +52,7 @@ enum { EP_LISTEN = 1, EP_WAKE = 2, EP_CLIENT = 3, EP_PIDFD = 4 };
 
 typedef struct {
     int fd;
+    uid_t uid;  // peer uid from SO_PEERCRED (Phase 10.1); for logging/quotas
     uint32_t owned[IPC_MAX_OWNED];
     int n_owned;
 } session_t;
@@ -67,6 +69,12 @@ static struct {
     char template_name[IPC_MAX_TEMPLATE];
     char* allowed[TOKEN_MAX_SERVICES + 1];
     int n_allowed;
+
+    // Phase 10.1: SO_PEERCRED allowlist. Empty => any peer uid is accepted
+    // (backward compatible; a warning is logged at startup). Non-empty => only
+    // the listed uids may connect.
+    uid_t allowed_uids[IPC_MAX_ALLOWED_UIDS];
+    int n_allowed_uids;
 
     int listen_fd;
     int epfd;
@@ -149,6 +157,35 @@ static uint64_t read_rss_mib(int pid) {
     }
     fclose(f);
     return kib / 1024;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 10.1: peer-uid allowlist (SO_PEERCRED). An empty list accepts any uid
+// (logged at startup); otherwise only listed uids may open a session.
+// ---------------------------------------------------------------------------
+
+static bool uid_allowed(uid_t uid) {
+    if (g.n_allowed_uids == 0) return true;
+    for (int i = 0; i < g.n_allowed_uids; i++) {
+        if (g.allowed_uids[i] == uid) return true;
+    }
+    return false;
+}
+
+// Phase 10.5: names that flow into tap device names or filesystem paths must be
+// constrained to [A-Za-z0-9_-] (max 20) so they cannot carry shell
+// metacharacters into network_manager's nft commands or leak path traversal.
+static bool valid_name(const char* s) {
+    if (!s || !*s) return false;
+    size_t n = 0;
+    for (; s[n]; n++) {
+        char c = s[n];
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_' || c == '-')) {
+            return false;
+        }
+    }
+    return n <= 20;
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +407,10 @@ static void reply_error(int fd, sandbox_error_t code, const char* msg) {
 }
 
 static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
+    if (req->template_name[0] && !valid_name(req->template_name)) {
+        reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "invalid template name");
+        return;
+    }
     if (g.template_name[0] && req->template_name[0] &&
         strcmp(req->template_name, g.template_name) != 0) {
         reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "unknown template");
@@ -585,12 +626,28 @@ static void accept_clients(int lfd) {
             if (errno == EINTR) continue;
             return;  // EAGAIN or real error
         }
+        // Phase 10.1: authenticate the peer before it can reach the pool.
+        struct ucred cred;
+        socklen_t clen = sizeof(cred);
+        if (getsockopt(cfd, SOL_SOCKET, SO_PEERCRED, &cred, &clen) < 0) {
+            close(cfd);
+            continue;
+        }
+        if (!uid_allowed(cred.uid)) {
+            fprintf(stderr,
+                    "{\"component\":\"ipc_server\",\"event\":\"peer_rejected\","
+                    "\"uid\":%d,\"pid\":%d}\n",
+                    (int)cred.uid, (int)cred.pid);
+            close(cfd);
+            continue;
+        }
         session_t* s = session_alloc(cfd);
         if (!s) {
             fprintf(stderr, "[ipc] session table full; rejecting client\n");
             close(cfd);
             continue;
         }
+        s->uid = cred.uid;
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
         ev.events = EPOLLIN;
@@ -635,6 +692,16 @@ int ipc_server_run(const char* socket_path) {
 
     fprintf(stderr, "[ipc] listening on %s (template %s)\n", socket_path,
             g.template_name[0] ? g.template_name : "<none>");
+    if (g.n_allowed_uids == 0) {
+        fprintf(stderr,
+                "{\"component\":\"ipc_server\",\"event\":\"peer_auth\","
+                "\"mode\":\"any_uid\",\"warning\":\"no allowed_uids configured\"}\n");
+    } else {
+        fprintf(stderr,
+                "{\"component\":\"ipc_server\",\"event\":\"peer_auth\","
+                "\"mode\":\"allowlist\",\"count\":%d}\n",
+                g.n_allowed_uids);
+    }
 
     uint8_t* payload = malloc(IPC_FRAME_MAX);
     if (!payload) {
@@ -712,6 +779,23 @@ void ipc_server_set_pool(pool_manager_t* pool) { g.pool = pool; }
 void ipc_server_set_template(const char* template_name) {
     snprintf(g.template_name, sizeof(g.template_name), "%s",
              template_name ? template_name : "");
+}
+
+void ipc_server_set_allowed_uids(const char* csv) {
+    g.n_allowed_uids = 0;
+    if (!csv || !*csv) return;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", csv);
+    char* save = NULL;
+    for (char* tok = strtok_r(tmp, ",", &save);
+         tok && g.n_allowed_uids < IPC_MAX_ALLOWED_UIDS;
+         tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') tok++;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (!*tok) continue;
+        g.allowed_uids[g.n_allowed_uids++] = (uid_t)strtoul(tok, NULL, 10);
+    }
 }
 
 void ipc_server_set_allowed_services(const char* csv) {

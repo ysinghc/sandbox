@@ -767,7 +767,9 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     // api.sock Firecracker cannot rebind (connect then fails ECONNREFUSED
     // forever, and wait_for_file passes on the stale file). Clear it first.
     jail_cleanup(jail_root);
-    if (mkdir_recursive(jail_root, 0755) < 0) {
+    // 0700: the jail holds the per-VM vsock UDS (env injection channel); only
+    // root and the jailed uid may traverse it (Phase 10.3).
+    if (mkdir_recursive(jail_root, 0700) < 0) {
         free(manifest);
         free(vm);
         return NULL;

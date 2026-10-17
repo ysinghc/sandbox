@@ -75,15 +75,29 @@ static void serve(int cfd) {
     close(cfd);
     buf[off] = '\0';
 
-    int fd = open(ENV_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(ENV_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {
         ssize_t w = write(fd, buf, off);
         (void)w;
         close(fd);
     }
+    // Log only the *key names* to the (persistent) serial console: values may
+    // be credentials and serial output is retained. The full payload still
+    // reaches the guest via ENV_FILE (0600).
     say("\nSANDBOX-ENV-BEGIN\n");
-    say(buf);
-    say("\nSANDBOX-ENV-END\n");
+    for (size_t i = 0; i < off;) {
+        size_t j = i;
+        while (j < off && buf[j] != '\n' && buf[j] != '\0') j++;
+        size_t eq = i;
+        while (eq < j && buf[eq] != '=') eq++;
+        if (eq > i) {
+            ssize_t w = write(g_console, buf + i, eq - i);
+            (void)w;
+        }
+        say("\n");
+        i = (j < off) ? j + 1 : off;
+    }
+    say("SANDBOX-ENV-END\n");
     got_env = 1;
 }
 

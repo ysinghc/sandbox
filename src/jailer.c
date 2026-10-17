@@ -17,7 +17,6 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
-#include <sys/xattr.h>
 #include <unistd.h>
 
 extern char** environ;
@@ -203,6 +202,26 @@ int drop_capabilities(void) {
     return 0;
 }
 
+// Re-grant CAP_SYS_PTRACE as an *ambient* capability after the uid transition.
+// Firecracker needs it to create UFFD objects (unprivileged_userfaultfd=0).
+// Ambient caps are carried across execve() even when PR_SET_NO_NEW_PRIVS is
+// set (unlike setuid/file caps, which no_new_privs silently ignores), so this
+// replaces the previous security.capability xattr delivery and lets the whole
+// daemon run with no_new_privs.
+static int raise_ambient_sys_ptrace(void) {
+    struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct data[2];
+    if (syscall(SYS_capget, &hdr, data) < 0) return -1;
+    data[0].effective |= (1u << CAP_SYS_PTRACE);
+    data[0].permitted |= (1u << CAP_SYS_PTRACE);
+    data[0].inheritable |= (1u << CAP_SYS_PTRACE);
+    data[1].effective = data[1].permitted = data[1].inheritable = 0;
+    if (syscall(SYS_capset, &hdr, data) < 0) return -1;
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_RAISE, CAP_SYS_PTRACE, 0, 0) < 0)
+        return -1;
+    return 0;
+}
+
 pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
                    const char* bin, char* const argv[],
                    bool mount_devices, bool apply_seccomp,
@@ -212,10 +231,10 @@ pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
     if (pid != 0) return pid;  // Parent returns child PID
 
     // Child becomes the Jailer, then execs. Never returns; _exit(N) on error:
-    // 1=mkdir, 2=chown, 3=copy_fc, 4=setxattr, 5=devices, 6=bind_files,
+    // 1=mkdir, 2=chown, 3=copy_fc, 5=devices, 6=bind_files,
     // 7=cgroup, 8=serial_open, 9=chroot, 10=chdir, 11=caps, 12=setgid,
-    // 13=setuid, 14=seccomp, 15=execve_fail
-    if (mkdir_recursive(jail_root, 0755) < 0) _exit(1);
+    // 13=setuid, 16=ambient_cap, 14=seccomp, 15=execve_fail
+    if (mkdir_recursive(jail_root, 0700) < 0) _exit(1);
     // The jailed uid must create sockets/files at the jail top level
     // (api.sock, uffd.sock). chown normally; 0777 fallback where chown is
     // unsupported (e.g. 9p test mounts); fatal only if both fail.
@@ -226,17 +245,6 @@ pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
         char dst[PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/firecracker", jail_root);
         if (copy_file(files->firecracker_bin, dst, 0755) < 0) _exit(3);
-        // Grant CAP_SYS_PTRACE across the setuid+exec boundary so Firecracker
-        // can create UFFD objects (20-byte v3 xattr as setcap writes it).
-        struct {
-            uint32_t magic_etc;
-            uint32_t permitted;
-            uint32_t inheritable;
-            uint32_t rootid;
-            uint32_t pad;
-        } __attribute__((packed)) fcap = { 0x02000001u, 1u << CAP_SYS_PTRACE,
-                                           0, 0, 0 };
-        if (setxattr(dst, "security.capability", &fcap, sizeof(fcap), 0) < 0) _exit(4);
     }
     if (mount_devices && make_jail_devices(jail_root, config->jailer_uid,
                                                  config->jailer_gid) < 0)
@@ -251,15 +259,19 @@ pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
         // Opened pre-chroot on the host path and dup2'd post-setuid. The fd
         // is already write-capable (checked at open), so the chown is only
         // ownership hygiene and best-effort (9p mounts reject chown).
-        serial_fd = open(serial_log, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        serial_fd = open(serial_log, O_WRONLY | O_CREAT | O_APPEND, 0600);
         if (serial_fd < 0) _exit(8);
         fchown(serial_fd, config->jailer_uid, config->jailer_gid);
     }
     if (chroot(jail_root) < 0) _exit(9);
     if (chdir("/") < 0) _exit(10);
     if (drop_capabilities() < 0) _exit(11);
+    // Retain the permitted set across the uid transition so CAP_SYS_PTRACE can
+    // be re-raised as ambient below.
+    if (prctl(PR_SET_KEEPCAPS, 1) < 0) _exit(11);
     if (setgid(config->jailer_gid) < 0) _exit(12);
     if (setuid(config->jailer_uid) < 0) _exit(13);
+    if (raise_ambient_sys_ptrace() < 0) _exit(16);
     if (apply_seccomp && apply_seccomp_filter() < 0) _exit(14);
     if (serial_fd >= 0) {
         dup2(serial_fd, STDOUT_FILENO);
