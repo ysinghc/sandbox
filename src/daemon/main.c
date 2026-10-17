@@ -6,6 +6,7 @@
 // There is no YAML/std::variant config layer (see SYSTEM DESIGN.md §15.9); the
 // file is a flat "key = value" list.
 
+#include "engine_config.h"
 #include "ipc_server.h"
 #include "network_manager.h"
 #include "pool_manager.h"
@@ -16,6 +17,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,103 +29,113 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-typedef struct {
-    char socket_path[256];
-    char broker_control_socket[256];
-    char template_name[128];
-    int pool_size;
-    char allowed_services[1024];
-    char allowed_uids[512];  // Phase 10.1: CSV of peer uids; empty = any
-    int metrics_port;  // 0 = disabled
-    char metrics_bind[64];  // "" = disabled, else bind address
-} engine_config_t;
+#ifdef SANDBOX_HAVE_SYSTEMD
+#include <systemd/sd-daemon.h>
+#endif
 
-static void config_defaults(engine_config_t* c) {
-    memset(c, 0, sizeof(*c));
-    snprintf(c->socket_path, sizeof(c->socket_path),
-             "/var/run/sandbox-engine/engine.sock");
-    snprintf(c->broker_control_socket, sizeof(c->broker_control_socket),
-             "/var/run/sandbox-engine/broker-control.sock");
-    snprintf(c->template_name, sizeof(c->template_name), "python-agent");
-    c->pool_size = 4;
-    c->allowed_services[0] = '\0';
-    c->allowed_uids[0] = '\0';
-    c->metrics_port = 0;
-    snprintf(c->metrics_bind, sizeof(c->metrics_bind), "127.0.0.1");
+
+// Publish the resolved paths/uid/gid back into the environment so the VMM
+// layer (which reads SANDBOX_JAIL_ROOT/SNAPSHOT_ROOT/JAILER_UID/GID) sees the
+// config-file values, not just CLI/env overrides.
+static void apply_paths_to_env(const engine_config_t* c) {
+    if (c->jail_root[0]) setenv("SANDBOX_JAIL_ROOT", c->jail_root, 1);
+    if (c->snapshot_root[0])
+        setenv("SANDBOX_SNAPSHOT_ROOT", c->snapshot_root, 1);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%d", c->jailer_uid);
+    setenv("SANDBOX_JAILER_UID", buf, 1);
+    snprintf(buf, sizeof(buf), "%d", c->jailer_gid);
+    setenv("SANDBOX_JAILER_GID", buf, 1);
 }
 
-static void set_key(engine_config_t* c, const char* key, const char* val) {
-    if (strcmp(key, "socket") == 0 || strcmp(key, "socket_path") == 0 ||
-        strcmp(key, "engine_socket") == 0) {
-        snprintf(c->socket_path, sizeof(c->socket_path), "%s", val);
-    } else if (strcmp(key, "broker_control_socket") == 0 ||
-               strcmp(key, "broker_control") == 0) {
-        snprintf(c->broker_control_socket, sizeof(c->broker_control_socket),
-                 "%s", val);
-    } else if (strcmp(key, "template") == 0 ||
-               strcmp(key, "template_name") == 0) {
-        snprintf(c->template_name, sizeof(c->template_name), "%s", val);
-    } else if (strcmp(key, "pool_size") == 0 ||
-               strcmp(key, "target_size") == 0) {
-        c->pool_size = atoi(val);
-    } else if (strcmp(key, "allowed_services") == 0) {
-        snprintf(c->allowed_services, sizeof(c->allowed_services), "%s", val);
-    } else if (strcmp(key, "allowed_uids") == 0) {
-        snprintf(c->allowed_uids, sizeof(c->allowed_uids), "%s", val);
-    } else if (strcmp(key, "metrics_bind") == 0) {
-        snprintf(c->metrics_bind, sizeof(c->metrics_bind), "%s", val);
-    } else if (strcmp(key, "metrics_port") == 0) {
-        c->metrics_port = atoi(val);
+static const char* effective_root(const char* cfg_val, const char* env_name,
+                                  const char* fallback) {
+    if (cfg_val && *cfg_val) return cfg_val;
+    const char* e = getenv(env_name);
+    if (e && *e) return e;
+    return fallback;
+}
+
+static void notify_systemd(const char* state) {
+#ifdef SANDBOX_HAVE_SYSTEMD
+    sd_notify(0, state);
+#else
+    (void)state;
+#endif
+}
+
+static void* watchdog_thread(void* arg) {
+    (void)arg;
+#ifdef SANDBOX_HAVE_SYSTEMD
+    for (;;) {
+        sd_notify(0, "WATCHDOG=1");
+        sleep(10);
+    }
+#else
+    return NULL;
+#endif
+}
+
+// Phase 11: --validate-config pre-flight. Prints a report and returns 0/1.
+static int validate_config(const engine_config_t* c, const char* config_file) {
+    int ok = 1;
+    char path[512];
+    printf("sandboxd %s config validation\n", SANDBOX_VERSION);
+    printf("  config file:   %s\n",
+           config_file ? config_file : "<built-in defaults>");
+    printf("  socket:        %s\n", c->socket_path);
+    printf("  broker-control:%s\n", c->broker_control_socket);
+    printf("  template:      %s\n", c->template_name);
+
+    if (c->pool_size < 1 || c->pool_size > POOL_MAX_SIZE) {
+        printf("  pool_size:     %d  FAIL (1..%d)\n", c->pool_size, POOL_MAX_SIZE);
+        ok = 0;
     } else {
-        fprintf(stderr, "[sandboxd] unknown config key '%s'\n", key);
+        printf("  pool_size:     %d  ok\n", c->pool_size);
     }
-}
+    if (c->max_queue_depth < 1 || c->max_queue_depth > POOL_MAX_QUEUE_DEPTH) {
+        printf("  max_queue:     %d  FAIL (1..%d)\n", c->max_queue_depth,
+               POOL_MAX_QUEUE_DEPTH);
+        ok = 0;
+    } else {
+        printf("  max_queue:     %d  ok\n", c->max_queue_depth);
+    }
+    if (c->metrics_port < 0 || c->metrics_port > 65535) {
+        printf("  metrics_port:  %d  FAIL (0..65535)\n", c->metrics_port);
+        ok = 0;
+    } else {
+        printf("  metrics_port:  %d  ok\n", c->metrics_port);
+    }
+    if (c->jailer_uid < 0 || c->jailer_gid < 0) {
+        printf("  jailer uid/gid:%d/%d  FAIL (>=0)\n", c->jailer_uid,
+               c->jailer_gid);
+        ok = 0;
+    } else {
+        printf("  jailer uid/gid:%d/%d  ok\n", c->jailer_uid, c->jailer_gid);
+    }
 
-static void config_load_file(engine_config_t* c, const char* path) {
-    FILE* f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "[sandboxd] config %s: %s (using defaults)\n", path,
-                strerror(errno));
-        return;
+    const char* snap_root = effective_root(c->snapshot_root,
+                                           "SANDBOX_SNAPSHOT_ROOT",
+                                           "/var/lib/sandbox-engine/snapshots");
+    snprintf(path, sizeof(path), "%s/%s/manifest.bin", snap_root,
+             c->template_name);
+    if (access(path, R_OK) == 0) {
+        printf("  template img:  %s  ok\n", path);
+    } else {
+        printf("  template img:  %s  FAIL (missing)\n", path);
+        ok = 0;
     }
-    char line[2048];
-    while (fgets(line, sizeof(line), f)) {
-        char* p = line;
-        while (*p == ' ' || *p == '\t') p++;
-        if (*p == '#' || *p == ';' || *p == '\n' || *p == '\0') continue;
-        char* eq = strchr(p, '=');
-        if (!eq) continue;
-        *eq = '\0';
-        char* key = p;
-        char* val = eq + 1;
-        char* end = key + strlen(key);
-        while (end > key && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
-        while (*val == ' ' || *val == '\t') val++;
-        end = val + strlen(val);
-        while (end > val && (end[-1] == '\n' || end[-1] == '\r' ||
-                             end[-1] == ' ' || end[-1] == '\t')) {
-            *--end = '\0';
-        }
-        if (*key) set_key(c, key, val);
-    }
-    fclose(f);
-}
 
-static void config_apply_env(engine_config_t* c) {
-    const char* v;
-    if ((v = getenv("SANDBOX_ENGINE_SOCK")) && *v) set_key(c, "socket", v);
-    if ((v = getenv("SANDBOX_BROKER_CONTROL")) && *v)
-        set_key(c, "broker_control", v);
-    if ((v = getenv("SANDBOX_TEMPLATE")) && *v) set_key(c, "template", v);
-    if ((v = getenv("SANDBOX_POOL_SIZE")) && *v) set_key(c, "pool_size", v);
-    if ((v = getenv("SANDBOX_ALLOWED_SERVICES")))
-        set_key(c, "allowed_services", v);
-    if ((v = getenv("SANDBOX_ALLOWED_UIDS")))
-        set_key(c, "allowed_uids", v);
-    if ((v = getenv("SANDBOX_METRICS_PORT")) && *v)
-        set_key(c, "metrics_port", v);
-    if ((v = getenv("SANDBOX_METRICS_BIND")) && *v)
-        set_key(c, "metrics_bind", v);
+    const char* jail_root = effective_root(c->jail_root, "SANDBOX_JAIL_ROOT",
+                                           "/var/lib/sandbox-engine/jail");
+    if (access(jail_root, W_OK) == 0) {
+        printf("  jail root:     %s  ok\n", jail_root);
+    } else {
+        printf("  jail root:     %s  (will be created)\n", jail_root);
+    }
+
+    printf("result: %s\n", ok ? "OK" : "FAILED");
+    return ok ? 0 : 1;
 }
 
 static void ensure_parent_dir(const char* path) {
@@ -180,6 +192,7 @@ int main(int argc, char** argv) {
     config_defaults(&cfg);
 
     const char* config_file = NULL;
+    bool do_validate = false;
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-c") == 0) &&
             i + 1 < argc) {
@@ -197,21 +210,26 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* v = (i + 1 < argc) ? argv[i + 1] : NULL;
-        if ((strcmp(a, "--socket") == 0) && v) set_key(&cfg, "socket", argv[++i]);
+        if ((strcmp(a, "--socket") == 0) && v) config_set_key(&cfg, "socket", argv[++i]);
         else if ((strcmp(a, "--broker-control") == 0) && v)
-            set_key(&cfg, "broker_control", argv[++i]);
+            config_set_key(&cfg, "broker_control", argv[++i]);
         else if ((strcmp(a, "--template") == 0) && v)
-            set_key(&cfg, "template", argv[++i]);
+            config_set_key(&cfg, "template", argv[++i]);
         else if ((strcmp(a, "--pool-size") == 0) && v)
-            set_key(&cfg, "pool_size", argv[++i]);
+            config_set_key(&cfg, "pool_size", argv[++i]);
         else if ((strcmp(a, "--allowed-services") == 0) && v)
-            set_key(&cfg, "allowed_services", argv[++i]);
+            config_set_key(&cfg, "allowed_services", argv[++i]);
         else if ((strcmp(a, "--allowed-uids") == 0) && v)
-            set_key(&cfg, "allowed_uids", argv[++i]);
+            config_set_key(&cfg, "allowed_uids", argv[++i]);
         else if ((strcmp(a, "--metrics-port") == 0) && v)
-            set_key(&cfg, "metrics_port", argv[++i]);
+            config_set_key(&cfg, "metrics_port", argv[++i]);
         else if ((strcmp(a, "--metrics-bind") == 0) && v)
-            set_key(&cfg, "metrics_bind", argv[++i]);
+            config_set_key(&cfg, "metrics_bind", argv[++i]);
+        else if ((strcmp(a, "--jail-root") == 0) && v)
+            config_set_key(&cfg, "jail_root", argv[++i]);
+        else if ((strcmp(a, "--snapshot-root") == 0) && v)
+            config_set_key(&cfg, "snapshot_root", argv[++i]);
+        else if (strcmp(a, "--validate-config") == 0) do_validate = true;
         else if (strcmp(a, "--version") == 0) {
             printf("sandboxd %s\n", SANDBOX_VERSION);
             return 0;
@@ -220,10 +238,14 @@ int main(int argc, char** argv) {
             printf("usage: sandboxd [--config FILE] [--socket PATH] "
                    "[--broker-control PATH] [--template NAME] [--pool-size N] "
                    "[--allowed-services CSV] [--allowed-uids CSV] "
-                   "[--metrics-port N] [--metrics-bind ADDR] [--version]\n");
+                   "[--metrics-port N] [--metrics-bind ADDR] "
+                   "[--jail-root DIR] [--snapshot-root DIR] "
+                   "[--validate-config] [--version]\n");
             return 0;
         }
     }
+
+    if (do_validate) return validate_config(&cfg, config_file);
 
     if (cfg.pool_size <= 0 || cfg.pool_size > POOL_MAX_SIZE) {
         fprintf(stderr, "[sandboxd] invalid pool_size %d\n", cfg.pool_size);
@@ -233,6 +255,11 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[sandboxd] no template configured\n");
         return 1;
     }
+    if (cfg.max_queue_depth < 1) cfg.max_queue_depth = 1;
+    if (cfg.max_queue_depth > POOL_MAX_QUEUE_DEPTH)
+        cfg.max_queue_depth = POOL_MAX_QUEUE_DEPTH;
+
+    apply_paths_to_env(&cfg);
 
     ensure_parent_dir(cfg.socket_path);
     ensure_parent_dir(cfg.broker_control_socket);
@@ -263,11 +290,13 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[sandboxd] pool_manager_init failed\n");
         return 1;
     }
+    pool_manager_set_max_queue_depth(&pool, cfg.max_queue_depth);
 
     ipc_server_set_pool(&pool);
     ipc_server_set_template(cfg.template_name);
     ipc_server_set_allowed_services(cfg.allowed_services);
     ipc_server_set_allowed_uids(cfg.allowed_uids);
+    ipc_server_set_default_pool_wait_ms((uint32_t)cfg.pool_wait_timeout_ms);
     pool_manager_set_live(&pool);
     if (ipc_server_start_broker_control(cfg.broker_control_socket) < 0) {
         fprintf(stderr, "[sandboxd] broker-control start failed\n");
@@ -300,7 +329,16 @@ int main(int argc, char** argv) {
     sigaction(SIGINT, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
 
+    // Phase 11: tell systemd (Type=notify) we are ready to accept connections.
+    notify_systemd("READY=1");
+    if (getenv("NOTIFY_SOCKET")) {
+        pthread_t wt;
+        if (pthread_create(&wt, NULL, watchdog_thread, NULL) == 0)
+            pthread_detach(wt);
+    }
+
     ipc_server_run(cfg.socket_path);
+    notify_systemd("STOPPING=1");
     ipc_server_stop();
     pool_manager_set_live(NULL);
     pool_manager_destroy(&pool);

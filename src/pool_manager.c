@@ -22,7 +22,7 @@ static void push_pool_state(pool_manager_t* pool) {
 
 static void enqueue_overflow(pool_manager_t* pool, pending_request_t* req) {
     pool->overflow_queue[pool->overflow_tail] = req;
-    pool->overflow_tail = (pool->overflow_tail + 1) % POOL_MAX_QUEUE_DEPTH;
+    pool->overflow_tail = (pool->overflow_tail + 1) % pool->max_queue_depth;
     pool->overflow_count++;
 }
 
@@ -32,7 +32,7 @@ static pending_request_t* peek_overflow(pool_manager_t* pool) {
 }
 
 static void dequeue_head(pool_manager_t* pool) {
-    pool->overflow_head = (pool->overflow_head + 1) % POOL_MAX_QUEUE_DEPTH;
+    pool->overflow_head = (pool->overflow_head + 1) % pool->max_queue_depth;
     pool->overflow_count--;
 }
 
@@ -40,16 +40,16 @@ static void dequeue_head(pool_manager_t* pool) {
 // request was already handed off (caller must re-check req->ready).
 static int dequeue_overflow(pool_manager_t* pool, pending_request_t* req) {
     for (int i = 0; i < pool->overflow_count; i++) {
-        int idx = (pool->overflow_head + i) % POOL_MAX_QUEUE_DEPTH;
+        int idx = (pool->overflow_head + i) % pool->max_queue_depth;
         if (pool->overflow_queue[idx] == req) {
             // Shift the tail segment left to close the gap.
             for (int j = i; j < pool->overflow_count - 1; j++) {
-                int dst = (pool->overflow_head + j) % POOL_MAX_QUEUE_DEPTH;
-                int src = (pool->overflow_head + j + 1) % POOL_MAX_QUEUE_DEPTH;
+                int dst = (pool->overflow_head + j) % pool->max_queue_depth;
+                int src = (pool->overflow_head + j + 1) % pool->max_queue_depth;
                 pool->overflow_queue[dst] = pool->overflow_queue[src];
             }
             pool->overflow_tail =
-                (pool->overflow_tail - 1 + POOL_MAX_QUEUE_DEPTH) % POOL_MAX_QUEUE_DEPTH;
+                (pool->overflow_tail - 1 + pool->max_queue_depth) % pool->max_queue_depth;
             pool->overflow_count--;
             return 0;
         }
@@ -80,6 +80,7 @@ int pool_manager_init(pool_manager_t* pool, int target_size) {
     pool->overflow_head = pool->overflow_tail = pool->overflow_count = 0;
     pool->target_size = target_size;
     pool->restoring_count = 0;
+    pool->max_queue_depth = POOL_MAX_QUEUE_DEPTH;
     pool->expected_version = 0;
     pool->shutdown = false;
 
@@ -101,6 +102,15 @@ int pool_manager_init(pool_manager_t* pool, int target_size) {
     }
     push_pool_state(pool);
     return 0;
+}
+
+void pool_manager_set_max_queue_depth(pool_manager_t* pool, int depth) {
+    if (!pool) return;
+    if (depth < 1) depth = 1;
+    if (depth > POOL_MAX_QUEUE_DEPTH) depth = POOL_MAX_QUEUE_DEPTH;
+    pthread_mutex_lock(&pool->lock);
+    pool->max_queue_depth = depth;
+    pthread_mutex_unlock(&pool->lock);
 }
 
 void pool_manager_destroy(pool_manager_t* pool) {
@@ -207,7 +217,7 @@ sandbox_error_t pool_provision(pool_manager_t* pool, const sandbox_spec_t* spec,
         pthread_mutex_unlock(&pool->lock);
         return SANDBOX_ERR_POOL_EXHAUSTED;  // fail immediately
     }
-    if (pool->overflow_count >= POOL_MAX_QUEUE_DEPTH) {
+    if (pool->overflow_count >= pool->max_queue_depth) {
         pthread_mutex_unlock(&pool->lock);
         return SANDBOX_ERR_POOL_EXHAUSTED;  // Immediate rejection
     }

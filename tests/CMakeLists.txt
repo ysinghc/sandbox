@@ -93,3 +93,12 @@ set_tests_properties(ipc PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
     ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+
+# Phase 11: daemon config parser (no root). Parses the packaged engine.conf.
+add_executable(test_config test_config.c)
+target_include_directories(test_config PRIVATE ../include)
+target_link_libraries(test_config sandbox_config)
+target_compile_definitions(test_config PRIVATE
+    SANDBOX_TEST_CONFIG_FILE="${CMAKE_SOURCE_DIR}/config/engine.conf")
+add_test(NAME config COMMAND test_config)
+set_tests_properties(config PROPERTIES TIMEOUT 30)

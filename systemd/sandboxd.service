@@ -3,10 +3,12 @@ Description=Sandbox Engine Daemon
 After=network.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart=/usr/local/bin/sandboxd
+ExecStartPre=-/usr/local/bin/sandboxd --validate-config
 Restart=on-failure
 RestartSec=5s
+WatchdogSec=30s
 StandardError=journal
 
 # Security hardening (Phase 10.4). The daemon runs as root by design (it must

@@ -424,3 +424,34 @@ Plan reference: production-readiness plan items 10.1–10.5.
 - **Tests.** `test_ipc` gained a Phase 10.1 case (allowlist excluding uid 0 ⇒
   create rejected) and a redaction case; full `ctest` 10/10 as root, including
   the libnftables network tests.
+
+## Phase 11 — Config & Packaging Correctness (§10, §15.13)
+
+Plan reference: production-readiness plan items 10.6–10.7.
+
+- **10.6 config parity.** The daemon's flat parser recognised only a subset of
+  `config/engine.conf`; `max_queue_depth`, `pool_wait_timeout_ms`, `jail_root`,
+  `snapshot_root`, `jailer_uid`, `jailer_gid` fell through to "unknown config
+  key". All are now parsed. The parser was **extracted to
+  `src/daemon/config.c` + `include/engine_config.h`** (new `sandbox_config`
+  static lib) so it is unit-testable — plan Option B. `config/engine.conf` was
+  rewritten to the flat format with the complete key set. Code default
+  `pool_size` changed 4 → 5 to match §5.1 / the packaged file. **Deviation:**
+  `max_queue_depth` is applied via `pool_manager_set_max_queue_depth()`; the
+  ring buffers stay `POOL_MAX_QUEUE_DEPTH`-sized and the effective depth is the
+  configured value clamped to `[1, POOL_MAX_QUEUE_DEPTH]` (no dynamic
+  allocation). `pool_wait_timeout_ms` is the default when a `CreateRequest`
+  sends 0. `jail_root`/`snapshot_root`/`jailer_uid`/`jailer_gid` are published
+  to the env; `vmm_manager` now reads `SANDBOX_JAILER_UID`/`GID`.
+- **10.7 `--version` / `--validate-config` / `Type=notify`.** `--version`
+  prints `SANDBOX_VERSION`. `--validate-config` prints a report and exits 1 on
+  error; wired as `ExecStartPre=-` (non-fatal). CMake auto-detects libsystemd;
+  the daemon sends `READY=1`/`STOPPING=1` and a watchdog thread emits
+  `WATCHDOG=1` when `NOTIFY_SOCKET` is set. Unit is `Type=notify` +
+  `WatchdogSec=30s`, `LimitNOFILE=65536`, `TasksMax=512`, capabilities tightened
+  to `CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT CAP_MKNOD
+  CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SYS_PTRACE CAP_DAC_OVERRIDE CAP_FOWNER
+  CAP_KILL`.
+- **Tests.** New `tests/test_config.c` (ctest `config`) parses a synthetic file
+  and the packaged `engine.conf` and checks env precedence. Full `ctest` 11/11
+  as root.

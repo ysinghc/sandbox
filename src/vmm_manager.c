@@ -72,6 +72,18 @@ static const char* snapshot_parent(void) {
     return (e && *e) ? e : "/var/lib/sandbox-engine/snapshots";
 }
 
+// Phase 11: jailer uid/gid are configurable (config `jailer_uid`/`jailer_gid`
+// are published as env by the daemon). Default 65534 (nobody).
+static uid_t jailer_uid(void) {
+    const char* e = getenv("SANDBOX_JAILER_UID");
+    return (e && *e) ? (uid_t)strtoul(e, NULL, 10) : 65534;
+}
+
+static gid_t jailer_gid(void) {
+    const char* e = getenv("SANDBOX_JAILER_GID");
+    return (e && *e) ? (gid_t)strtoul(e, NULL, 10) : 65534;
+}
+
 static uint64_t now_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -379,7 +391,7 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
                            .out_dir = out_dir };
     char serial[PATH_MAX];
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
-    jailer_config_t jcfg = { .jailer_uid = 65534, .jailer_gid = 65534,
+    jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
                              .cgroup_path = NULL };
     // Transport must match the restore path (see pci_enabled()).
     char* argv[8];
@@ -811,7 +823,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     if (stat(tpl_rootfs, &st) == 0) files.rootfs_path = tpl_rootfs;
     char serial[PATH_MAX];
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
-    jailer_config_t jcfg = { .jailer_uid = 65534, .jailer_gid = 65534,
+    jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
                              .cgroup_path = NULL };
     char* argv[8];
     int ai = 0;

@@ -1669,14 +1669,21 @@ authoritative.
   thread and written by the IPC thread; `token_lookup` copies service strings
   under the lock and the socket I/O happens outside it.
 - **Config:** flat `key = value` file (no hierarchy) with precedence
-  CLI > env > file > defaults. Keys: `socket(_path)`, `broker_control_socket`,
-  `template(_name)`, `pool_size`/`target_size`, `allowed_services`,
-  `allowed_uids`, `metrics_port`, `metrics_bind`. Env: `SANDBOX_ENGINE_SOCK`,
+  CLI > env > file > defaults. The parser now lives in
+  `src/daemon/config.c` + `include/engine_config.h` (extracted for unit
+  testing); `[section]` headers are skipped. Keys: `socket(_path)`,
+  `broker_control_socket`, `template(_name)`, `pool_size`/`target_size`,
+  `max_queue_depth`, `pool_wait_timeout_ms`, `allowed_services`,
+  `allowed_uids`, `jailer_uid`, `jailer_gid`, `jail_root`, `snapshot_root`,
+  `metrics_port`, `metrics_bind`. Env: `SANDBOX_ENGINE_SOCK`,
   `SANDBOX_BROKER_CONTROL`, `SANDBOX_TEMPLATE`, `SANDBOX_POOL_SIZE`,
   `SANDBOX_ALLOWED_SERVICES`, `SANDBOX_ALLOWED_UIDS`, `SANDBOX_METRICS_PORT`,
-  `SANDBOX_METRICS_BIND`, plus the pre-existing `SANDBOX_FC_*`,
-  `FIRECRACKER_BIN`, `SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAIL_ROOT`. `--version`
-  prints `SANDBOX_VERSION` (CMake var, fallback `include/version.h`).
+  `SANDBOX_METRICS_BIND`, `SANDBOX_MAX_QUEUE_DEPTH`, `SANDBOX_POOL_WAIT_MS`,
+  `SANDBOX_JAIL_ROOT`, `SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAILER_UID`,
+  `SANDBOX_JAILER_GID`, plus the pre-existing `SANDBOX_FC_*`,
+  `FIRECRACKER_BIN`. `--version` prints `SANDBOX_VERSION` (CMake var, fallback
+  `include/version.h`); `--validate-config` prints a pre-flight report and
+  exits non-zero on error (used as `ExecStartPre`).
 - **Observability (§11):** `telemetry_render()` emits the §11.1 metric names in
   Prometheus text; the daemon serves them on `127.0.0.1:<metrics_port>` only
   when `--metrics-port` is set (`telemetry_serve` in a detached thread).
@@ -1855,3 +1862,39 @@ authoritative.
   runtime, so a blanket capability drop would break per-VM provisioning.
   `no_new_privs` + uid allowlist + name validation + no-shell nftables are the
   Phase-10 subset. vsock payload HMAC and per-tenant quotas remain V2.
+
+### 15.13 Phase 11 — Config & Packaging Correctness (§10)
+- **Config parser recognises every packaged key.** Previously the daemon
+  warned "unknown config key" for `max_queue_depth`, `pool_wait_timeout_ms`,
+  `jail_root`, `snapshot_root`, `jailer_uid`, `jailer_gid`; those are now
+  parsed (sections already ignored). `config/engine.conf` was rewritten to the
+  flat format with the full key set (plus `template`, `allowed_services`,
+  `allowed_uids`, `broker_control_socket`, `metrics_*`). Default pool size in
+  code is now `5` to match §5.1 and the packaged file.
+- **Wiring.** `jail_root`/`snapshot_root`/`jailer_uid`/`jailer_gid` are
+  published to the environment (the VMM layer already read
+  `SANDBOX_JAIL_ROOT`/`SNAPSHOT_ROOT`; it now also reads
+  `SANDBOX_JAILER_UID`/`GID`). `max_queue_depth` is applied via
+  `pool_manager_set_max_queue_depth()` — the overflow arrays stay fixed at
+  `POOL_MAX_QUEUE_DEPTH` and the *effective* depth is the configured value
+  (clamped). `pool_wait_timeout_ms` becomes the default `Create` wait when the
+  request sends `0` (`ipc_server_set_default_pool_wait_ms()`).
+- **Parser is unit-tested.** Extracted to `src/daemon/config.c` +
+  `include/engine_config.h`; `tests/test_config.c` parses a synthetic file
+  (all keys, unknown key ignored) and the shipped `config/engine.conf`, and
+  checks env precedence. New ctest `config`.
+- **`--version` / `--validate-config`.** `--version` prints `SANDBOX_VERSION`.
+  `--validate-config` prints the resolved config and checks pool/queue/metrics
+  ranges, jailer ids, and that the template manifest exists; exits 1 on error.
+  Wired as `ExecStartPre=-` in the unit (leading `-` = non-fatal so a
+  first-run install without a template still starts).
+- **`Type=notify` readiness + watchdog.** CMake auto-detects libsystemd; the
+  daemon calls `sd_notify(READY=1)` after the pool/broker/metrics are up and
+  `STOPPING=1` on exit, and starts a watchdog thread (`WATCHDOG=1` every 10 s)
+  when `NOTIFY_SOCKET` is set. The unit uses `Type=notify` + `WatchdogSec=30s`.
+  Builds without libsystemd compile the calls to no-ops (then use
+  `Type=simple` — noted in the unit).
+- **Unit resource limits.** `LimitNOFILE=65536`, `TasksMax=512`; capability
+  set tightened to the runtime minimum (§15.12) including `CAP_SETPCAP`
+  (needed by the jailer's bounding-set drop) and `CAP_SYS_PTRACE` (ambient UFFD
+  cap).

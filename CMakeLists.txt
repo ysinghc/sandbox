@@ -92,7 +92,20 @@ target_link_libraries(sandbox++ sandbox)
 add_executable(sandboxd
     src/daemon/main.c
 )
-target_link_libraries(sandboxd sandbox)
+# Config parser as a small static lib so it is unit-testable (Phase 11).
+add_library(sandbox_config STATIC src/daemon/config.c)
+target_include_directories(sandbox_config PUBLIC include)
+target_link_libraries(sandboxd sandbox sandbox_config)
+
+# Phase 11: sd_notify readiness/watchdog for Type=notify; optional so the build
+# works where libsystemd is absent.
+find_library(SYSTEMD_LIB systemd)
+if(SYSTEMD_LIB)
+    target_compile_definitions(sandboxd PRIVATE SANDBOX_HAVE_SYSTEMD=1)
+    target_include_directories(sandboxd PRIVATE ${SYSTEMD_INCLUDE_DIR})
+    target_link_libraries(sandboxd ${SYSTEMD_LIB})
+    message(STATUS "libsystemd found: ${SYSTEMD_LIB}")
+endif()
 
 # Broker (§5.8). Core split into a library so the request pipeline is testable
 # in-process; main.c is a thin shim.

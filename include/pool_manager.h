@@ -26,6 +26,7 @@ typedef struct {
 
     int target_size;        // Runtime-configurable (from config file)
     int restoring_count;    // VMs currently being restored (not yet warm)
+    int max_queue_depth;    // Effective overflow depth (<= POOL_MAX_QUEUE_DEPTH)
 
     // Snapshot version this pool was built from (0 = none yet).
     uint32_t expected_version;
@@ -42,6 +43,10 @@ typedef struct {
 // Lifecycle
 int pool_manager_init(pool_manager_t* pool, int target_size);
 void pool_manager_destroy(pool_manager_t* pool);
+
+// Phase 11: set the effective overflow-queue depth (clamped to
+// [1, POOL_MAX_QUEUE_DEPTH]). Safe to call after init, before serving.
+void pool_manager_set_max_queue_depth(pool_manager_t* pool, int depth);
 
 // Fast-path provision (<1ms on pool hit); slow-path overflow queue on miss.
 // Returns NULL handle wrapped in error: on failure returns error code and *out_vm NULL.

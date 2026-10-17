@@ -27,6 +27,9 @@ void ipc_server_set_allowed_services(const char* csv);
 // (SO_PEERCRED). NULL/empty accepts any uid (logged as a warning at startup).
 void ipc_server_set_allowed_uids(const char* csv);
 
+// Phase 11: default pool wait (ms) applied when a CreateRequest sends 0.
+void ipc_server_set_default_pool_wait_ms(uint32_t ms);
+
 // Engine-side half of §5.8: the credential broker validates session tokens
 // over broker-control.sock. Runs in its own thread.
 int ipc_server_start_broker_control(const char* socket_path);

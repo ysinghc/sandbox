@@ -76,6 +76,9 @@ static struct {
     uid_t allowed_uids[IPC_MAX_ALLOWED_UIDS];
     int n_allowed_uids;
 
+    // Phase 11: default pool_wait_ms applied when a CreateRequest sends 0.
+    uint32_t default_pool_wait_ms;
+
     int listen_fd;
     int epfd;
     int wake_fd;
@@ -427,7 +430,8 @@ static void handle_create(int fd, session_t* s, const ipc_request_t* req) {
     spec.vcpu_count = req->vcpu_count ? req->vcpu_count : 1;
     spec.template_name = g.template_name;
     spec.env_vars = (const char**)req->env_vars;
-    spec.pool_wait_ms = req->pool_wait_ms;
+    spec.pool_wait_ms = req->pool_wait_ms ? req->pool_wait_ms
+                                          : g.default_pool_wait_ms;
 
     uint64_t t0 = now_ms();
     vm_handle_t* vm = NULL;
@@ -815,6 +819,10 @@ void ipc_server_set_allowed_services(const char* csv) {
         g.allowed[g.n_allowed++] = strdup(tok);
     }
     g.allowed[g.n_allowed] = NULL;
+}
+
+void ipc_server_set_default_pool_wait_ms(uint32_t ms) {
+    g.default_pool_wait_ms = ms;
 }
 
 // ---------------------------------------------------------------------------
