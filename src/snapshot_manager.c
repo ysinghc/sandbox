@@ -13,6 +13,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -224,12 +226,89 @@ static int verify_files(const char* template_name, const snap_manifest_t* m) {
     return 0;
 }
 
+// §10.10 verification re-hashes the whole memory.snap (hundreds of MiB). That is
+// far too slow to repeat on every restore (measured: ~640 ms per restore for a
+// 256 MiB guest, vs an 8 ms snapshot-load). A published snapshot is immutable —
+// publishing renames a freshly built directory into place, so a rebuild changes
+// the inodes — therefore remember a successful verification keyed by the two
+// files' (dev, ino, size, mtime). A rebuilt snapshot misses the cache and is
+// re-verified; an untouched one is not hashed again. This keeps the corruption
+// check without paying it in the restore hot path.
+#define VERIFY_CACHE_MAX 8
+typedef struct {
+    char   name[64];
+    dev_t  mem_dev; ino_t mem_ino; off_t mem_size; time_t mem_mtime;
+    dev_t  vms_dev; ino_t vms_ino; off_t vms_size; time_t vms_mtime;
+    bool   valid;
+} verify_cache_t;
+
+static verify_cache_t g_verify_cache[VERIFY_CACHE_MAX];
+static size_t g_verify_cache_len;
+static pthread_mutex_t g_verify_cache_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static bool verify_sig_eq(dev_t dev, ino_t ino, off_t size, time_t mtime,
+                          const struct stat* st) {
+    return dev == st->st_dev && ino == st->st_ino &&
+           size == st->st_size && mtime == st->st_mtime;
+}
+
+static bool verify_cache_hit(const char* name, const struct stat* ms,
+                             const struct stat* vs) {
+    bool hit = false;
+    pthread_mutex_lock(&g_verify_cache_lock);
+    for (size_t i = 0; i < g_verify_cache_len; i++) {
+        verify_cache_t* c = &g_verify_cache[i];
+        if (c->valid && strcmp(c->name, name) == 0 &&
+            verify_sig_eq(c->mem_dev, c->mem_ino, c->mem_size, c->mem_mtime, ms) &&
+            verify_sig_eq(c->vms_dev, c->vms_ino, c->vms_size, c->vms_mtime, vs)) {
+            hit = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_verify_cache_lock);
+    return hit;
+}
+
+static void verify_cache_put(const char* name, const struct stat* ms,
+                             const struct stat* vs) {
+    pthread_mutex_lock(&g_verify_cache_lock);
+    verify_cache_t* c = NULL;
+    for (size_t i = 0; i < g_verify_cache_len; i++) {
+        if (strcmp(g_verify_cache[i].name, name) == 0) {
+            c = &g_verify_cache[i];
+            break;
+        }
+    }
+    if (!c) {
+        c = (g_verify_cache_len < VERIFY_CACHE_MAX)
+                ? &g_verify_cache[g_verify_cache_len++]
+                : &g_verify_cache[0];  // few templates; evict slot 0
+    }
+    snprintf(c->name, sizeof(c->name), "%s", name);
+    c->mem_dev = ms->st_dev; c->mem_ino = ms->st_ino;
+    c->mem_size = ms->st_size; c->mem_mtime = ms->st_mtime;
+    c->vms_dev = vs->st_dev; c->vms_ino = vs->st_ino;
+    c->vms_size = vs->st_size; c->vms_mtime = vs->st_mtime;
+    c->valid = true;
+    pthread_mutex_unlock(&g_verify_cache_lock);
+}
+
 int snapshot_verify_manifest(const char* template_name,
                              const snap_manifest_t* manifest) {
     if (!template_name || !manifest) { errno = EINVAL; return -1; }
     const char* e = getenv("SANDBOX_VERIFY_SNAPSHOT");
     if (e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0)) return 0;
-    return verify_files(template_name, manifest);
+
+    char mpath[PATH_MAX], vpath[PATH_MAX];
+    struct stat ms, vs;
+    snprintf(mpath, sizeof(mpath), "%s/%s/memory.snap", snapshot_root(), template_name);
+    snprintf(vpath, sizeof(vpath), "%s/%s/vmstate", snapshot_root(), template_name);
+    bool have_sig = stat(mpath, &ms) == 0 && stat(vpath, &vs) == 0;
+    if (have_sig && verify_cache_hit(template_name, &ms, &vs)) return 0;
+
+    int rc = verify_files(template_name, manifest);
+    if (rc == 0 && have_sig) verify_cache_put(template_name, &ms, &vs);
+    return rc;
 }
 
 int snapshot_verify(const char* template_name) {

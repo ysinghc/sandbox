@@ -141,7 +141,7 @@ static int wait_markers(vm_handle_t* vm, const char* const* markers, int nm,
             fclose(f);
         }
         if (found || now_ms() >= end) break;
-        struct timespec nap = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L };
+        struct timespec nap = { .tv_sec = 0, .tv_nsec = 5 * 1000 * 1000L };
         nanosleep(&nap, NULL);
     }
     free(buf);
@@ -212,7 +212,7 @@ static int fc_connect(const char* sock_path) {
     snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", sock_path);
     for (int i = 0; i < 200; i++) {
         if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) return fd;
-        struct timespec nap = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L };
+        struct timespec nap = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000L };
         nanosleep(&nap, NULL);
     }
     close(fd);
@@ -363,7 +363,9 @@ static int wait_for_file(const char* path, int timeout_ms) {
     struct stat st;
     while (now_ms() < end) {
         if (stat(path, &st) == 0) return 0;
-        struct timespec nap = { .tv_sec = 0, .tv_nsec = 50 * 1000 * 1000L };
+        // The child's jail setup + Firecracker startup is the dominant part of
+        // restore latency; poll tightly so we do not add up to a full interval.
+        struct timespec nap = { .tv_sec = 0, .tv_nsec = 2 * 1000 * 1000L };
         nanosleep(&nap, NULL);
     }
     return -1;
@@ -820,6 +822,7 @@ int vmm_destroy(vm_handle_t* vm) {
 
 vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
                          const char* tap_name, uint32_t guest_ip) {
+    uint64_t t_enter = now_ms();
     if (!template_name || !vm_id || !*vm_id || !tap_name) {
         errno = EINVAL;
         return NULL;
@@ -877,6 +880,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         free(vm);
         return NULL;
     }
+    uint64_t t_prep = now_ms();
 
     // Handler UDS: listening before load so no fault is ever unhandled.
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -904,6 +908,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         free(vm);
         return NULL;
     }
+    uint64_t t_listen = now_ms();
 
     jail_files_t files = { .firecracker_bin = fc_bin(), .kernel_path = NULL,
                            .rootfs_path = NULL, .snap_state_src = state_src,
@@ -955,6 +960,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         free(vm);
         return NULL;
     }
+    uint64_t t_spawn = now_ms();
     vm->vmm_pid = pid;
     if (wait_for_file(vm->api_sock_path, FC_FILE_WAIT_MS) < 0) {
         fprintf(stderr, "[vmm_restore] FAIL: wait_for_file(%s) errno=%d\n", vm->api_sock_path, errno);
@@ -963,6 +969,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         free(manifest);
         return NULL;
     }
+    uint64_t t_sock = now_ms();
     fprintf(stderr, "[vmm_restore] api.sock ready: %s\n", vm->api_sock_path);
 
     // Firecracker faults on guest memory *during* /snapshot/load (it writes
@@ -1022,6 +1029,7 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         return NULL;
     }
     fprintf(stderr, "[vmm_restore] /snapshot/load ok\n");
+    uint64_t t_load = now_ms();
 
     // Tap was retargeted in the load request; just resume vCPUs.
     if (vmm_resume_vcpus(vm) < 0) {
@@ -1029,6 +1037,16 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         cold_fail(vm);
         return NULL;
     }
+    uint64_t t_resume = now_ms();
+    fprintf(stderr, "[vmm_restore] time total=%lums prep=%lums listen=%lums "
+                    "spawn=%lums sock=%lums load=%lums resume=%lums\n",
+            (unsigned long)(t_resume - t_enter),
+            (unsigned long)(t_prep - t_enter),
+            (unsigned long)(t_listen - t_prep),
+            (unsigned long)(t_spawn - t_listen),
+            (unsigned long)(t_sock - t_spawn),
+            (unsigned long)(t_load - t_sock),
+            (unsigned long)(t_resume - t_load));
     return vm;
 }
 
@@ -1062,14 +1080,21 @@ vm_handle_t* restore_vm_from_snapshot(void) {
     char vm_id[32];
     snprintf(vm_id, sizeof(vm_id), "vm-%u",
              (unsigned)atomic_fetch_add(&g_vm_counter, 1));
+    uint64_t t_net0 = now_ms();
     vm_network_t net;
     memset(&net, 0, sizeof(net));
     if (network_setup(vm_id, &net) < 0) return NULL;
+    uint64_t t_net = now_ms();
     vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip);
     if (!vm) {
         network_cleanup(&net);
         return NULL;
     }
+    uint64_t t_done = now_ms();
+    fprintf(stderr, "[pool] restore net=%lums vmm=%lums total=%lums\n",
+            (unsigned long)(t_net - t_net0),
+            (unsigned long)(t_done - t_net),
+            (unsigned long)(t_done - t_net0));
     vm->net = net;
     vm->has_net = true;
     return vm;
