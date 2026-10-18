@@ -25,6 +25,14 @@ target_link_libraries(test_jailer sandbox)
 add_test(NAME jailer COMMAND test_jailer)
 set_tests_properties(jailer PROPERTIES TIMEOUT 120)
 
+# Phase 2: seccomp allow-list regression. Unprivileged (installing a filter
+# needs no root), so it also runs on the hosted CI — see tests/test_seccomp.c.
+add_executable(test_seccomp test_seccomp.c)
+target_include_directories(test_seccomp PRIVATE ../include)
+target_link_libraries(test_seccomp sandbox)
+add_test(NAME seccomp COMMAND test_seccomp)
+set_tests_properties(seccomp PROPERTIES TIMEOUT 60)
+
 # Phase 3: network manager test (root only: tap + nftables; SKIPs otherwise).
 # The cleanup fixture runs even if the test aborts, so leaked netns/routes/
 # nft rules can never poison later runs.
