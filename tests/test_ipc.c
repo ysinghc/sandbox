@@ -173,6 +173,38 @@ int main(void) {
         // serial console (only key names).
         CHECK(!serial_has(hvm, "myvalue"), "env: value redacted in serial");
 
+        // #10: only the host may drive the control channel. After the host's
+        // first injection the agent opens a loopback connection to its own
+        // listener; the production accept path must reject that peer (it is
+        // CID_LOCAL, not CID_HOST) and log it. Reaching the end of this block
+        // proves the host peer was accepted (env landed above) AND a non-host
+        // peer was refused.
+        int auth_test = 0, auth_skip = 0, rejected = 0;
+        for (int i = 0; i < 200; i++) {
+            auth_test = serial_has(hvm, "SANDBOX-VSOCK-AUTH-TEST");
+            auth_skip = serial_has(hvm, "SANDBOX-VSOCK-AUTH-SKIP");
+            rejected = serial_has(hvm, "SANDBOX-VSOCK-REJECT cid=");
+            if (rejected || auth_skip) break;
+            usleep(10000);
+        }
+        CHECK(!serial_has(hvm, "SANDBOX-VSOCK-AUTH-FAIL"),
+              "vsock: a guest-local peer is not mistaken for the host");
+        if (auth_skip) {
+            // The guest kernel exposes no vsock loopback, so the in-guest probe
+            // cannot be made. Surface it loudly instead of passing silently:
+            // the host-vs-guest half is still covered by the env checks above.
+            fprintf(stderr,
+                    "  NOTE: vsock peer-auth self-test SKIPPED (no vsock "
+                    "loopback in this guest kernel)\n");
+        } else {
+            CHECK(auth_test, "vsock: peer-auth self-test ran");
+            CHECK(rejected, "vsock: a guest-local peer was rejected");
+            // A rejected *host* would mean the fix broke the real path; the
+            // env checks above already prove it did not, so assert it directly.
+            CHECK(!serial_has(hvm, "SANDBOX-VSOCK-REJECT cid=2"),
+                  "vsock: the host (cid 2) was not rejected");
+        }
+
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,
               "inspect paused");

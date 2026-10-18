@@ -10,17 +10,34 @@
 # Usage: sudo bash build-custom-rootfs.sh
 set -euo pipefail
 
-ROOTFS_OUT="/opt/sandbox-assets/rootfs.ext4"
+# SANDBOX_ROOTFS_OUT lets CI build into a scratch path instead of overwriting
+# the operator's asset (the engine reads the result via SANDBOX_ROOTFS, the same
+# variable scripts/benchmark.sh and tests/make_template.c honour).
+ROOTFS_OUT="${SANDBOX_ROOTFS_OUT:-/opt/sandbox-assets/rootfs.ext4}"
 ROOTFS_SIZE_MB=128
 MNTDIR=$(mktemp -d /tmp/rootfs-mnt.XXXXXX)
 
 log() { echo "[rootfs] $*"; }
 
+# ── 0. Sanity ─────────────────────────────────────────────────────────────────
+if [ "$(id -u)" != 0 ]; then
+    echo "error: must run as root (loop mount + mkfs)" >&2
+    exit 1
+fi
+mkdir -p "$(dirname "$ROOTFS_OUT")"
+
 # ── 1. Install busybox-static ─────────────────────────────────────────────────
+# Best effort: without network we fall back to whatever busybox is installed,
+# which must be statically linked (the rootfs ships no libc) -- verified below.
 log "Installing busybox-static..."
 apt-get install -y --no-install-recommends busybox-static 2>/dev/null | tail -3
 BUSYBOX=$(which busybox-static 2>/dev/null || which busybox)
 log "  busybox: $BUSYBOX ($($BUSYBOX --help 2>&1 | head -1))"
+if ldd "$BUSYBOX" >/dev/null 2>&1; then
+    echo "error: $BUSYBOX is dynamically linked; the rootfs has no libc." >&2
+    echo "       install busybox-static (apt-get install busybox-static)." >&2
+    exit 1
+fi
 
 # ── 2. Create ext4 image ──────────────────────────────────────────────────────
 log "Creating ${ROOTFS_SIZE_MB}MB ext4 image at $ROOTFS_OUT..."

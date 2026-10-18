@@ -34,6 +34,13 @@
 #define ASSET_KERNEL "/opt/sandbox-assets/vmlinux"
 #define ASSET_ROOTFS "/opt/sandbox-assets/rootfs.ext4"
 
+// Same overrides as tests/make_template.c and scripts/benchmark.sh, so CI can
+// cold-boot the guest image it built instead of the operator's asset.
+static const char* asset_path(const char* env, const char* fallback) {
+    const char* v = getenv(env);
+    return (v && *v) ? v : fallback;
+}
+
 static int have_file(const char* p) {
     struct stat st;
     return stat(p, &st) == 0;
@@ -70,8 +77,8 @@ static void test_lifecycle(void) {
     char jail_root[PATH_MAX];
     CHECK_RC(vmm_jail_path(jail, jail_root, sizeof(jail_root)), "jail path");
     template_config_t cfg = { .memory_mib = 128, .vcpu_count = 1,
-                              .kernel_path = ASSET_KERNEL,
-                              .rootfs_path = ASSET_ROOTFS,
+                              .kernel_path = asset_path("SANDBOX_KERNEL", ASSET_KERNEL),
+                              .rootfs_path = asset_path("SANDBOX_ROOTFS", ASSET_ROOTFS),
                               .ready_marker = "SANDBOX-READY" };
     vm_handle_t* vm = vmm_cold_boot(&cfg, jail, jail_root, NULL);
     if (!vm) {
@@ -221,7 +228,8 @@ static void test_pool_e2e(void) {
 
 int main(void) {
     if (geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0 ||
-        !have_file(ASSET_KERNEL) || !have_file(ASSET_ROOTFS) ||
+        !have_file(asset_path("SANDBOX_KERNEL", ASSET_KERNEL)) ||
+        !have_file(asset_path("SANDBOX_ROOTFS", ASSET_ROOTFS)) ||
         !have_file("/usr/local/bin/firecracker")) {
         printf("SKIP (need root + /dev/kvm + firecracker + guest assets)\n");
         return 0;

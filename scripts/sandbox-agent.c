@@ -3,6 +3,8 @@
 //
 // This is the guest's foreground process (the init execs it). It:
 //   * binds an AF_VSOCK listener on ENV_PORT,
+//   * authenticates every accepted peer: only the host (CID_HOST) may drive
+//     this channel, so an in-guest process cannot impersonate it (#10),
 //   * prints "SANDBOX-READY" (the template readiness marker),
 //   * then busy-loops: zero-timeout poll() + accept() serves the host's per-VM
 //     env injection, and it periodically prints "SANDBOX-TICK". Until the env
@@ -34,6 +36,11 @@
 #define ENV_FILE "/tmp/sandbox-env"
 #define MAX_PAYLOAD 8192
 
+// vsock loopback CID: a connection from inside this guest to this guest.
+#ifndef VMADDR_CID_LOCAL
+#define VMADDR_CID_LOCAL 1
+#endif
+
 static int g_console = -1;
 
 static void say(const char* s) {
@@ -43,6 +50,74 @@ static void say(const char* s) {
 }
 
 static int got_env = 0;
+
+// ── #10: authenticate the host ───────────────────────────────────────────────
+//
+// The listener is reachable by ANY process inside the guest, so without a peer
+// check an unprivileged guest process could open a connection to ENV_PORT and
+// impersonate the host -- injecting environment, and (once #24 lands) issuing
+// exec/file RPC. That is guest-internal, so it is low impact today, but it is
+// the wrong trust model for a control channel.
+//
+// Only the host's vsock proxy legitimately presents VMADDR_CID_HOST. A
+// guest-local connection presents VMADDR_CID_LOCAL (or the guest's own CID).
+// This is a real boundary rather than a formality because the CID is assigned
+// by the vsock transport, not by the sender: connect()ing to CID 2 from inside
+// the guest is routed to the host, so a guest process cannot make its own
+// connection look like it came from CID 2.
+//
+// A per-session token is NOT usable here: the token would have to reach the
+// guest over the very channel being authenticated, and a snapshot template is
+// built once and restored per session, so nothing per-session can be baked in.
+// (Guest->host needs no token either: each VM has its own vsock UDS, so the
+// connection's provenance is already per-VM.)
+static int peer_is_host(int cfd) {
+    struct sockaddr_vm peer;
+    socklen_t len = sizeof(peer);
+    if (getpeername(cfd, (struct sockaddr*)&peer, &len) != 0) return 0;
+    return peer.svm_family == AF_VSOCK && peer.svm_cid == VMADDR_CID_HOST;
+}
+
+static void log_reject(int cfd) {
+    struct sockaddr_vm peer;
+    socklen_t len = sizeof(peer);
+    unsigned cid = 0;
+    if (getpeername(cfd, (struct sockaddr*)&peer, &len) == 0) cid = peer.svm_cid;
+    char m[64];
+    int n = snprintf(m, sizeof(m), "SANDBOX-VSOCK-REJECT cid=%u\n", cid);
+    if (n > 0) {
+        ssize_t w = write(g_console, m, (size_t)n);
+        (void)w;
+    }
+}
+
+// In-guest self-test. After the host's first successful injection we know we
+// are post-restore, so open a loopback connection to our OWN listener. The main
+// loop then has to accept it and reject it through the production path, which
+// logs SANDBOX-VSOCK-REJECT -- that line is the assertion (see tests/test_ipc.c).
+// Best effort: if the guest kernel has no vsock loopback we log SKIP.
+static int g_probe_fd = -1;
+
+static void auth_probe(void) {
+    int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    if (fd < 0) {
+        say("SANDBOX-VSOCK-AUTH-SKIP no-socket\n");
+        return;
+    }
+    struct sockaddr_vm sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.svm_family = AF_VSOCK;
+    sa.svm_cid = VMADDR_CID_LOCAL;
+    sa.svm_port = ENV_PORT;
+    if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
+        say("SANDBOX-VSOCK-AUTH-SKIP no-loopback\n");
+        close(fd);
+        return;
+    }
+    // Hold the fd open until the listener has accepted it (the loop closes it).
+    g_probe_fd = fd;
+    say("SANDBOX-VSOCK-AUTH-TEST\n");
+}
 
 static int bind_listen(void) {
     int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
@@ -141,6 +216,7 @@ int main(void) {
     unsigned long tick = 0;
     unsigned long rl = 0;
     int announced = 0;
+    int auth_probed = 0;
     for (;;) {
         pfd.fd = lfd;
         pfd.events = POLLIN;
@@ -153,7 +229,28 @@ int main(void) {
             }
             int cfd = accept(lfd, NULL, NULL);
             if (cfd >= 0) {
-                serve(cfd);
+                // #10: only the host may drive this channel. A connection from
+                // inside the guest (or anything not presenting CID_HOST) is
+                // dropped and logged rather than applied.
+                //
+                // The peer must be inspected while the connection is still open,
+                // so the self-test probe (g_probe_fd) is only released after
+                // this check, never before it.
+                int is_host = peer_is_host(cfd);
+                if (!is_host) log_reject(cfd);
+                if (g_probe_fd >= 0) {
+                    close(g_probe_fd);
+                    g_probe_fd = -1;
+                }
+                if (is_host) {
+                    serve(cfd);
+                    if (!auth_probed) {
+                        auth_probed = 1;
+                        auth_probe();  // must be rejected on the next accept
+                    }
+                } else {
+                    close(cfd);
+                }
                 continue;
             }
         }

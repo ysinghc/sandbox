@@ -135,6 +135,12 @@ Each host needs:
 - Firecracker at `${FIRECRACKER_BIN:-/usr/local/bin/firecracker}`;
 - guest assets at `${SANDBOX_KERNEL:-/opt/sandbox-assets/vmlinux}` and
   `${SANDBOX_ROOTFS:-/opt/sandbox-assets/rootfs.ext4}`;
+  the kernel is only obtainable from the host, but the rootfs is rebuildable
+  from this tree with `sudo scripts/build-custom-rootfs.sh` (writes
+  `/opt/sandbox-assets/rootfs.ext4`, or `${SANDBOX_ROOTFS_OUT}`). The privileged
+  workflow builds it into the checkout and points `SANDBOX_ROOTFS` at the result,
+  so guest-side changes (`scripts/sandbox-agent.c`, `/init`) are exercised in CI
+  without clobbering the operator's asset;
 - a build toolchain plus `libprotobuf-dev`, `libseccomp-dev`,
   `libcurl4-openssl-dev`, `libnftables-dev`, `libsystemd-dev`;
 - a dev-capable (not `nodev`) working filesystem under `/var/tmp` or `$HOME` —

@@ -26,8 +26,21 @@ jobs:
   e2e:
     name: e2e (${{ inputs.arch }})
     runs-on: [self-hosted, "${{ inputs.label }}"]
+    env:
+      # Build the guest image from this checkout instead of using the operator's
+      # /opt/sandbox-assets/rootfs.ext4, so guest-side changes (scripts/
+      # sandbox-agent.c, /init) are actually exercised. The kernel is not
+      # rebuildable here and stays a host prerequisite.
+      SANDBOX_ROOTFS: ${{ github.workspace }}/guest/rootfs.ext4
     steps:
       - uses: actions/checkout@v5
+
+      - name: Build the guest image
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO env SANDBOX_ROOTFS_OUT="$SANDBOX_ROOTFS" \
+                bash scripts/build-custom-rootfs.sh
+          ls -l "$SANDBOX_ROOTFS"
 
       - name: Configure
         # The VM tests need a workspace on a filesystem that permits device

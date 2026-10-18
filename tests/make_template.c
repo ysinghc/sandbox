@@ -16,6 +16,13 @@
 #define ASSET_KERNEL "/opt/sandbox-assets/vmlinux"
 #define ASSET_ROOTFS "/opt/sandbox-assets/rootfs.ext4"
 
+// Same overrides as scripts/benchmark.sh, so CI can build and use its own guest
+// image (scripts/build-custom-rootfs.sh) instead of the operator's asset.
+static const char* asset_path(const char* env, const char* fallback) {
+    const char* v = getenv(env);
+    return (v && *v) ? v : fallback;
+}
+
 static int have_file(const char* p) {
     struct stat st;
     return stat(p, &st) == 0;
@@ -27,8 +34,10 @@ int main(void) {
         fprintf(stderr, "SKIP template setup: no SANDBOX_SNAPSHOT_ROOT\n");
         return 0;
     }
+    const char* asset_kernel = asset_path("SANDBOX_KERNEL", ASSET_KERNEL);
+    const char* asset_rootfs = asset_path("SANDBOX_ROOTFS", ASSET_ROOTFS);
     if (geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0 ||
-        !have_file(ASSET_KERNEL) || !have_file(ASSET_ROOTFS)) {
+        !have_file(asset_kernel) || !have_file(asset_rootfs)) {
         fprintf(stderr, "SKIP template setup: need root + /dev/kvm + assets\n");
         return 0;
     }
@@ -49,8 +58,8 @@ int main(void) {
     const char* tmpl = getenv("SANDBOX_TEMPLATE_NAME");
     if (!tmpl || !*tmpl) tmpl = "e2e";
     template_config_t cfg = { .memory_mib = 128, .vcpu_count = 1,
-                              .kernel_path = ASSET_KERNEL,
-                              .rootfs_path = ASSET_ROOTFS,
+                              .kernel_path = asset_kernel,
+                              .rootfs_path = asset_rootfs,
                               .ready_marker = "SANDBOX-READY" };
     // Rebuild unconditionally so consumers never use a stale template.
     char stale[4096], stale_ready[4096];
