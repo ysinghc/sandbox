@@ -1,0 +1,70 @@
+name: Privileged e2e (body)
+
+# Reusable body for one architecture, called by privileged-e2e.yml (which owns
+# the enable/disable variables and the fork guard). Not triggered directly.
+#
+# The runner must be able to run as root: the harness chroots, setuids, writes
+# cgroups and mknod()s /dev/kvm. See docs/TESTING.md §"Privileged runners" for
+# the host prerequisites and the registration commands.
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: "self-hosted runner label to target"
+        required: true
+        type: string
+      arch:
+        description: "architecture, used for artefact names"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: e2e (${{ inputs.arch }})
+    runs-on: [self-hosted, "${{ inputs.label }}"]
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        # The VM tests need a workspace on a filesystem that permits device
+        # nodes: the jail mknod()s /dev/kvm and /dev/net/tun, and opening them
+        # on a `nodev` mount fails with EACCES. /tmp is nodev on most hosts,
+        # /var/tmp usually is not.
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DSANDBOX_TEST_TMPDIR="${SANDBOX_TEST_TMPDIR:-/var/tmp}"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unit tests that need no privileges
+        run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
+      # The whole point of a self-hosted runner: the tests that cannot run on
+      # hosted CI. They need root, /dev/kvm, Firecracker and the guest assets.
+      - name: Tests that need root, /dev/kvm and guest assets
+        run: ctest --test-dir build --output-on-failure -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$"
+
+      # The runner may or may not be the root user; use sudo only when needed.
+      - name: e2e smoke (root)
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO bash tests/e2e/smoke.sh
+
+      - name: Latency assertions (root)
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO bash tests/e2e/latency.sh
+
+      - name: Upload daemon logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-logs-${{ inputs.arch }}
+          path: /tmp/serial-last-*.log
+          if-no-files-found: ignore
+          retention-days: 7

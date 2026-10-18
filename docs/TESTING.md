@@ -62,9 +62,20 @@ gh variable set PRIVILEGED_ARM     --body true   # ONLY once an ARM runner exist
 ```
 
 Until then every job is skipped rather than queued, so pull requests are never
-blocked. The aarch64 matrix leg is gated separately on purpose: with no runner
-serving `sandbox-arm64`, that job does not fail — it queues for ~24 h and is
-then cancelled, which is indistinguishable from a broken workflow.
+blocked. The aarch64 leg is gated separately on purpose: with no runner serving
+`sandbox-arm64`, that job does not fail — it queues for ~24 h and is then
+cancelled, which is indistinguishable from a broken workflow.
+
+The two legs share [`privileged-e2e-run.yml`](../.github/workflows/privileged-e2e-run.yml)
+and are separate jobs rather than matrix rows, because `matrix` is **not** an
+available context in `jobs.<job_id>.if` (only `github`, `needs`, `vars`,
+`inputs`) — referencing it there invalidates the entire workflow file.
+
+> **Security.** A self-hosted runner executes workflow code as **root** on the
+> operator's machine. `privileged-e2e.yml` therefore refuses pull requests from
+> forks (`github.event.pull_request.head.repo.full_name == github.repository`)
+> and only ever runs the owner's own branches. Do not remove that guard: a
+> privileged runner plus an untrusted PR is a root compromise.
 
 ### Registering a runner
 
