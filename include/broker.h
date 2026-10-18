@@ -27,6 +27,13 @@ typedef struct credential_store_t credential_store_t;
 credential_store_t* credentials_load(const char* path);
 void credentials_free(credential_store_t* store);
 
+// Refuse a credentials file that is group/world accessible or not owned by the
+// broker's uid: a leaked secret must not be readable by another local user.
+// Returns 0 when the file is safe or absent, -1 (errno=EACCES) when unsafe.
+// SANDBOX_ALLOW_INSECURE_CREDENTIALS=1 downgrades the refusal to a warning for
+// development only.
+int credentials_check_permissions(const char* path);
+
 // Look up the credential for a request's Host value. Any ":port" suffix and
 // letter case are ignored. Returns a borrowed pointer, or NULL if unset.
 const char* credential_store_lookup(const credential_store_t* store, const char* host);

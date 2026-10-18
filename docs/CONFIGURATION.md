@@ -104,6 +104,12 @@ production-oriented):
 `:port` suffix and letter case are ignored on lookup. See
 [`config/credentials.conf.example`](../config/credentials.conf.example).
 
+The file **must be `0600` and owned by the broker's uid**. On startup the broker
+`stat()`s it and refuses to run if it is readable/writable by group or other, or
+owned by another uid — a leaked secret must not be readable by another local
+user. For development only, `SANDBOX_ALLOW_INSECURE_CREDENTIALS=1` downgrades
+the refusal to a loud warning.
+
 ```ini
 [api.openai.com]
 credential = Bearer sk-...        # injected verbatim as Authorization

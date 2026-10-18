@@ -270,6 +270,18 @@ static void test_credentials(void) {
     }
     CHECK(credentials_load("/nonexistent/xyz.conf") == NULL,
           "missing file -> NULL");
+
+    // #3: permissions / ownership gate on the secrets file.
+    CHECK(chmod(p, 0600) == 0, "chmod 0600");
+    CHECK(credentials_check_permissions(p) == 0, "0600 file accepted");
+    CHECK(chmod(p, 0644) == 0, "chmod 0644");
+    CHECK(credentials_check_permissions(p) != 0, "world-readable file refused");
+    CHECK(credentials_check_permissions("/nonexistent/xyz.conf") == 0,
+          "absent file is not an error");
+    setenv("SANDBOX_ALLOW_INSECURE_CREDENTIALS", "1", 1);
+    CHECK(credentials_check_permissions(p) == 0,
+          "dev override downgrades refusal to a warning");
+    unsetenv("SANDBOX_ALLOW_INSECURE_CREDENTIALS");
     report("credentials", b);
 }
 

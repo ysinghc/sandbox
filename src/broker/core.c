@@ -746,6 +746,10 @@ static void start_broker_metrics(void) {
 int broker_run(void) {
     signal(SIGPIPE, SIG_IGN);
 
+    // A group/world-readable secrets file is a credential leak; refuse it
+    // before parsing. The check prints its own diagnostic (issue #3).
+    if (credentials_check_permissions(broker_credentials_path()) != 0) return -1;
+
     credential_store_t* creds = credentials_load(broker_credentials_path());
     if (!creds) {
         fprintf(stderr, "[broker] cannot load credentials %s: %s\n",

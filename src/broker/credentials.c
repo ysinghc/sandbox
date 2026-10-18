@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 typedef struct {
     char* host;
@@ -142,4 +144,40 @@ const char* credential_store_lookup(const credential_store_t* store, const char*
         if (strcmp(entry, key) == 0) return store->entries[i].credential;
     }
     return NULL;
+}
+
+int credentials_check_permissions(const char* path) {
+    if (!path || !*path) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) return (errno == ENOENT) ? 0 : -1;
+    if (!S_ISREG(st.st_mode)) {
+        errno = EINVAL;
+        return -1;
+    }
+
+    const char* why = NULL;
+    if (st.st_mode & (S_IRWXG | S_IRWXO)) {
+        why = "is readable/writable by group or other";
+    } else if (st.st_uid != getuid()) {
+        why = "is not owned by the broker uid";
+    }
+    if (!why) return 0;
+
+    const char* allow = getenv("SANDBOX_ALLOW_INSECURE_CREDENTIALS");
+    if (allow && strcmp(allow, "1") == 0) {
+        fprintf(stderr,
+                "[broker] WARNING: %s %s; continuing only because "
+                "SANDBOX_ALLOW_INSECURE_CREDENTIALS=1\n",
+                path, why);
+        return 0;
+    }
+
+    fprintf(stderr, "[broker] refusing %s: it %s (mode %04o, uid %u)\n", path,
+            why, (unsigned)(st.st_mode & 07777), (unsigned)st.st_uid);
+    errno = EACCES;
+    return -1;
 }
