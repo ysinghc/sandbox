@@ -83,6 +83,43 @@ while applying this plan:
 
 (Implemented correctly in `scripts/check-spdx.sh` + the sweep.)
 
+### C6 — #1: the seccomp trace was already taken (WAS IMPLIED TO BE OUTSTANDING)
+
+The plan's step 1 is "generate a real trace". The allow-list comments in
+`src/seccomp.c` already cite a real x86_64 strace as their source. The genuine
+gap was only the **regression test**, which did not exist (`tests/test_seccomp.c`
+now does).
+
+### C7 — #2: the escape test already existed (WAS IMPLIED TO BE MISSING)
+
+`tests/jailer_probe.c` already exits 10 when an outside sentinel is openable
+inside the chroot, and `tests/test_jailer.c` drives it through a real
+`spawn_jailed()` inside a user namespace. No new `tests/e2e/chroot_escape.sh`
+was needed — only the `..`/`getcwd` assertion the plan named, which is now in
+the probe (exit 12). Note what actually closes the `/proc/self/root` escape:
+**`/proc` is not mounted in the jail**, not the chroot alone.
+
+### C8 — #22: `vmstate_sha256` already exists (WAS PROPOSED AS NEW)
+
+`snap_manifest_t` (`include/snapshot_manager.h`) already carries both
+`memory_sha256` and `vmstate_sha256`, and `build_manifest()` populates them. The
+real #22C gap is narrower: pin the **kernel image identity**, not the vmstate.
+
+### C9 — #19: the published asset layout is not what the plan assumes (WAS WRONG)
+
+The plan says "add checksums" — they already ship. And `v0.12.0`, the only
+release so far, publishes **only** `sandbox-engine-<ver>-linux-<arch>.tar.gz`
+(+ `.sha256`): the `-bin.tar.gz` and standalone `-linux-<arch>` binaries are
+new in the rewritten workflow and appear only from the *next* release. Any
+installer must therefore target the staged tree. `scripts/install.sh` does.
+
+### C10 — §12.2 items already satisfied (WERE OPEN IN THE DOC, NOT IN THE CODE)
+
+Broker TLS verification is **on by default** (`CURLOPT_SSL_VERIFYPEER=1`,
+`VERIFYHOST=2`; off only via `SANDBOX_BROKER_TLS_VERIFY=0`), and the session
+token already comes from `getrandom()` (`/dev/urandom` is a fallback). Both
+were ticked off with evidence rather than "fixed".
+
 ### Sharper alternatives adopted
 
 - **#19** — checksums already ship for both architectures (`.sha256` since
@@ -109,15 +146,21 @@ while applying this plan:
 
 ---
 
-## Status — Day 1–2 (this change set)
+## Status
 
 | Item | State |
 |---|---|
-| Perf fixes committed (`snapshot_manager.c`, `vmm_manager.c`) | ✅ `e5a5cc7` |
-| `tests/e2e/smoke.sh` + `tests/e2e/latency.sh` (Day 1, #20) | ✅ |
-| `privileged-e2e.yml` + runner docs (Day 3 groundwork, #20) | ✅ (inert until runners exist) |
-| `jail_cleanup` shell-injection fix (Day 2, #5) | ✅ **plus two more call sites the plan missed** |
-| SPDX headers + `scripts/check-spdx.sh` + CI gate (Day 2, #8) | ✅ 66 files |
+| Perf fixes (`snapshot_manager.c`, `vmm_manager.c`) | ✅ `e5a5cc7` |
+| `jail_cleanup` shell-injection fix (#5) | ✅ `d2eff09` — **plus three more call sites the plan missed** |
+| SPDX headers + `scripts/check-spdx.sh` + CI gate (#8) | ✅ `085d594` — 66 files |
+| `tests/e2e/smoke.sh` + `tests/e2e/latency.sh`, gated `privileged-e2e.yml` (#20) | ✅ `639b25e` — inert until runners exist |
+| Threat model + §12.2 close-out (#21, #5) | ✅ `13b36ce`/later |
+| `credentials.conf` permissions gate (#3) | ✅ + `test_broker` coverage |
+| Seccomp allow-list regression test (#1) | ✅ `tests/test_seccomp.c` — runs unprivileged in CI |
+| Chroot `..`-escape assertion (#2) | ✅ `jailer_probe` exit 12 |
+| `scripts/install.sh` + release docs (#19) | ✅ verified offline against a staged tree |
+| M1 ARM timer (#6), vsock auth (#10) | ⏳ need a privileged/ARM host |
+| M2 (#22–#28) | ⏳ not started; #22 clock fix unverifiable without a VM |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -315,9 +358,23 @@ helper; also enables `pivot_root`) · **#11** per-tenant quotas incl. storage by
 ## Immediate next steps
 
 ```
-Day 1  ✅ commit perf fixes; tests/e2e smoke + latency harness
-Day 2  ✅ jail_cleanup shell-outs (3 call sites) via sandbox_fs; SPDX sweep + CI gate
-Day 3  Register self-hosted runners; set PRIVILEGED_RUNNERS=true → #20 green
-Day 4  #22 x86_64 clock_realtime (with fallback); confirm guest kernel ≥ 5.18
-Day 5  #23 workspace bind-mount prototype per docs/WORKSPACE_DISK.md (no TTL yet)
+Done     perf fixes; e2e smoke + latency harness; 4 shell-outs removed; SPDX sweep + CI gate
+Done     #21 threat model + §12.2 close-out; #1 seccomp regression test; #2 chroot ".." assertion
+Done     #3 credentials.conf permissions gate; #19 scripts/install.sh + prebuilt-release docs
+Deferred #20 privileged e2e — runners switched off by the operator; set PRIVILEGED_RUNNERS=true
+         and register the host when it is ready. The workflow is correct and skipped, not broken.
+Next     the whole remaining critical path needs /dev/kvm to *verify*:
+           #10 vsock authentication      — host + guest code; a guest rebuild is what proves it
+           #6  aarch64 arch timer        — needs an ARM host (native, or the ubuntu-24.04-arm runner)
+           #22 x86_64 clock_realtime     — trivial code, but only provable with a guest that boots
+           #23 workspace bind-mount + TTL — the M2 product core
+         Code can be written and compile-checked here; treat it as unverified until the privileged
+         host is back, and do not claim a latency/reliability number for it.
 ```
+
+> **Note on the order.** The plan's burn-down assumed the privileged host was available from Day 3.
+> With runners off, the honest split is: M0/M1 hygiene (done above) is verifiable anywhere; everything
+> from #10 onward has a *runtime* claim attached (a timer works, a clock is right, a workspace
+> persists) that this environment cannot confirm. Writing it is still useful — it unblocks a
+> one-shot verification pass — but the plan should not report those items as *done* until they have
+> been observed once.
