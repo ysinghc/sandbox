@@ -1338,12 +1338,23 @@ server and broker:
 
 ### 12.2 Audit Checklist (Pre-Production)
 
-- [ ] Seccomp filter tested against Firecracker syscall trace
-- [ ] Jailer chroot verified (no escape via /proc/self/root)
-- [ ] Credential config file permissions (chmod 600, root-owned)
+- [x] Seccomp filter tested against Firecracker syscall trace — the trace was
+      taken on x86_64 (see the header of `src/seccomp.c`); `tests/test_seccomp.c`
+      now asserts every permitted syscall is reachable and that an omitted one
+      (`getuid`) is never allowed. Runs unprivileged, in CI. (#1)
+- [x] Jailer chroot verified (no escape via /proc/self/root) — the jailer does
+      `chroot()` + `chdir("/")` (`src/jailer.c:266-267`; **not** `pivot_root`)
+      and `/proc` is not mounted in the jail, so `/proc/self/root` is
+      unreachable. `tests/jailer_probe.c` exits 10 when an outside sentinel is
+      openable and 12 when `..` reaches the host root. (#2)
+- [x] Credential config file permissions (chmod 600, root-owned) — the broker
+      `stat()`s `credentials.conf` at startup and refuses a group/world
+      accessible or foreign-owned file (`src/broker/credentials.c`). (#3)
 - [x] Engine daemon runs with `PR_SET_NO_NEW_PRIVS` after setup — Phase 10.4,
       see §15.12; CAP_SYS_PTRACE delivered as an ambient cap (§15.3)
-- [ ] Network policy tested (guest cannot reach internet directly)
+- [x] Network policy tested (guest cannot reach internet directly) —
+      `tests/test_network.c` (root-only; SKIPs otherwise) asserts the default
+      drop and the single broker exception.
 - [x] nftables rules applied without a shell (libnftables) — Phase 10.5, §15.12
 - [x] Engine socket authenticates peers (SO_PEERCRED allowlist) — Phase 10.1, §15.9
 - [x] Snapshot integrity verified (SHA-256 in manifest, checked on restore) —
@@ -1354,8 +1365,15 @@ server and broker:
       §15.15
 - [x] Liveness/readiness probes + process self-metrics — Phase 13.13, §15.15
 - [x] CI builds + ASan/UBSan + fuzz smoke — Phase 13.14, §15.15
-- [ ] Broker TLS cert validation enabled (HTTPS to upstream)
-- [ ] Session token entropy (getrandom, not /dev/urandom)
+- [x] Broker TLS cert validation enabled (HTTPS to upstream) — verified on by
+      default (`CURLOPT_SSL_VERIFYPEER=1`, `VERIFYHOST=2`); disabled only by
+      `SANDBOX_BROKER_TLS_VERIFY=0`.
+- [x] Session token entropy (getrandom, not /dev/urandom) — 32 bytes from
+      `getrandom()`; `/dev/urandom` is a fallback only (`src/ipc_server.c:290`).
+
+Open items carried out of this list: release signing and store permissions
+(#19), and the unauthenticated vsock control channel (#10 → remediation in
+[`THREAT_MODEL.md`](THREAT_MODEL.md) §5).
 
 ---
 
