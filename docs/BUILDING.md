@@ -84,6 +84,33 @@ DESTDIR=/tmp/stage cmake --install build   # staging (packaging)
 
 See [`DEPLOYMENT.md`](DEPLOYMENT.md) for the resulting layout.
 
+### Installing a prebuilt release
+
+Releases ship per-architecture assets for **x86_64** and **aarch64**.
+[`scripts/install.sh`](../scripts/install.sh) selects this machine's
+architecture, verifies the SHA-256, and installs the binaries and libraries:
+
+```sh
+sudo scripts/install.sh                    # latest, into /usr/local
+sudo scripts/install.sh --version v0.12.0  # a specific tag
+sudo scripts/install.sh --full             # also extract units/config/state dirs over /
+scripts/install.sh --dry-run               # print the plan; download nothing
+```
+
+Set `SANDBOX_BASE_URL` to install from a mirror (the assets are also fetchable
+by hand). Per architecture (`<arch>` is `x86_64` or `aarch64`):
+
+| asset | contents |
+|---|---|
+| `sandbox-engine-<ver>-linux-<arch>.tar.gz` | staged install tree (the "zip") |
+| `sandbox-engine-<ver>-linux-<arch>-bin.tar.gz` | bare binaries + shared libraries |
+| `sandboxd-linux-<arch>`, `sandbox-cli-linux-<arch>`, … | standalone binaries |
+| `*.sha256` | checksums for the two archives |
+
+aarch64 assets are built **natively** on `ubuntu-24.04-arm` — there is no
+cross-toolchain, and no qemu emulation. `install.sh` also works offline against
+`file://` (or a mirror), which is how it is smoke-tested.
+
 ## Cross / on-target builds
 
 The engine builds natively on both x86_64 and aarch64. On a small host (e.g. a
