@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 6 verification: real Firecracker lifecycle (cold boot, serial
 // readiness, pause/resume, snapshot), UFFD restore with post-restore guest
 // execution, and pool-managed provision/destroy end to end.

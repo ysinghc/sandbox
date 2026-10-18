@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Prefault Worker (§5.3): stream snapshot pages into the page cache in
 // background after vCPU resume. No coordination with the handler needed —
 // both read the same mmap; the worker just warms the cache ahead of faults.

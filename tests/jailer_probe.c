@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Static probe executed inside the jail. Args: <outside_path> <expected_uid>
 // <ptrace|ioctl|allowed>
 // Exit 10: outside path reachable (chroot broken). Exit 11: uid mismatch.

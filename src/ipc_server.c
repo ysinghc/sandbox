@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Engine IPC server (§2.3) + engine-side session-token authority (§5.8).
 //
 // SOCK_SEQPACKET Unix socket, length-prefixed protobuf. One persistent

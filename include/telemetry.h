@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef TELEMETRY_H
 #define TELEMETRY_H
 

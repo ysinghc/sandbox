@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Observability (§11.1): Prometheus-format counters. All counters are atomic
 // so the pool/gateway/uffd paths can bump them without a lock.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // §10.11 verification: per-VM cgroup hierarchy creation, limit-file contents,
 // vm_id sanitization, and removal. SKIPs when cgroup v2 is unavailable (or the
 // test is not root, since the default root needs privilege to populate).

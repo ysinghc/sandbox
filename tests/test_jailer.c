@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 2 verification: seccomp enforcement (always runs) plus the full
 // jailer sequence under a user namespace when id-mapping is available
 // (SKIPs where the environment forbids it, e.g. AppArmor without sudo).

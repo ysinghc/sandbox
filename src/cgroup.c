@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Per-VM cgroup v2 enforcement (§10.11). See include/cgroup.h.
 //
 // The jailer already accepts a cgroup.procs path in jailer_config_t and writes

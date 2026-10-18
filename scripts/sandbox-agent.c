@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // sandbox-agent — guest-side env receiver + heartbeat (Phase 9b).
 //
 // This is the guest's foreground process (the init execs it). It:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Guards the C++ wrapper <-> C API linkage. sandbox.cpp must reference the
 // *unmangled* C symbols, which requires extern "C" in libsandbox.h; without it
 // the mangled references cannot be resolved against libsandbox.so. This test

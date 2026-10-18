@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef POOL_MANAGER_H
 #define POOL_MANAGER_H
 

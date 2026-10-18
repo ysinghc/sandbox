@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Structured logging (§10.12). See include/log.h.
 
 #define _GNU_SOURCE

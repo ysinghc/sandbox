@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 5 verification: userfaultfd lazy restore of a real snapshot.
 // A "guest" thread touches pages only after register+handler-start (the
 // vmm_resume_vcpus ordering); every byte must match the snapshot pattern,

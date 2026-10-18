@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef IPC_CODEC_H
 #define IPC_CODEC_H
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef SNAPSHOT_MANAGER_H
 #define SNAPSHOT_MANAGER_H
 

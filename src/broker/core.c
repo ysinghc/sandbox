@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Broker core (§5.8): session-token validation with the engine daemon,
 // allow-listing, credential injection, and upstream proxying over libcurl.
 // Everything here is testable in-process; src/broker/main.c only wires argv/env.

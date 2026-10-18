@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef PREFAULT_WORKER_H
 #define PREFAULT_WORKER_H
 

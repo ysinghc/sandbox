@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Minimal self-contained SHA-256 (FIPS 180-4). See include/sha256.h.
 
 #include "sha256.h"

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // sandbox-cli: create a sandbox and hold the session open (a disconnected
 // session reclaims its sandboxes, so a fire-and-forget CLI cannot leave one
 // behind). Prints a JSON line with the id, then waits for SIGINT/SIGTERM.

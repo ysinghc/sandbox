@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef UFFD_HANDLER_H
 #define UFFD_HANDLER_H
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 11: daemon config parser test (no root, no KVM). Verifies the flat
 // "key = value" parser recognises every key in the packaged engine.conf
 // (sections are ignored) and that env overrides win.

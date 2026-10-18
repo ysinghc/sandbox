@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 4 verification: manifest bitmap correctness, write/read round-trip,
 // versioning, atomic publish under concurrent readers, create-flow hygiene
 // (bad config fails clean), and version-check drain. No root needed (tmp dirs).

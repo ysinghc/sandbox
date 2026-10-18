@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // HTTP parsing + response helpers (§5.8). The broker reads only the request
 // line and headers (the body stays in the socket for the upstream forwarder)
 // and speaks enough HTTP/1.1 to proxy a guest request.

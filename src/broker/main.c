@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Credential Broker entry point (§5.8). All request-handling logic lives in
 // the broker core (src/broker/{core,http,credentials}.c) so it is testable
 // in-process; this shim only initialises libcurl and runs the accept loop.

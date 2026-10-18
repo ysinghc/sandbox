@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Credential store (§5.8 / §7.2): parse an INI file of "[host]" sections each
 // carrying a "credential = VALUE" key. The engine holds no credentials; only
 // the broker reads this file (chmod 600, root-owned in production).

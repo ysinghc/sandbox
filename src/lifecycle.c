@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Lifecycle: the daemon-side live-VM registry plus the client-side libsandbox
 // C API (§3.1). The client speaks the §2.3 IPC protocol (SEQPACKET +
 // length-prefixed protobuf) through ipc_codec.

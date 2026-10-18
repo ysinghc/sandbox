@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # build-and-test.sh — Build sandbox-engine in the VM and run Phase 6 fixture
 # Run from: multipass exec sandbox-dev -- bash /home/ubuntu/sandbox/scripts/build-and-test.sh
 set -euo pipefail

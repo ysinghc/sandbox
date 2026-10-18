@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // sandboxd: the engine daemon (§5, §10). Wires the warm pool to the network
 // manager and the IPC server, and runs the engine-side broker-control socket
 // that the credential broker validates session tokens against.

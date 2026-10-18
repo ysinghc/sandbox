@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 8 integration test: daemon-side IPC server + client API + engine-side
 // broker-control token authority, over the real warm pool (REQUIRES the "e2e"
 // template fixture and root). SKIPs where root/KVM/template are unavailable.

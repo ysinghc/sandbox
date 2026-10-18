@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // C bridge over the generated C++ protobuf types (§2.3). Compiled as C++ so it
 // can use sandbox.pb.h directly; every entry point has C linkage (ipc_codec.h).
 

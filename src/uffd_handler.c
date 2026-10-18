@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // UFFD Handler (§5.2): serve guest page faults on-demand from the mmap'd
 // snapshot. Registration MUST complete before vmm_resume_vcpus(); the kernel
 // holds faulting vCPUs until the handler serves them, so there is no window

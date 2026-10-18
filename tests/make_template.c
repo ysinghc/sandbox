@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // CTest FIXTURES_SETUP: build the "e2e" template once per build dir.
 // SANDBOX_TEMPLATE_NAME overrides the name (default "e2e"); the daemon must be
 // configured to restore the same name. SKIPs (exit 0, no READY marker) without

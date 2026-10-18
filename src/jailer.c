@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Jailer (§5.4): confine and privilege-drop the VMM process.
 // Order: setup (mkdir, device mounts) → cgroup → chroot → caps →
 // setuid/setgid → seccomp → exec.

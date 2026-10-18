@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef NETWORK_MANAGER_H
 #define NETWORK_MANAGER_H
 

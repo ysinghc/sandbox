@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Jailer seccomp policy (§5.5). Our filter is the *only* one — Firecracker is
 // exec'd with --no-seccomp — and the jailer installs it *before* dup2/execve,
 // so it must also cover the calls Firecracker makes before it would install its

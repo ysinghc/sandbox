@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef SANDBOX_VERSION_H
 #define SANDBOX_VERSION_H
 

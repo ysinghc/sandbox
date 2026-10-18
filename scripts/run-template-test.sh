@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # run-template-test.sh — Run make_template with proper library path, must be run as root
 # Usage: sudo bash run-template-test.sh
 set -euo pipefail

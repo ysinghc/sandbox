@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
 # CTest FIXTURES_CLEANUP for the network test: remove everything the test may
 # have leaked, including on abort/core-dump paths. Idempotent, always exits 0.
 # Only touches test artifacts (sbtest* netns, tap-vmt* rules, test routes).

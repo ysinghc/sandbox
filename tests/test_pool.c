@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 1 verification: pool concurrency + invariant test (TSan-clean).
 //
 // Proves under concurrent provision load that the §5.1 invariant

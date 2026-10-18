@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Network Manager (§5.7): tap devices plus nftables rules forcing guest
 // traffic through the broker. Phase 10.5: rules and cleanup run through
 // libnftables (no shell). A system() fallback is kept for builds without the

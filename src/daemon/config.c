@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // sandboxd configuration parser (Phase 11). Flat "key = value"; [section]
 // headers are skipped (a line without '=' is ignored). See engine_config.h.
 

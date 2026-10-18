@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef LIBSANDBOX_HPP
 #define LIBSANDBOX_HPP
 

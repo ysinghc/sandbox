@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-2.0-only
 # Sync local sandbox source to the test Pi and rebuild. Run from the repo root.
 #
 # Remote paths are deliberately tilde-free:

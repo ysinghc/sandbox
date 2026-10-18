@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # setup-vm.sh — Bootstrap sandbox-dev Multipass VM for Phase 6 testing
 # Run as: sudo bash setup-vm.sh (inside the VM)
 set -euo pipefail

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // §10.13 verification: /health, /ready (pool-gated), /metrics (incl. process
 // self-stats) and 404 handling. No root; binds an ephemeral loopback port.
 

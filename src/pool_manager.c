@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Pool Manager (§5.1): fixed-size warm VM pool, overflow queue, replenishment thread.
 // NOTE: fast path omits the LLD's restoring_count++ reservation (it double-counts
 // with the replenishment thread's own increment and wedges the pool full).

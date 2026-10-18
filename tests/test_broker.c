@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 7 verification: credential broker request pipeline.
 //
 // Covers credential-file parsing, HTTP header parsing/munging, session-token

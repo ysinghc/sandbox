@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-2.0-only
 # build-custom-rootfs.sh
 # Creates a minimal ext4 rootfs for sandbox template tests.
 # The rootfs has a custom /init that:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Phase 3 verification (root only): tap setup per §5.7, nft rules present as
 // specified, and packet-level proof from the guest side (frames written to
 // the tap fd): 169.254.0.1:8080 answers SYN-ACK, non-broker destinations are

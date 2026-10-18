@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 #ifndef ENGINE_CONFIG_H
 #define ENGINE_CONFIG_H
 
