@@ -2,6 +2,7 @@
 // Static probe executed inside the jail. Args: <outside_path> <expected_uid>
 // <ptrace|ioctl|allowed>
 // Exit 10: outside path reachable (chroot broken). Exit 11: uid mismatch.
+// Exit 12: cwd escaped the jail root via "..".
 // Exit 13: allowed syscall failed post-filter. Exit 14: filter load failed.
 // Exit 0: "allowed" mode — every permitted syscall (incl. the jailer's dup2,
 //         musl's arch_prctl, and Firecracker's startup poll) succeeded.
@@ -15,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -45,6 +47,18 @@ int main(int argc, char** argv) {
     if (fd >= 0) { close(fd); return 10; }
 
     if (getuid() != expected_uid) return 11;
+
+    // #2: a chroot escape via ".." must not work. The jailer does chroot() then
+    // chdir("/") — it does NOT use pivot_root — so the kernel must resolve ".."
+    // inside the new root and getcwd() must stay "/". Reaching the host root
+    // here means the jail is broken. Runs before the seccomp filter is loaded.
+    {
+        char cwd[PATH_MAX];
+        if (chdir("/..") != 0 || !getcwd(cwd, sizeof cwd) ||
+            strcmp(cwd, "/") != 0)
+            return 12;
+        if (chdir("/") != 0) return 12;
+    }
 
     printf("PROBE ok uid=%d\n", (int)getuid());
     fflush(stdout);
