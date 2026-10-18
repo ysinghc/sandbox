@@ -1,0 +1,67 @@
+name: Privileged e2e
+
+# Runs the tests that need real root, /dev/kvm, /dev/net/tun, nftables,
+# Firecracker and the guest assets. None of that exists on GitHub-hosted
+# runners, so these jobs need SELF-HOSTED runners.
+#
+# This workflow is inert until a repository variable enables it:
+#
+#     gh variable set PRIVILEGED_RUNNERS --body true
+#
+# Until then every job is skipped (not queued), so pull requests are unaffected.
+# Register runners with the labels `sandbox-x86` (x86_64) and `sandbox-arm64`
+# (aarch64); see docs/TESTING.md §"Privileged runners" for host prerequisites.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  privileged-e2e:
+    name: e2e (${{ matrix.arch }})
+    if: vars.PRIVILEGED_RUNNERS == 'true'
+    runs-on: [self-hosted, "${{ matrix.label }}"]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: sandbox-x86
+            arch: x86_64
+          - label: sandbox-arm64
+            arch: aarch64
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Unprivileged unit tests
+        run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
+      # The runner may or may not be the root user; use sudo only when needed.
+      - name: e2e smoke (root)
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO bash tests/e2e/smoke.sh
+
+      - name: Latency assertions (root)
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO bash tests/e2e/latency.sh
+
+      - name: Upload daemon logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-logs-${{ matrix.arch }}
+          path: /tmp/serial-last-*.log
+          if-no-files-found: ignore
+          retention-days: 7

@@ -36,17 +36,49 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 
 ## CI
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs three jobs on
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs four jobs on
 hosted runners (no KVM/assets/root), excluding the privileged set via
 `CI_TEST_EXCLUDE="pool|network|tmpl_setup|vmm|ipc|cgroup"`:
 
-1. **build-and-test** — Release build + the unprivileged tests.
-2. **asan-ubsan** — Debug build with `-DSANDBOX_SANITIZE=address,undefined`.
-3. **fuzz-smoke** — clang + libFuzzer build of `fuzz_http`/`fuzz_config`/
+1. **spdx** — `scripts/check-spdx.sh`: every source file carries a licence tag.
+2. **build-and-test** — Release build + the unprivileged tests.
+3. **asan-ubsan** — Debug build with `-DSANDBOX_SANITIZE=address,undefined`.
+4. **fuzz-smoke** — clang + libFuzzer build of `fuzz_http`/`fuzz_config`/
    `fuzz_proto` plus a short smoke run over the corpora.
 
-The privileged/end-to-end coverage runs on a prepared lab host (see
-[`BUILDING.md`](BUILDING.md)).
+The privileged/end-to-end coverage lives in
+[`.github/workflows/privileged-e2e.yml`](../.github/workflows/privileged-e2e.yml)
+and needs self-hosted runners (see below).
+
+## Privileged runners
+
+`tests/e2e/` drives the real restore path and is **not runnable on hosted
+runners**. [`privileged-e2e.yml`](../.github/workflows/privileged-e2e.yml) is
+inert until a repository variable turns it on:
+
+```sh
+gh variable set PRIVILEGED_RUNNERS --body true
+```
+
+Until then every job is skipped rather than queued, so pull requests are never
+blocked. Register two self-hosted runners and label them `sandbox-x86` (x86_64)
+and `sandbox-arm64` (aarch64). Each host needs:
+
+- `/dev/kvm` and `/dev/net/tun`, and `nftables` on the host;
+- Firecracker at `${FIRECRACKER_BIN:-/usr/local/bin/firecracker}`;
+- guest assets at `${SANDBOX_KERNEL:-/opt/sandbox-assets/vmlinux}` and
+  `${SANDBOX_ROOTFS:-/opt/sandbox-assets/rootfs.ext4}`;
+- a build toolchain plus `libprotobuf-dev`, `libseccomp-dev`,
+  `libcurl4-openssl-dev`, `libnftables-dev`, `libsystemd-dev`;
+- a dev-capable (not `nodev`) working filesystem under `/var/tmp` or `$HOME` —
+  `scripts/benchmark.sh` selects one automatically.
+
+Run the same checks by hand with:
+
+```sh
+sudo tests/e2e/smoke.sh          # one warm + one cold restore; checks the timing log
+sudo tests/e2e/latency.sh        # warm <5 ms, cold <250 ms (override with flags)
+```
 
 ## Sanitizers and fuzzers
 
