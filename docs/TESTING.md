@@ -89,19 +89,27 @@ passwordless `sudo`.
 #    https://github.com/actions/runner/releases (v2.338.0 at time of writing);
 #    use actions-runner-linux-arm64-... on aarch64.
 sudo mkdir -p /opt/actions-runner && cd /opt/actions-runner
-curl -fsSL --retry 3 -o runner.tar.gz \
+sudo curl -fsSL --retry 3 -o runner.tar.gz \
   https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz
 sudo tar xzf runner.tar.gz -C /opt/actions-runner
+sudo chown -R root:root /opt/actions-runner   # the tarball preserves uid 1001
 
-# 2. Registration token (valid ~1 hour), then configure. `--labels` is
-#    ADDITIVE: the runner also keeps self-hosted, linux and x64.
+# 2. Registration token (valid ~1 hour), then configure.
+#    config.sh refuses to run as root -- `if [ $(id -u) -eq 0 -a -z
+#    "$RUNNER_ALLOW_RUNASROOT" ]` -- so opt in explicitly. This flag is only
+#    needed for *configure*; run.sh and runsvc.sh have no such guard.
+#    `--labels` is ADDITIVE: the runner also keeps self-hosted, linux and x64.
 TOKEN=$(gh api -X POST repos/ysinghc/sandbox/actions/runners/registration-token --jq .token)
-sudo /opt/actions-runner/config.sh \
+sudo env RUNNER_ALLOW_RUNASROOT=1 /opt/actions-runner/config.sh \
   --url https://github.com/ysinghc/sandbox --token "$TOKEN" \
-  --name "$(hostname)-x86" --labels sandbox-x86 --unattended
+  --name sandbox-x86-01 --labels sandbox-x86 --unattended
 
-# 3. Install and start it as a root systemd service (survives reboots).
+# 3. svc.sh did not exist before step 2 -- config.sh generates it from
+#    bin/systemd.svc.sh.template. Install and start it as a root service
+#    (survives reboots). `install <account>` -> run_as_user; omit it and the
+#    service runs as $SUDO_USER instead.
 cd /opt/actions-runner && sudo ./svc.sh install root && sudo ./svc.sh start
+sudo systemctl status 'actions.runner.*.service' --no-pager   # expect active (running)
 
 # 4. Verify it is online with the right labels.
 gh api repos/ysinghc/sandbox/actions/runners \
