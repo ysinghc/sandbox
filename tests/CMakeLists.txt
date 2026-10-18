@@ -39,10 +39,10 @@ set_tests_properties(seccomp PROPERTIES TIMEOUT 60)
 add_executable(test_network test_network.c)
 target_include_directories(test_network PRIVATE ../include)
 target_link_libraries(test_network sandbox)
-add_test(NAME network COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_network)
+add_test(NAME network COMMAND ${CMAKE_BINARY_DIR}/tests/test_network)
 set_tests_properties(network PROPERTIES TIMEOUT 180 FIXTURES_SETUP netfix)
 add_test(NAME network_cleanup
-         COMMAND sudo -E sh ${CMAKE_CURRENT_SOURCE_DIR}/net_cleanup.sh)
+         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/net_cleanup.sh)
 set_tests_properties(network_cleanup PROPERTIES FIXTURES_CLEANUP netfix)
 
 # Phase 4: snapshot manager tests (no root needed: tmp dirs only).
@@ -63,6 +63,22 @@ set_tests_properties(snapshot PROPERTIES TIMEOUT 120)
 #
 set(SANDBOX_TEST_TMPDIR "/tmp" CACHE PATH
     "Parent dir for test workspaces (must permit device nodes, i.e. not `nodev`)")
+
+# ── Privileged tests and the environment ──────────────────────────────────────
+# The tests below (network, tmpl_setup, vmm, pool, ipc, cgroup) need real root,
+# /dev/kvm and the guest assets, and several of them read their workspace roots
+# from the environment, which ctest supplies through the ENVIRONMENT property.
+#
+# They therefore must NOT be wrapped in `sudo`: sudo resets the environment, so
+# the ENVIRONMENT property never arrives, and a test whose roots are missing
+# SKIPs (exit 0) instead of failing -- a silent, green no-op. That is exactly
+# the failure mode this comment exists to prevent: the labs job spent its first
+# runs "passing" while `tmpl_setup` exited in 0.01 s without booting anything.
+#
+# Instead, run the whole suite as root (`sudo ctest ...`, which is what
+# .github/workflows/privileged-e2e-run.yml does); each test SKIPs cleanly when
+# it is not root, so an unprivileged `ctest` stays honest rather than red.
+
 get_filename_component(TEST_BDIR ${CMAKE_CURRENT_BINARY_DIR} NAME)
 set(TEST_TMPROOT "${SANDBOX_TEST_TMPDIR}/sbtest-${TEST_BDIR}")
 set(TEST_SNAPROOT "${TEST_TMPROOT}/snapshots")
@@ -70,7 +86,7 @@ set(TEST_JAILROOT "${TEST_TMPROOT}/jails")
 add_executable(make_template make_template.c)
 target_include_directories(make_template PRIVATE ../include)
 target_link_libraries(make_template sandbox)
-add_test(NAME tmpl_setup COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/make_template)
+add_test(NAME tmpl_setup COMMAND ${CMAKE_BINARY_DIR}/tests/make_template)
 set_tests_properties(tmpl_setup PROPERTIES
     TIMEOUT 300
     FIXTURES_SETUP tmplfix
@@ -79,7 +95,7 @@ set_tests_properties(tmpl_setup PROPERTIES
 add_executable(test_vmm test_vmm.c)
 target_include_directories(test_vmm PRIVATE ../include)
 target_link_libraries(test_vmm sandbox)
-add_test(NAME vmm COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_vmm)
+add_test(NAME vmm COMMAND ${CMAKE_BINARY_DIR}/tests/test_vmm)
 set_tests_properties(vmm PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
@@ -112,7 +128,7 @@ set_tests_properties(broker PROPERTIES TIMEOUT 120)
 add_executable(test_ipc test_ipc.c)
 target_include_directories(test_ipc PRIVATE ../include)
 target_link_libraries(test_ipc sandbox sandbox_broker_core)
-add_test(NAME ipc COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_ipc)
+add_test(NAME ipc COMMAND ${CMAKE_BINARY_DIR}/tests/test_ipc)
 set_tests_properties(ipc PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
@@ -132,7 +148,7 @@ set_tests_properties(config PROPERTIES TIMEOUT 30)
 add_executable(test_cgroup test_cgroup.c)
 target_include_directories(test_cgroup PRIVATE ../include)
 target_link_libraries(test_cgroup sandbox)
-add_test(NAME cgroup COMMAND sudo -E ${CMAKE_BINARY_DIR}/tests/test_cgroup)
+add_test(NAME cgroup COMMAND ${CMAKE_BINARY_DIR}/tests/test_cgroup)
 set_tests_properties(cgroup PROPERTIES TIMEOUT 60)
 
 # Phase 13: metrics / health / ready endpoints (§10.13). No root.

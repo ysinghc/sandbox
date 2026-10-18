@@ -127,6 +127,13 @@ to surface a missing asset or a `nodev` workspace:
 ```sh
 sudo tests/e2e/smoke.sh
 sudo tests/e2e/latency.sh
+
+# The privileged CTest set: run the whole suite as root. Do NOT wrap the tests
+# in `sudo` inside CMakeLists.txt -- sudo resets the environment, so the
+# workspace roots ctest passes via its ENVIRONMENT property never arrive, every
+# fixture-dependent test SKIPs (exit 0), and the run goes green having executed
+# nothing. `privileged-e2e-run.yml` also fails the job if any of these skip.
+sudo ctest --test-dir build -V -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$"
 ```
 
 Each host needs:

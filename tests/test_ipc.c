@@ -194,9 +194,12 @@ int main(void) {
             // cannot be made. Surface it loudly instead of passing silently:
             // the host-vs-guest half is still covered by the env checks above.
             fprintf(stderr,
-                    "  NOTE: vsock peer-auth self-test SKIPPED (no vsock "
-                    "loopback in this guest kernel)\n");
+                    "  NOTE: vsock peer-auth probe unavailable: this guest "
+                    "kernel has no vsock loopback\n");
         } else {
+            fprintf(stderr,
+                    "  vsock peer-auth evidence: self-test ran=%d, guest-local "
+                    "peer rejected=%d\n", auth_test, rejected);
             CHECK(auth_test, "vsock: peer-auth self-test ran");
             CHECK(rejected, "vsock: a guest-local peer was rejected");
             // A rejected *host* would mean the fix broke the real path; the

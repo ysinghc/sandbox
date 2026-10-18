@@ -59,8 +59,28 @@ jobs:
 
       # The whole point of a self-hosted runner: the tests that cannot run on
       # hosted CI. They need root, /dev/kvm, Firecracker and the guest assets.
+      #
+      # Run the suite as root; the tests themselves must NOT call sudo, because
+      # sudo resets the environment and would strip the workspace roots ctest
+      # passes via its ENVIRONMENT property -- the tests then SKIP (exit 0) and
+      # the job goes green having executed nothing. -V is deliberate: this job's
+      # value is the evidence in its output.
       - name: Tests that need root, /dev/kvm and guest assets
-        run: ctest --test-dir build --output-on-failure -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$"
+        run: |
+          set -euo pipefail
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO ctest --test-dir build -V \
+            -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$" \
+            | tee /tmp/privileged-ctest.log
+
+      # A skipped privileged test is a green no-op: it proves nothing. Fail on
+      # one so this job can never "pass" without actually executing them.
+      - name: No privileged test may skip
+        run: |
+          if grep -nE '\*\*\*Skipped|SKIP \(|\*\*\*Not Run' /tmp/privileged-ctest.log; then
+            echo "::error::a privileged test skipped or did not run"; exit 1
+          fi
+          echo "all privileged tests executed"
 
       # The runner may or may not be the root user; use sudo only when needed.
       - name: e2e smoke (root)
