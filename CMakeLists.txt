@@ -66,6 +66,7 @@ add_library(sandbox SHARED
     src/snapshot_manager.c
     src/network_manager.c
     src/jailer.c
+    src/fs_util.c
     src/seccomp.c
     src/sha256.c
     src/cgroup.c

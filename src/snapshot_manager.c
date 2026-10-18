@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // Snapshot Manager (§5.6): manifest format, atomic template publish,
 // version checking. Cold boot, guest-ready wait and capture run on the real
 // VMM; the orchestration below follows the LLD flow line-for-line.
@@ -7,6 +8,7 @@
 #include "snapshot_manager.h"
 #include "pool_manager.h"
 #include "sha256.h"
+#include "sandbox_fs.h"
 #include "vmm_manager.h"
 #include "jailer.h"
 
@@ -363,17 +365,11 @@ static int firecracker_create_snapshot(vm_handle_t* vm, const char* vmstate_path
 }
 
 static int rm_rf(const char* path) {
-    char cmd[PATH_MAX + 16];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", path);
-    int rc = system(cmd);
-    return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
+    return sandbox_rm_rf(path);
 }
 
 static int copy_into(const char* src, const char* dst) {
-    char cmd[PATH_MAX * 2 + 16];
-    snprintf(cmd, sizeof(cmd), "cp %s %s", src, dst);
-    int rc = system(cmd);
-    return (WIFEXITED(rc) && WEXITSTATUS(rc) == 0) ? 0 : -1;
+    return sandbox_copy_file(src, dst);
 }
 
 // Atomic publish: fresh templates rename directly; rebuilds swap the old

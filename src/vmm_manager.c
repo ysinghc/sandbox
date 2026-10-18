@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 // VMM Manager — Firecracker lifecycle over the jail + Unix-socket HTTP API
 // (v1.17.0 live spec): spawn, configure, boot/restore, pause/resume, snapshot,
 // destroy. Templates boot *with* a network interface and snapshot it; restores
@@ -14,6 +15,7 @@
 
 #include "cgroup.h"
 #include "jailer.h"
+#include "sandbox_fs.h"
 #include "sandbox_seccomp.h"
 #include "snapshot_manager.h"
 #include "uffd_handler.h"
@@ -382,10 +384,9 @@ static void jail_cleanup(const char* jail_root) {
         snprintf(p, sizeof(p), "%s%s", jail_root, subs[i]);
         umount2(p, MNT_DETACH);
     }
-    char cmd[PATH_MAX + 16];
-    snprintf(cmd, sizeof(cmd), "rm -rf %s", jail_root);
-    int rc = system(cmd);
-    (void)rc;
+    // Recursive removal in-process: a shell would interpret metacharacters in
+    // jail_root (see the §12.2 audit note).
+    sandbox_rm_rf(jail_root);
 }
 
 int vmm_jail_path(const char* vm_id, char* out, size_t n) {
@@ -595,9 +596,7 @@ int vmm_wait_ready(vm_handle_t* vm, const char* marker, int timeout_ms) {
             // Also stash a copy outside the jail before destroy
             char stash[PATH_MAX];
             snprintf(stash, sizeof(stash), "/tmp/serial-last-%u.log", vm->sandbox_id);
-            char cp_cmd[PATH_MAX * 2 + 16];
-            snprintf(cp_cmd, sizeof(cp_cmd), "cp %s %s 2>/dev/null || true", logpath, stash);
-            system(cp_cmd);
+            (void)sandbox_copy_file(logpath, stash);  // best-effort stash
             fprintf(stderr, "[vmm_wait_ready] Stashed to %s\n", stash);
         } else {
             fprintf(stderr, "[vmm_wait_ready] serial log not found (FC never wrote to it?)\n");
