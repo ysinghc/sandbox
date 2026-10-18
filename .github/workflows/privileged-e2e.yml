@@ -11,6 +11,12 @@ name: Privileged e2e
 # Until then every job is skipped (not queued), so pull requests are unaffected.
 # Register runners with the labels `sandbox-x86` (x86_64) and `sandbox-arm64`
 # (aarch64); see docs/TESTING.md §"Privileged runners" for host prerequisites.
+#
+# The aarch64 leg needs a *second* variable, because a matrix job with no runner
+# to serve its label does not fail fast — it queues for ~24h and is then
+# cancelled, which is indistinguishable from a broken workflow:
+#
+#     gh variable set PRIVILEGED_ARM --body true    # only once an ARM runner exists
 
 on:
   workflow_dispatch:
@@ -24,7 +30,12 @@ permissions:
 jobs:
   privileged-e2e:
     name: e2e (${{ matrix.arch }})
-    if: vars.PRIVILEGED_RUNNERS == 'true'
+    # Master switch, then a per-arch gate: with only an x86_64 runner
+    # registered, the aarch64 job is *skipped* rather than left queued for a
+    # label nobody serves.
+    if: >-
+      vars.PRIVILEGED_RUNNERS == 'true' &&
+      (matrix.arch == 'x86_64' || vars.PRIVILEGED_ARM == 'true')
     runs-on: [self-hosted, "${{ matrix.label }}"]
     strategy:
       fail-fast: false
@@ -38,13 +49,24 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        # The VM tests need a workspace on a filesystem that permits device
+        # nodes: the jail mknod()s /dev/kvm and /dev/net/tun, and opening them
+        # on a `nodev` mount fails with EACCES. /tmp is nodev on most hosts,
+        # /var/tmp usually is not.
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
+                -DSANDBOX_TEST_TMPDIR="${SANDBOX_TEST_TMPDIR:-/var/tmp}"
 
       - name: Build
         run: cmake --build build -j
 
-      - name: Unprivileged unit tests
+      - name: Unit tests that need no privileges
         run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+
+      # The whole point of a self-hosted runner: the tests that cannot run on
+      # hosted CI. They need root, /dev/kvm, Firecracker and the guest assets.
+      - name: Tests that need root, /dev/kvm and guest assets
+        run: ctest --test-dir build --output-on-failure -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$"
 
       # The runner may or may not be the root user; use sudo only when needed.
       - name: e2e smoke (root)

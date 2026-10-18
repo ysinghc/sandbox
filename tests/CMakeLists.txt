@@ -53,11 +53,20 @@ add_test(NAME snapshot COMMAND test_snapshot)
 set_tests_properties(snapshot PROPERTIES TIMEOUT 120)
 
 # Phase 6: template fixture (builds "e2e" once; consumers REQUIRE it).
-# Roots live on LOCAL disk (/tmp): the workspace mount (9p) rejects Unix
-# socket creation (api.sock/uffd.sock bind fails with EPERM there).
+# Roots live on LOCAL disk: the workspace mount (9p) rejects Unix socket
+# creation (api.sock/uffd.sock bind fails with EPERM there), and the jail
+# mknod()s /dev/kvm + /dev/net/tun, which fails with EACCES on a `nodev` mount.
+# /tmp is `nodev` on many hosts (including the self-hosted CI runner), so the
+# parent is overridable:
+#
+#     cmake -S . -B build -DSANDBOX_TEST_TMPDIR=/var/tmp
+#
+set(SANDBOX_TEST_TMPDIR "/tmp" CACHE PATH
+    "Parent dir for test workspaces (must permit device nodes, i.e. not `nodev`)")
 get_filename_component(TEST_BDIR ${CMAKE_CURRENT_BINARY_DIR} NAME)
-set(TEST_SNAPROOT "/tmp/sbtest-${TEST_BDIR}/snapshots")
-set(TEST_JAILROOT "/tmp/sbtest-${TEST_BDIR}/jails")
+set(TEST_TMPROOT "${SANDBOX_TEST_TMPDIR}/sbtest-${TEST_BDIR}")
+set(TEST_SNAPROOT "${TEST_TMPROOT}/snapshots")
+set(TEST_JAILROOT "${TEST_TMPROOT}/jails")
 add_executable(make_template make_template.c)
 target_include_directories(make_template PRIVATE ../include)
 target_link_libraries(make_template sandbox)

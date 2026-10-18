@@ -57,12 +57,60 @@ runners**. [`privileged-e2e.yml`](../.github/workflows/privileged-e2e.yml) is
 inert until a repository variable turns it on:
 
 ```sh
-gh variable set PRIVILEGED_RUNNERS --body true
+gh variable set PRIVILEGED_RUNNERS --body true   # master switch
+gh variable set PRIVILEGED_ARM     --body true   # ONLY once an ARM runner exists
 ```
 
 Until then every job is skipped rather than queued, so pull requests are never
-blocked. Register two self-hosted runners and label them `sandbox-x86` (x86_64)
-and `sandbox-arm64` (aarch64). Each host needs:
+blocked. The aarch64 matrix leg is gated separately on purpose: with no runner
+serving `sandbox-arm64`, that job does not fail — it queues for ~24 h and is
+then cancelled, which is indistinguishable from a broken workflow.
+
+### Registering a runner
+
+The harness needs **root** (`chroot`, `setuid`, cgroup writes, `mknod` of
+`/dev/kvm`), and `sudo` normally prompts for a password — so run the runner
+service **as root**. Do not run it as an unprivileged user unless that user has
+passwordless `sudo`.
+
+```sh
+# 1. Fetch the runner and unpack it. Check the version on
+#    https://github.com/actions/runner/releases (v2.338.0 at time of writing);
+#    use actions-runner-linux-arm64-... on aarch64.
+sudo mkdir -p /opt/actions-runner && cd /opt/actions-runner
+curl -fsSL --retry 3 -o runner.tar.gz \
+  https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-x64-2.338.0.tar.gz
+sudo tar xzf runner.tar.gz -C /opt/actions-runner
+
+# 2. Registration token (valid ~1 hour), then configure. `--labels` is
+#    ADDITIVE: the runner also keeps self-hosted, linux and x64.
+TOKEN=$(gh api -X POST repos/ysinghc/sandbox/actions/runners/registration-token --jq .token)
+sudo /opt/actions-runner/config.sh \
+  --url https://github.com/ysinghc/sandbox --token "$TOKEN" \
+  --name "$(hostname)-x86" --labels sandbox-x86 --unattended
+
+# 3. Install and start it as a root systemd service (survives reboots).
+cd /opt/actions-runner && sudo ./svc.sh install root && sudo ./svc.sh start
+
+# 4. Verify it is online with the right labels.
+gh api repos/ysinghc/sandbox/actions/runners \
+  --jq '.runners[] | "\(.name) \(.status) [\(.labels|map(.name)|join(","))]"'
+
+# 5. Flip the switch and trigger the workflow.
+gh variable set PRIVILEGED_RUNNERS --body true
+gh workflow run "Privileged e2e" --ref master
+gh run watch
+```
+
+Before wiring up CI, prove the host can do it at all — this is the fastest way
+to surface a missing asset or a `nodev` workspace:
+
+```sh
+sudo tests/e2e/smoke.sh
+sudo tests/e2e/latency.sh
+```
+
+Each host needs:
 
 - `/dev/kvm` and `/dev/net/tun`, and `nftables` on the host;
 - Firecracker at `${FIRECRACKER_BIN:-/usr/local/bin/firecracker}`;
@@ -71,7 +119,11 @@ and `sandbox-arm64` (aarch64). Each host needs:
 - a build toolchain plus `libprotobuf-dev`, `libseccomp-dev`,
   `libcurl4-openssl-dev`, `libnftables-dev`, `libsystemd-dev`;
 - a dev-capable (not `nodev`) working filesystem under `/var/tmp` or `$HOME` —
-  `scripts/benchmark.sh` selects one automatically.
+  `scripts/benchmark.sh` selects one automatically;
+- that same kind of filesystem for the CMake test root: the VM tests (`pool`,
+  `vmm`, `ipc`) build their jail under `${SANDBOX_TEST_TMPDIR:-/tmp}`, so
+  configure with `-DSANDBOX_TEST_TMPDIR=/var/tmp` where `/tmp` is `nodev`.
+  `privileged-e2e.yml` already does this.
 
 Run the same checks by hand with:
 
