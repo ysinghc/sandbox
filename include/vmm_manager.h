@@ -38,6 +38,10 @@ typedef struct vm_handle_t {
     char jail_root[PATH_MAX];
     char vsock_uds[PATH_MAX];  // host path to the per-VM vsock UDS ("" = none)
     char cgroup_dir[PATH_MAX];  // per-VM cgroup dir (§10.11); "" = none
+    // #23: an ephemeral workspace cloned for this VM when the caller did not
+    // supply a session volume. Owned by the handle: vmm_destroy unlinks it. Empty
+    // when the volume belongs to a session (or the template has no workspace).
+    char workspace_scratch[PATH_MAX];
     vm_network_t net;  // per-VM tap; reclaimed by vmm_destroy
     bool has_net;
     pthread_t uffd_thread;
@@ -76,8 +80,15 @@ int vmm_jail_path(const char* vm_id, char* out, size_t n);
 // Restore a template into a new jailed VM; net must already exist (tap device
 // by name, retargeted via the load request's network_overrides). UFFD handler
 // is up before vCPU resume.
+//
+// workspace_image (#23): host path of the writable volume to bind at
+// /workspace.ext4, or NULL for an ephemeral per-VM volume cloned from the
+// template's base image. A template captured without a workspace ignores the
+// argument; asking for a session volume on such a template is an error, because
+// the guest has nowhere to mount it.
 vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
-                         const char* tap_name, uint32_t guest_ip);
+                         const char* tap_name, uint32_t guest_ip,
+                         const char* workspace_image);
 
 // Block until the serial log shows marker (or timeout_ms). 0 ready, -1 timeout.
 int vmm_wait_ready(vm_handle_t* vm, const char* marker, int timeout_ms);

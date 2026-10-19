@@ -11,6 +11,7 @@
 #include "sandbox_fs.h"
 #include "vmm_manager.h"
 #include "jailer.h"
+#include "workspace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -254,6 +255,41 @@ static int verify_files(const char* template_name, const snap_manifest_t* m) {
                 template_name, got, want);
         return -1;
     }
+
+    // #23: the base image new sessions are cloned from. Not captured state, but
+    // it decides what every future session's /workspace starts as.
+    snprintf(path, sizeof(path), "%s/%s/base_workspace.ext4", snapshot_root(),
+             template_name);
+    if (m->workspace_size) {
+        struct stat wst;
+        if (stat(path, &wst) < 0) {
+            fprintf(stderr, "[snapshot] verify %s: cannot stat %s\n", template_name,
+                    path);
+            return -1;
+        }
+        if ((uint64_t)wst.st_size != m->workspace_size) {
+            fprintf(stderr,
+                    "[snapshot] verify %s: base_workspace.ext4 is %lld bytes, "
+                    "snapshot expects %llu\n",
+                    template_name, (long long)wst.st_size,
+                    (unsigned long long)m->workspace_size);
+            return -1;
+        }
+        if (sha256_file(path, digest) < 0) {
+            fprintf(stderr, "[snapshot] verify %s: cannot read %s\n", template_name,
+                    path);
+            return -1;
+        }
+        if (memcmp(digest, m->workspace_sha256, 32) != 0) {
+            sha256_hex(digest, got);
+            sha256_hex(m->workspace_sha256, want);
+            fprintf(stderr,
+                    "[snapshot] verify %s: workspace base hash mismatch "
+                    "(got %s want %s)\n",
+                    template_name, got, want);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -271,6 +307,7 @@ typedef struct {
     dev_t  mem_dev; ino_t mem_ino; off_t mem_size; time_t mem_mtime;
     dev_t  vms_dev; ino_t vms_ino; off_t vms_size; time_t vms_mtime;
     dev_t  rfs_dev; ino_t rfs_ino; off_t rfs_size; time_t rfs_mtime;
+    dev_t  ws_dev;  ino_t ws_ino;  off_t ws_size;  time_t ws_mtime;
     bool   valid;
 } verify_cache_t;
 
@@ -285,7 +322,8 @@ static bool verify_sig_eq(dev_t dev, ino_t ino, off_t size, time_t mtime,
 }
 
 static bool verify_cache_hit(const char* name, const struct stat* ms,
-                             const struct stat* vs, const struct stat* rs) {
+                             const struct stat* vs, const struct stat* rs,
+                             const struct stat* ws) {
     bool hit = false;
     pthread_mutex_lock(&g_verify_cache_lock);
     for (size_t i = 0; i < g_verify_cache_len; i++) {
@@ -293,7 +331,8 @@ static bool verify_cache_hit(const char* name, const struct stat* ms,
         if (c->valid && strcmp(c->name, name) == 0 &&
             verify_sig_eq(c->mem_dev, c->mem_ino, c->mem_size, c->mem_mtime, ms) &&
             verify_sig_eq(c->vms_dev, c->vms_ino, c->vms_size, c->vms_mtime, vs) &&
-            verify_sig_eq(c->rfs_dev, c->rfs_ino, c->rfs_size, c->rfs_mtime, rs)) {
+            verify_sig_eq(c->rfs_dev, c->rfs_ino, c->rfs_size, c->rfs_mtime, rs) &&
+            verify_sig_eq(c->ws_dev, c->ws_ino, c->ws_size, c->ws_mtime, ws)) {
             hit = true;
             break;
         }
@@ -303,7 +342,8 @@ static bool verify_cache_hit(const char* name, const struct stat* ms,
 }
 
 static void verify_cache_put(const char* name, const struct stat* ms,
-                             const struct stat* vs, const struct stat* rs) {
+                             const struct stat* vs, const struct stat* rs,
+                             const struct stat* ws) {
     pthread_mutex_lock(&g_verify_cache_lock);
     verify_cache_t* c = NULL;
     for (size_t i = 0; i < g_verify_cache_len; i++) {
@@ -324,6 +364,8 @@ static void verify_cache_put(const char* name, const struct stat* ms,
     c->vms_size = vs->st_size; c->vms_mtime = vs->st_mtime;
     c->rfs_dev = rs->st_dev; c->rfs_ino = rs->st_ino;
     c->rfs_size = rs->st_size; c->rfs_mtime = rs->st_mtime;
+    c->ws_dev = ws->st_dev; c->ws_ino = ws->st_ino;
+    c->ws_size = ws->st_size; c->ws_mtime = ws->st_mtime;
     c->valid = true;
     pthread_mutex_unlock(&g_verify_cache_lock);
 }
@@ -334,17 +376,24 @@ int snapshot_verify_manifest(const char* template_name,
     const char* e = getenv("SANDBOX_VERIFY_SNAPSHOT");
     if (e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0)) return 0;
 
-    char mpath[PATH_MAX], vpath[PATH_MAX], rpath[PATH_MAX];
-    struct stat ms, vs, rs;
+    char mpath[PATH_MAX], vpath[PATH_MAX], rpath[PATH_MAX], wpath[PATH_MAX];
+    struct stat ms, vs, rs, ws;
     snprintf(mpath, sizeof(mpath), "%s/%s/memory.snap", snapshot_root(), template_name);
     snprintf(vpath, sizeof(vpath), "%s/%s/vmstate", snapshot_root(), template_name);
     snprintf(rpath, sizeof(rpath), "%s/%s/rootfs.ext4", snapshot_root(), template_name);
+    // The base workspace image is optional (pre-#23 templates have none). A
+    // missing one leaves the signature zeroed, which cannot match a cached
+    // entry, so a template that gains a workspace is re-verified once.
+    snprintf(wpath, sizeof(wpath), "%s/%s/base_workspace.ext4", snapshot_root(),
+             template_name);
+    memset(&ws, 0, sizeof(ws));
+    bool have_ws = stat(wpath, &ws) == 0;
     bool have_sig = stat(mpath, &ms) == 0 && stat(vpath, &vs) == 0 &&
-                    stat(rpath, &rs) == 0;
-    if (have_sig && verify_cache_hit(template_name, &ms, &vs, &rs)) return 0;
+                    stat(rpath, &rs) == 0 && (have_ws || manifest->workspace_size == 0);
+    if (have_sig && verify_cache_hit(template_name, &ms, &vs, &rs, &ws)) return 0;
 
     int rc = verify_files(template_name, manifest);
-    if (rc == 0 && have_sig) verify_cache_put(template_name, &ms, &vs, &rs);
+    if (rc == 0 && have_sig) verify_cache_put(template_name, &ms, &vs, &rs, &ws);
     return rc;
 }
 
@@ -447,6 +496,23 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     }
     rm_rf(tjail);  // stale jail from a crashed run
 
+    // #23/D7: format the session workspace's base image *here*, once, at template
+    // build time. Sessions clone it (reflink or a sparse copy) instead of
+    // running mkfs, which is what keeps session creation inside the latency
+    // budget. The guest mounts this device at /workspace during the boot below,
+    // so the capture records the mount and every restore sees the same device.
+    char ws_base[PATH_MAX];
+    ws_base[0] = '\0';
+    if (config->workspace_size_mb) {
+        snprintf(ws_base, sizeof(ws_base), "%s/base_workspace.ext4", temp_dir);
+        if (workspace_format_base(ws_base, config->workspace_size_mb) < 0) {
+            fprintf(stderr, "[snapshot] cannot format %s: %s\n", ws_base,
+                    strerror(errno));
+            rm_rf(temp_dir);
+            return -1;
+        }
+    }
+
     // Templates carry a NIC so restores can retarget its host tap via the load
     // request's network_overrides (§5.7). The tap must exist at boot: the
     // template VM opens it during InstanceStart. A NIC-less template would
@@ -456,6 +522,7 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     bool tpl_net_up = false;
     template_config_t local = *config;
     local.tap_name = NULL;
+    local.workspace_path = ws_base[0] ? ws_base : NULL;
     if (network_setup(tvm_id, &tpl_net) == 0) {
         local.tap_name = tpl_net.tap_name;
         tpl_net_up = true;
@@ -543,6 +610,22 @@ int create_snapshot_template(const char* template_name, const template_config_t*
         return -1;
     }
     manifest->rootfs_size = (uint64_t)rst.st_size;
+
+    // #23: pin the base workspace image too. It is not captured state, but it
+    // decides what every future session's /workspace starts as, so a silent
+    // substitution would change new sandboxes of this template.
+    if (config->workspace_size_mb) {
+        struct stat wst;
+        if (stat(ws_base, &wst) < 0 ||
+            sha256_file(ws_base, manifest->workspace_sha256) < 0) {
+            fprintf(stderr, "[snapshot] failed to hash %s\n", ws_base);
+            free(manifest);
+            vmm_destroy(vm);
+            rm_rf(temp_dir);
+            return -1;
+        }
+        manifest->workspace_size = (uint64_t)wst.st_size;
+    }
 
     char manifest_path[PATH_MAX];
     snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.bin", temp_dir);

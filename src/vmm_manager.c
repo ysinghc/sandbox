@@ -19,6 +19,7 @@
 #include "sandbox_seccomp.h"
 #include "snapshot_manager.h"
 #include "uffd_handler.h"
+#include "workspace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -46,6 +47,7 @@
 #define FC_UFFD_SOCK_JAILVIEW "/uffd.sock"
 #define FC_KERNEL_JAILVIEW "/vmlinux"
 #define FC_ROOTFS_JAILVIEW "/rootfs.ext4"
+#define FC_WORKSPACE_JAILVIEW JAIL_WORKSPACE_PATH  // #23 writable session volume
 #define FC_STATE_JAILVIEW "/vmstate"
 #define FC_MEM_JAILVIEW "/memory.snap"
 #define FC_BOOT_ARGS "console=ttyS0 reboot=k panic=1 init=/init root=/dev/vda ro"
@@ -426,6 +428,7 @@ static void cold_fail(vm_handle_t* vm) {
                     WTERMSIG(st));
     }
     jail_cleanup(vm->jail_root);
+    if (vm->workspace_scratch[0]) unlink(vm->workspace_scratch);
     free(vm);
 }
 
@@ -449,7 +452,8 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
                            .kernel_path = cfg->kernel_path,
                            .rootfs_path = cfg->rootfs_path,
                            .snap_state_src = NULL, .snap_mem_src = NULL,
-                           .out_dir = out_dir };
+                           .out_dir = out_dir,
+                           .workspace_path = cfg->workspace_path };
     char serial[PATH_MAX];
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
     jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
@@ -500,6 +504,19 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
     if (fc_put(vm->api_sock_path, "/drives/rootfs", body) < 0) {
         cold_fail(vm);
         return NULL;
+    }
+    // #23: the writable session volume. Attached at boot so the captured
+    // snapshot carries the device the guest mounts at /workspace; every restore
+    // then binds a *different* host file behind the same jail path.
+    if (cfg->workspace_path) {
+        snprintf(body, sizeof(body),
+                 "{\"drive_id\": \"workspace\", \"path_on_host\": \"%s\", "
+                 "\"is_root_device\": false, \"is_read_only\": false}",
+                 FC_WORKSPACE_JAILVIEW);
+        if (fc_put(vm->api_sock_path, "/drives/workspace", body) < 0) {
+            cold_fail(vm);
+            return NULL;
+        }
     }
     // Optional NIC: the template snapshots *with* this interface so that
     // restores can retarget its tap via network_overrides. Firecracker assigns
@@ -813,6 +830,9 @@ int vmm_destroy(vm_handle_t* vm) {
         vm->has_net = false;
     }
     jail_cleanup(vm->jail_root);
+    // #23: an ephemeral workspace belongs to this VM alone; a session volume is
+    // owned by the registry and survives.
+    if (vm->workspace_scratch[0]) unlink(vm->workspace_scratch);
     // §10.11: the VMM is reaped, so its cgroup is empty and can be removed.
     cgroup_remove_vm(vm->cgroup_dir);
     free(vm);
@@ -855,7 +875,8 @@ int vmm_build_load_request(char* buf, size_t cap, const char* tap_name) {
 }
 
 vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
-                         const char* tap_name, uint32_t guest_ip) {
+                         const char* tap_name, uint32_t guest_ip,
+                         const char* workspace_image) {
     uint64_t t_enter = now_ms();
     if (!template_name || !vm_id || !*vm_id || !tap_name) {
         errno = EINVAL;
@@ -871,6 +892,29 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         errno = ENOENT;
         return NULL;
     }
+
+    // #23: decide the writable volume before anything else is set up, because a
+    // template captured *with* a workspace drive needs a file at
+    // /workspace.ext4 at load time, and a template without one must not be told
+    // to persist into a device the guest never mounts.
+    char ws_base[PATH_MAX], ws_scratch[PATH_MAX];
+    ws_base[0] = '\0';
+    ws_scratch[0] = '\0';
+    bool tpl_has_workspace = false;
+    snprintf(ws_base, sizeof(ws_base), "%s/base_workspace.ext4", store);
+    struct stat wst;
+    if (stat(ws_base, &wst) == 0) {
+        tpl_has_workspace = true;
+    } else if (workspace_image) {
+        // The caller asked for persistence the template cannot provide. Failing
+        // loudly beats handing back a sandbox whose files vanish.
+        fprintf(stderr, "[vmm_restore] template %s has no workspace drive; "
+                        "cannot attach session volume %s\n",
+                template_name, workspace_image);
+        errno = EINVAL;
+        return NULL;
+    }
+
     snap_manifest_t* manifest = NULL;
     if (read_manifest(template_name, &manifest) < 0) return NULL;
     // §10.10: refuse to restore a corrupt/truncated snapshot before handing it
@@ -951,6 +995,33 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     char tpl_rootfs[PATH_MAX];
     snprintf(tpl_rootfs, sizeof(tpl_rootfs), "%s/rootfs.ext4", store);
     if (stat(tpl_rootfs, &st) == 0) files.rootfs_path = tpl_rootfs;
+
+    // #23: give the (writable) workspace device a backing file. A session volume
+    // is bound as-is; without one, clone the template's base image into an
+    // ephemeral file for this VM only, so warm-pool members cannot share -- and
+    // therefore cannot corrupt -- each other's /workspace. The clone is a sibling
+    // of the jail root, outside the chroot, so the jailed VMM has no path to it
+    // other than the bind mount.
+    if (tpl_has_workspace) {
+        if (workspace_image) {
+            files.workspace_path = workspace_image;
+        } else {
+            snprintf(ws_scratch, sizeof(ws_scratch), "%s.workspace.ext4", jail_root);
+            unlink(ws_scratch);
+            if (workspace_clone(ws_base, ws_scratch) < 0) {
+                fprintf(stderr, "[vmm_restore] cannot clone workspace base %s: %s\n",
+                        ws_base, strerror(errno));
+                close(listen_fd);
+                free(manifest);
+                free(vm);
+                return NULL;
+            }
+            files.workspace_path = ws_scratch;
+            snprintf(vm->workspace_scratch, sizeof(vm->workspace_scratch), "%s",
+                     ws_scratch);
+        }
+    }
+
     char serial[PATH_MAX];
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
     // §10.11: per-VM cgroup (memory/CPU limits + OOM isolation). The jailer
@@ -1119,7 +1190,7 @@ vm_handle_t* restore_vm_from_snapshot(void) {
     memset(&net, 0, sizeof(net));
     if (network_setup(vm_id, &net) < 0) return NULL;
     uint64_t t_net = now_ms();
-    vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip);
+    vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip, NULL);
     if (!vm) {
         network_cleanup(&net);
         return NULL;

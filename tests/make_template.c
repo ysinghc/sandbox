@@ -57,10 +57,15 @@ int main(void) {
     // and silently restores nothing).
     const char* tmpl = getenv("SANDBOX_TEMPLATE_NAME");
     if (!tmpl || !*tmpl) tmpl = "e2e";
+    // #23: the fixture template carries a session workspace so the privileged
+    // tests exercise a real /workspace mount and the persistence path. The size
+    // is deliberately small: the volume is sparse, and this only has to be big
+    // enough to hold the test's files.
     template_config_t cfg = { .memory_mib = 128, .vcpu_count = 1,
                               .kernel_path = asset_kernel,
                               .rootfs_path = asset_rootfs,
-                              .ready_marker = "SANDBOX-READY" };
+                              .ready_marker = "SANDBOX-READY",
+                              .workspace_size_mb = 64 };
     // Rebuild unconditionally so consumers never use a stale template.
     char stale[4096], stale_ready[4096];
     snprintf(stale, sizeof(stale), "%s/%s", snap_root, tmpl);

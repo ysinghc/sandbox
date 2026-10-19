@@ -22,8 +22,10 @@
 #include <sys/types.h>
 
 // Fixed jail path. The guest kernel was told about this device at capture time,
-// so it must not change between the template and every restore of it.
-#define WORKSPACE_JAILVIEW "/workspace.ext4"
+// so it must not change between the template and every restore of it. The
+// jail-view constant itself lives in jailer.h (JAIL_WORKSPACE_PATH); this module
+// only ever deals in host paths.
+#define WORKSPACE_IMAGE_NAME "workspace.ext4"
 
 #define WORKSPACE_DEFAULT_ROOT "/var/lib/sandbox-engine/workspaces"
 
@@ -65,6 +67,10 @@ void workspace_paths(const char* session_key, char* dir, size_t dir_n,
 // with errno set; on failure `dst` is unlinked.
 int workspace_clone(const char* src, const char* dst);
 
+// Create a sparse ext4 image of `size_mb` at `path` (mkfs.ext4 via exec).
+// Called once per template, at build time, and never on the session path.
+int workspace_format_base(const char* path, uint32_t size_mb);
+
 // Create the session's volume if absent, else return the existing one. `out`
 // receives the (possibly pre-existing) registry row. `ttl_seconds == 0` means
 // the default. Never extends an existing expiry: re-creating a sandbox must not
@@ -75,11 +81,6 @@ int workspace_ensure(const char* session_key, uid_t owner_uid, uint32_t size_mb,
 
 // Read the registry row for a session. Returns 0, or -1/ENOENT if unknown.
 int workspace_load_meta(const char* session_key, workspace_meta_t* out);
-
-// Make the session image usable by the jailed VMM: Firecracker opens the
-// workspace read-write as the jailer uid, so the image must be owned by it.
-// Session directories are 0700, which is what keeps other local users out.
-int workspace_chown(const char* session_key, uid_t uid, gid_t gid);
 
 // Extend a session's TTL by `extra_seconds`, capped at `created_at + max`. Never
 // shortens an existing expiry; returns -1/ERANGE once the session is past the

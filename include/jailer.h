@@ -12,9 +12,14 @@ typedef struct {
     const char* cgroup_path;  // cgroup.procs file, or NULL to skip placement
 } jailer_config_t;
 
+// Jail-view path of the writable workspace volume (#23). Fixed because the
+// guest kernel is told about this device when the template is captured, and a
+// restore may not move it.
+#define JAIL_WORKSPACE_PATH "/workspace.ext4"
+
 // Optional jail contents. NULL fields are skipped. Jail-view paths are fixed
-// (/firecracker, /vmlinux, /rootfs.ext4, /vmstate, /memory.snap) so snapshot
-// state stays valid across template/restore jails.
+// (/firecracker, /vmlinux, /rootfs.ext4, /vmstate, /memory.snap,
+// /workspace.ext4) so snapshot state stays valid across template/restore jails.
 typedef struct {
     const char* firecracker_bin;  // host path, copied to $jail/firecracker
     const char* kernel_path;      // host path, bound at $jail/vmlinux
@@ -22,6 +27,10 @@ typedef struct {
     const char* snap_state_src;   // host path, bound at $jail/vmstate (restore)
     const char* snap_mem_src;     // host path, bound at $jail/memory.snap (restore)
     const char* out_dir;          // host dir, bound at $jail/out (template capture)
+    // Host path bound at $jail/workspace.ext4. Unlike everything else here this
+    // one is writable (the guest's /workspace), so it is chowned to the jailed
+    // uid before the mount. NULL for templates captured without a workspace.
+    const char* workspace_path;
 } jail_files_t;
 
 int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config);

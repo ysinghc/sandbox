@@ -21,6 +21,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -73,18 +74,87 @@ void workspace_paths(const char* session_key, char* dir, size_t dir_n,
     char id[65];
     session_id(session_key, id);
     if (dir && dir_n) snprintf(dir, dir_n, "%s/%s", workspace_root(), id);
-    if (image && image_n) snprintf(image, image_n, "%s/%s/workspace.ext4",
+    if (image && image_n) snprintf(image, image_n, "%s/%s/" WORKSPACE_IMAGE_NAME,
                                    workspace_root(), id);
 }
 
 void workspace_base_path(const char* template, char* out, size_t n) {
     const char* root = getenv("SANDBOX_SNAPSHOT_ROOT");
     if (!root || !*root) root = SNAPSHOT_DEFAULT_ROOT;
-    snprintf(out, n, "%s/%s/base_workspace.ext4", root, template);
+    snprintf(out, n, "%s/%s/base_" WORKSPACE_IMAGE_NAME, root, template);
+}
+
+// --- base image ------------------------------------------------------------
+
+int workspace_format_base(const char* path, uint32_t size_mb) {
+    if (!path || !*path || size_mb == 0) { errno = EINVAL; return -1; }
+
+    // Sparse: only the ext4 metadata occupies blocks, so a 512 MiB volume costs
+    // a few MiB on disk and clones in milliseconds.
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (ftruncate(fd, (off_t)size_mb * 1024 * 1024) < 0) {
+        int e = errno;
+        close(fd);
+        unlink(path);
+        errno = e;
+        return -1;
+    }
+    close(fd);
+
+    // exec, never system(): this runs at template-build time on a path the
+    // caller chose, and a shell would interpret it. This is the *only* mkfs in
+    // the session path's lifetime (D7) -- format once, clone per session.
+    const char* mkfs = NULL;
+    const char* candidates[] = {"/sbin/mkfs.ext4", "/usr/sbin/mkfs.ext4",
+                                "/usr/bin/mkfs.ext4", "/bin/mkfs.ext4"};
+    for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+        if (access(candidates[i], X_OK) == 0) { mkfs = candidates[i]; break; }
+    }
+    if (!mkfs) {
+        fprintf(stderr, "[workspace] cannot format %s: no mkfs.ext4 found "
+                        "(install e2fsprogs)\n", path);
+        unlink(path);
+        errno = ENOENT;
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        int e = errno;
+        unlink(path);
+        errno = e;
+        return -1;
+    }
+    if (pid == 0) {
+        // -F: it is a plain file, not a block device. -q: no chatter.
+        // -m 0: no root reserve; the volume is entirely the tenant's.
+        // -E lazy_itable_init: do not zero the inode tables up front.
+        execl(mkfs, mkfs, "-F", "-q", "-m", "0", "-E", "lazy_itable_init", path,
+              (char*)NULL);
+        _exit(127);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        int e = errno;
+        unlink(path);
+        errno = e;
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        fprintf(stderr, "[workspace] %s failed on %s (status %d)\n", mkfs, path,
+                status);
+        unlink(path);
+        errno = EIO;
+        return -1;
+    }
+    fprintf(stderr,
+            "[workspace] formatted base image %s (%u MiB, sparse)\n", path,
+            size_mb);
+    return 0;
 }
 
 // --- image copy ------------------------------------------------------------
-
 int workspace_clone(const char* src, const char* dst) {
     if (!src || !dst) { errno = EINVAL; return -1; }
 
@@ -310,7 +380,7 @@ int workspace_ensure(const char* session_key, uid_t owner_uid, uint32_t size_mb,
     if (mkdir(staging, 0700) < 0) return -1;
 
     char img[PATH_MAX];
-    snprintf(img, sizeof(img), "%s/workspace.ext4", staging);
+    snprintf(img, sizeof(img), "%s/" WORKSPACE_IMAGE_NAME, staging);
     if (workspace_clone(base_image, img) < 0) {
         int e = errno;
         sandbox_rm_rf(staging);
@@ -342,15 +412,6 @@ int workspace_ensure(const char* session_key, uid_t owner_uid, uint32_t size_mb,
         return -1;
     }
     if (out) *out = m;
-    return 0;
-}
-
-int workspace_chown(const char* session_key, uid_t uid, gid_t gid) {
-    if (!key_valid(session_key)) { errno = EINVAL; return -1; }
-    char img[PATH_MAX];
-    workspace_paths(session_key, NULL, 0, img, sizeof(img));
-    if (chown(img, uid, gid) < 0) return -1;
-    if (chmod(img, 0600) < 0) return -1;
     return 0;
 }
 
@@ -390,7 +451,7 @@ int workspace_destroy(const char* session_key) {
 // image with no expiry that the reaper would keep forever.
 static int reap_one(const char* dir, uint64_t* freed) {
     char img[PATH_MAX];
-    snprintf(img, sizeof(img), "%s/workspace.ext4", dir);
+    snprintf(img, sizeof(img), "%s/" WORKSPACE_IMAGE_NAME, dir);
     *freed += allocated_bytes(img);
     return sandbox_rm_rf(dir);
 }

@@ -25,6 +25,12 @@ typedef struct snap_manifest_t {
     // changes the sandbox. Bound at capture, verified at restore.
     uint8_t  rootfs_sha256[32];   // SHA-256 of rootfs.ext4
     uint64_t rootfs_size;         // bytes, checked before hashing
+    // #23: the base image every session workspace is cloned from. It is not
+    // captured guest state, but it decides what a *new* session's /workspace
+    // contains, so substituting it silently changes every future sandbox of this
+    // template. workspace_size == 0 means the template has no workspace drive.
+    uint8_t  workspace_sha256[32];  // SHA-256 of base_workspace.ext4
+    uint64_t workspace_size;        // bytes, checked before hashing
     uint8_t  page_bitmap[];  // 1 bit per page: 1=present, 0=zero (packed)
 } snap_manifest_t;
 
@@ -37,6 +43,15 @@ typedef struct {
     // Host tap for the template's NIC ("net1"). Set by create_snapshot_template;
     // NULL builds a network-less template (which restores cannot retarget).
     const char* tap_name;
+    // #23: size of the session workspace base image. 0 builds a template with no
+    // workspace drive (the pre-#23 shape). Any other value formats a sparse ext4
+    // of that many MiB at build time and attaches it, so the guest mounts
+    // /workspace and every restore has a device to bind a session image to.
+    uint32_t workspace_size_mb;
+    // Host path of that base image. Internal: create_snapshot_template formats
+    // the image inside the staging directory and sets this before the boot, so
+    // the caller never has to produce one.
+    const char* workspace_path;
 } template_config_t;
 
 int create_snapshot_template(const char* template_name, const template_config_t* config);

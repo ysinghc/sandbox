@@ -62,6 +62,11 @@ for cmd in sh ash mount umount echo cat ls mkdir touch sleep ps; do
     ln -sf /bin/busybox "$MNTDIR/bin/$cmd" 2>/dev/null || true
 done
 
+# ── 3a. Workspace mountpoint (#23) ────────────────────────────────────────────
+# The guest root is mounted read-only, so /init cannot create this at boot; it
+# has to exist in the image. The session workspace is mounted here.
+mkdir -p "$MNTDIR/workspace"
+
 # ── 3b. Guest env agent (Phase 9b) ────────────────────────────────────────────
 # Static binary; started by /init before capture, resumes blocked in accept()
 # after a snapshot restore to receive the host's per-VM env over vsock.
@@ -88,6 +93,20 @@ mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+
+# Session workspace (Phase 15, #23). The host attaches this template's workspace
+# drive second, so it enumerates as /dev/vdb; the mount is made *here*, before
+# capture, so the snapshot records the mounted filesystem. Every restore then
+# binds a different host file behind the same device: the guest keeps this mount
+# across a destroy + recreate, which is what makes a session's files persist.
+# Clones are byte-identical to the base image, so the page cache captured with
+# the template stays valid for the session's own copy.
+mkdir -p /workspace 2>/dev/null || true
+if mount -t ext4 /dev/vdb /workspace 2>/dev/null; then
+    echo "SANDBOX-WORKSPACE-MOUNTED"
+else
+    echo "SANDBOX-WORKSPACE-NODEVICE"
+fi
 
 # Configure lo
 ip link set lo up 2>/dev/null || true

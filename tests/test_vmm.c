@@ -123,7 +123,7 @@ static void test_restore(void) {
     memset(&net, 0, sizeof(net));
     CHECK_RC(network_setup(vm_id, &net), "net setup");
     uint64_t t0 = now_ms();
-    vm_handle_t* vm = vmm_restore("e2e", vm_id, net.tap_name, net.guest_ip);
+    vm_handle_t* vm = vmm_restore("e2e", vm_id, net.tap_name, net.guest_ip, NULL);
     uint64_t restore_ms = now_ms() - t0;
     if (!vm) {
         fprintf(stderr, "FAIL restore errno=%d (filter kill? see log)\n", errno);

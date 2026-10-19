@@ -109,6 +109,17 @@ static int jail_bind_files(const char* jail_root, const jail_files_t* files,
         snprintf(dst, sizeof(dst), "%s/memory.snap", jail_root);
         if (bind_file(files->snap_mem_src, dst) < 0) return -1;
     }
+    if (files->workspace_path) {
+        // The workspace is the one *writable* file we hand the VMM, so unlike
+        // the read-only binds above it must be owned by the jailed uid before
+        // the mount: a bind propagates the source inode's DAC attributes, and
+        // Firecracker opens this one read-write. 0600 keeps every other local
+        // user out; the session store is also 0700.
+        snprintf(dst, sizeof(dst), "%s" JAIL_WORKSPACE_PATH, jail_root);
+        if (chown(files->workspace_path, uid, gid) < 0) return -1;
+        if (chmod(files->workspace_path, 0600) < 0) return -1;
+        if (bind_file(files->workspace_path, dst) < 0) return -1;
+    }
     if (files->out_dir) {
         snprintf(dst, sizeof(dst), "%s/out", jail_root);
         if (mkdir_recursive(dst, 0755) < 0) return -1;
