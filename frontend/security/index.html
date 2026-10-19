@@ -64,7 +64,7 @@
           line, or that exposes a credential, is what matters most.
         </p>
         <div class="page-meta">
-          <span><strong>Supported</strong> 0.12.x</span>
+          <span><strong>Supported</strong> 0.13.x</span>
           <span><strong>Model</strong> Single trusted operator</span>
           <span><strong>Details</strong> <a href="https://github.com/ysinghc/sandbox/blob/master/docs/THREAT_MODEL.md" rel="noopener">Threat model</a></span>
         </div>
@@ -124,9 +124,14 @@
             A restored Firecracker process runs chrooted, as an unprivileged uid, under
             a seccomp allowlist, with <code>no_new_privs</code> set and a per-VM cgroup.
             Guest egress is dropped except for the host broker, which validates a
-            per-session token and injects real credentials host-side. Snapshots are
+            per-session token and injects real credentials host-side. The guest control
+            channel accepts only connections from the host vsock CID. Snapshots are
             checked against a SHA-256 manifest before restore. The daemon allow-lists
             peer uids on its Unix socket.
+          </p>
+          <p>
+            The privileged suite (jailer, seccomp, restore, vsock, cgroup, nftables)
+            runs on self-hosted KVM hosts in CI and the job fails if any test skips.
           </p>
           <p>
             The
@@ -139,9 +144,8 @@
           <h2>Known limitations</h2>
           <ul class="plain-list">
             <li>The daemon is still a single root trusted computing base. Privilege separation is planned for V2.</li>
-            <li>The seccomp filter has not been audited against a real Firecracker syscall trace.</li>
             <li>Releases include SHA-256 checksums but are not cryptographically signed yet.</li>
-            <li>Per-tenant quotas and full vsock payload authentication are future work.</li>
+            <li>Per-tenant quotas are future work; this remains a single-operator design.</li>
           </ul>
 
           <h2>Release integrity</h2>
@@ -155,7 +159,7 @@
               <span>terminal</span>
               <button class="copy-button" type="button" data-copy="security-verify">Copy</button>
             </div>
-            <pre id="security-verify"><code><span class="prompt">$</span> sha256sum -c sandbox-engine-0.12.0-linux-x86_64.tar.gz.sha256</code></pre>
+            <pre id="security-verify"><code><span class="prompt">$</span> sha256sum -c sandbox-engine-0.13.0-linux-x86_64.tar.gz.sha256</code></pre>
           </div>
         </div>
       </div>

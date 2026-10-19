@@ -4,12 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Download — Sandbox Engine</title>
-  <meta name="description" content="Download Sandbox Engine 0.12.0 for Linux x86_64 and aarch64. Staged install trees, SHA-256 checksums, and install instructions.">
+  <meta name="description" content="Download Sandbox Engine 0.13.0 for Linux x86_64 and aarch64. One-command install, staged archives, standalone binaries, and SHA-256 checksums.">
   <link rel="canonical" href="https://sandbox.ysinghc.in/download/">
   <meta name="theme-color" content="#eef0e9">
   <meta property="og:type" content="website">
   <meta property="og:title" content="Download — Sandbox Engine">
-  <meta property="og:description" content="Sandbox Engine 0.12.0 for Linux x86_64 and aarch64.">
+  <meta property="og:description" content="Sandbox Engine 0.13.0 for Linux x86_64 and aarch64.">
   <meta property="og:url" content="https://sandbox.ysinghc.in/download/">
   <meta property="og:image" content="https://sandbox.ysinghc.in/assets/og.png">
   <meta property="og:image:width" content="1200">
@@ -59,9 +59,9 @@
     <section class="page-hero">
       <div class="container">
         <h1>Download Sandbox Engine</h1>
-        <p class="lede">Version 0.12.0. Staged install trees for Linux x86_64 and aarch64, with SHA-256 checksums.</p>
+        <p class="lede">Version 0.13.0. Install with one script, or take the archive for your architecture. Both are checksummed.</p>
         <div class="page-meta">
-          <span><strong>Released</strong> 17 October 2026</span>
+          <span><strong>Released</strong> 20 October 2026</span>
           <span><strong>License</strong> GPL-2.0-only</span>
           <span><strong>Source</strong> <a href="https://github.com/ysinghc/sandbox" rel="noopener">github.com/ysinghc/sandbox</a></span>
         </div>
@@ -75,7 +75,8 @@
           <ul class="plain-list">
             <li>Linux on x86_64 or aarch64, with <code>/dev/kvm</code>.</li>
             <li>userfaultfd available to the daemon.</li>
-            <li>Root, for taps, device nodes, cgroups, and jails.</li>
+            <li>Root, for the installer, taps, cgroups, and jails.</li>
+            <li><code>curl</code> and <code>tar</code> for the install script.</li>
             <li>A Firecracker binary, guest kernel, and rootfs.</li>
           </ul>
           <p>
@@ -85,35 +86,117 @@
         </aside>
 
         <div class="prose">
-          <h2>Packages</h2>
+          <h2>One-command install</h2>
+          <p>
+            <code>scripts/install.sh</code> detects the machine's architecture, downloads
+            the matching release, verifies its SHA-256, and installs the binaries and
+            libraries. Read it first; it is a short shell script.
+          </p>
 
-          <div class="release-table">
-            <div class="release-row release-row--head" aria-hidden="true">
-              <span>Architecture</span>
-              <span>Package</span>
-              <span>Checksum</span>
+          <div class="code-block">
+            <div class="code-head">
+              <span>terminal</span>
+              <button class="copy-button" type="button" data-copy="install-code">Copy</button>
             </div>
+            <pre id="install-code"><code><span class="comment"># inspect, then install the full staged tree over /</span>
+<span class="prompt">$</span> curl -fsSL -o install.sh \
+    https://raw.githubusercontent.com/ysinghc/sandbox/v0.13.0/scripts/install.sh
+<span class="prompt">$</span> less install.sh
+<span class="prompt">$</span> sudo bash install.sh --version v0.13.0 --full
 
-            <div class="release-row">
-              <div class="arch">x86_64 <span>linux</span></div>
-              <div>
-                <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.12.0/sandbox-engine-0.12.0-linux-x86_64.tar.gz">sandbox-engine-0.12.0-linux-x86_64.tar.gz</a>
-                <span class="file-size">204.4 KiB</span>
-              </div>
-              <div class="checksum"><a href="https://github.com/ysinghc/sandbox/releases/download/v0.12.0/sandbox-engine-0.12.0-linux-x86_64.tar.gz.sha256">SHA-256</a></div>
-            </div>
+<span class="comment"># or install just the binaries and libraries into /usr/local</span>
+<span class="prompt">$</span> sudo bash install.sh --version v0.13.0
 
-            <div class="release-row">
-              <div class="arch">aarch64 <span>linux</span></div>
-              <div>
-                <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.12.0/sandbox-engine-0.12.0-linux-aarch64.tar.gz">sandbox-engine-0.12.0-linux-aarch64.tar.gz</a>
-                <span class="file-size">208.8 KiB</span>
-              </div>
-              <div class="checksum"><a href="https://github.com/ysinghc/sandbox/releases/download/v0.12.0/sandbox-engine-0.12.0-linux-aarch64.tar.gz.sha256">SHA-256</a></div>
-            </div>
+<span class="comment"># useful options</span>
+<span class="prompt">$</span> bash install.sh --prefix /opt/sandbox
+<span class="prompt">$</span> bash install.sh --dry-run</code></pre>
           </div>
 
-          <h2>Install</h2>
+          <div class="callout callout--spaced">
+            <h2>What <code>--full</code> adds</h2>
+            <p>
+              The staged tree includes the systemd unit, packaged config, and state
+              directories. Without <code>--full</code>, only <code>sandboxd</code>,
+              <code>sandbox-broker</code>, <code>sandbox-cli</code>, and the two client
+              libraries are installed.
+            </p>
+          </div>
+
+          <h2>Release archives</h2>
+          <p>
+            Both architectures are built natively from the same tag. Every archive has a
+            matching <code>.sha256</code> file.
+          </p>
+
+          <div class="arch-grid">
+            <article class="arch-card">
+              <div class="arch-card-head">
+                <h3>x86_64</h3>
+                <span class="mono">linux</span>
+              </div>
+              <ul class="asset-list">
+                <li>
+                  <div>
+                    <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64.tar.gz">Staged install tree</a>
+                    <span class="asset-file">sandbox-engine-0.13.0-linux-x86_64.tar.gz · 235.6 KiB</span>
+                  </div>
+                  <a class="asset-sha" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64.tar.gz.sha256">SHA-256</a>
+                </li>
+                <li>
+                  <div>
+                    <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz">Binaries and libraries</a>
+                    <span class="asset-file">sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz · 127.0 KiB</span>
+                  </div>
+                  <a class="asset-sha" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz.sha256">SHA-256</a>
+                </li>
+              </ul>
+              <details class="asset-details">
+                <summary>Individual binaries and libraries</summary>
+                <ul class="asset-links">
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandboxd-linux-x86_64">sandboxd</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-cli-linux-x86_64">sandbox-cli</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-broker-linux-x86_64">sandbox-broker</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/libsandbox-linux-x86_64.so">libsandbox.so</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/libsandbox%2B%2B-linux-x86_64.so">libsandbox++.so</a></li>
+                </ul>
+              </details>
+            </article>
+
+            <article class="arch-card">
+              <div class="arch-card-head">
+                <h3>aarch64</h3>
+                <span class="mono">linux</span>
+              </div>
+              <ul class="asset-list">
+                <li>
+                  <div>
+                    <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64.tar.gz">Staged install tree</a>
+                    <span class="asset-file">sandbox-engine-0.13.0-linux-aarch64.tar.gz · 239.0 KiB</span>
+                  </div>
+                  <a class="asset-sha" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64.tar.gz.sha256">SHA-256</a>
+                </li>
+                <li>
+                  <div>
+                    <a class="download-link" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz">Binaries and libraries</a>
+                    <span class="asset-file">sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz · 130.8 KiB</span>
+                  </div>
+                  <a class="asset-sha" href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz.sha256">SHA-256</a>
+                </li>
+              </ul>
+              <details class="asset-details">
+                <summary>Individual binaries and libraries</summary>
+                <ul class="asset-links">
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandboxd-linux-aarch64">sandboxd</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-cli-linux-aarch64">sandbox-cli</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-broker-linux-aarch64">sandbox-broker</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/libsandbox-linux-aarch64.so">libsandbox.so</a></li>
+                  <li><a href="https://github.com/ysinghc/sandbox/releases/download/v0.13.0/libsandbox%2B%2B-linux-aarch64.so">libsandbox++.so</a></li>
+                </ul>
+              </details>
+            </article>
+          </div>
+
+          <h2>Manual install</h2>
 
           <div class="install-flow">
             <div class="install-step">
@@ -126,7 +209,7 @@
                     <span>terminal</span>
                     <button class="copy-button" type="button" data-copy="verify-code">Copy</button>
                   </div>
-                  <pre id="verify-code"><code><span class="prompt">$</span> sha256sum -c sandbox-engine-0.12.0-linux-x86_64.tar.gz.sha256</code></pre>
+                  <pre id="verify-code"><code><span class="prompt">$</span> sha256sum -c sandbox-engine-0.13.0-linux-x86_64.tar.gz.sha256</code></pre>
                 </div>
               </div>
             </div>
@@ -141,7 +224,7 @@
                     <span>terminal</span>
                     <button class="copy-button" type="button" data-copy="extract-code">Copy</button>
                   </div>
-                  <pre id="extract-code"><code><span class="prompt">$</span> sudo tar -xzf sandbox-engine-0.12.0-linux-x86_64.tar.gz -C /</code></pre>
+                  <pre id="extract-code"><code><span class="prompt">$</span> sudo tar -xzf sandbox-engine-0.13.0-linux-x86_64.tar.gz -C /</code></pre>
                 </div>
               </div>
             </div>

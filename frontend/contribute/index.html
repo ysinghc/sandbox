@@ -114,12 +114,17 @@
 <span class="prompt">$</span> cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
     -DSANDBOX_SANITIZE=address,undefined
 <span class="prompt">$</span> cmake --build build-asan -j
-<span class="prompt">$</span> ctest --test-dir build-asan --output-on-failure</code></pre>
+<span class="prompt">$</span> ctest --test-dir build-asan --output-on-failure
+
+<span class="comment"># full suite, as root on a prepared KVM host</span>
+<span class="prompt">$</span> sudo ctest --test-dir build -V</code></pre>
           </div>
 
           <p>
             The privileged tests run on a lab host with real KVM and Firecracker.
-            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/TESTING.md" rel="noopener">docs/TESTING.md</a>
+            CI runs them on self-hosted runners and fails if any test skips, so
+            "passed" cannot mean "did not run". The
+            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/TESTING.md" rel="noopener">testing guide</a>
             explains the split and the runner prerequisites.
           </p>
 
@@ -127,7 +132,7 @@
           <ol class="number-list">
             <li>Branch from <code>master</code>.</li>
             <li>Keep the change focused. Separate refactors from behavior changes.</li>
-            <li>Pass build, unprivileged tests, ASan/UBSan, and the fuzz smoke job.</li>
+            <li>Pass build, unprivileged tests, ASan/UBSan, and the fuzz smoke job; run the privileged suite where you can.</li>
             <li>Update the affected design section, <code>docs/</code>, and <code>CHANGELOG.md</code>.</li>
             <li>In the PR, state exactly which privileged tests you ran and how.</li>
           </ol>
@@ -141,7 +146,7 @@
             </article>
             <article class="resource">
               <h3>Harden the engine</h3>
-              <p>Seccomp auditing, privilege separation, vsock payload authentication, and per-tenant quotas are open in the V2 backlog.</p>
+              <p>Privilege separation, per-tenant quotas, hierarchical config, and aarch64 arch-timer restore are open. The V2 backlog is explicit about each one.</p>
               <a href="https://github.com/ysinghc/sandbox/blob/master/docs/IMPLEMENTATION_LOG.md" rel="noopener">See the backlog →</a>
             </article>
             <article class="resource">

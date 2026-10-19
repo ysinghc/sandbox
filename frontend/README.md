@@ -1,7 +1,8 @@
 # Sandbox Engine website
 
 Static site for [sandbox.ysinghc.in](https://sandbox.ysinghc.in). No build step:
-plain HTML, CSS, and a small amount of JavaScript, served by Cloudflare Pages.
+plain HTML, CSS, and a small amount of JavaScript, served by Cloudflare Workers
+Static Assets from `frontend/`.
 
 ## Structure
 
@@ -34,20 +35,19 @@ Then open <http://localhost:8080>.
 
 ## Deploy
 
-The Pages project is `sandbox-engine`; `sandbox.ysinghc.in` is its custom domain.
+Deployment is configured by `../wrangler.jsonc`: the Worker is `sandbox-engine`,
+its assets are this directory, and `sandbox.ysinghc.in` is a custom domain.
 
 ```sh
-npx wrangler pages deploy frontend \
-  --project-name sandbox-engine \
-  --branch master \
-  --commit-dirty=true
+npx wrangler deploy
 ```
 
-Or push to `master` after connecting the project to GitHub in the Cloudflare
-dashboard. The site has no build command and uses `frontend` as its root.
+Cloudflare uploads the changed assets, applies `_headers`, serves `404.html`
+for missing paths, and keeps the custom domain attached. No build command is
+needed.
 
 ## Content sources
 
 Copy and links follow the repository's `README.md`, `CONTRIBUTING.md`,
 `CHANGELOG.md`, `docs/`, and `SYSTEM DESIGN.md`. Update this site when the
-release version or documentation layout changes.
+release version, download assets, or documentation layout changes.
