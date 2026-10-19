@@ -31,7 +31,7 @@ cmake --build build -j
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `SANDBOX_VERSION` | `0.12.0` | Version string for `--version` and packaging. |
+| `SANDBOX_VERSION` | `0.13.0` | Version string for `--version` and packaging. |
 | `CMAKE_BUILD_TYPE` | *(unset)* | `Release` (`-O3 -DNDEBUG`) or `Debug` (`-g -O0 -DDEBUG`). |
 | `SANDBOX_TSAN` | `OFF` | Build with ThreadSanitizer (pool concurrency verification). |
 | `SANDBOX_SANITIZE` | *(empty)* | Comma-separated sanitizers, e.g. `address,undefined`. |

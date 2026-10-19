@@ -209,12 +209,14 @@ documented in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
 ## Project status
 
-Current release: **0.12.0**. The engine, jailer, uffd path, snapshot manager,
+Current release: **0.13.0**. The engine, jailer, uffd path, snapshot manager,
 broker, pool, cgroups, snapshot integrity, structured logging, metrics, and CLI
-are implemented and covered by the test suite (see `docs/TESTING.md`). Items
-still open — seccomp audit against a real syscall trace, hierarchical config,
-`credentials.conf` mode enforcement, and the V2 hardening backlog (privilege
-separation, vsock payload authentication, per-tenant quotas) — are tracked in
+are implemented and covered by the test suite (see `docs/TESTING.md`). The
+privileged tests (jailer, seccomp, real VM restore, vsock IPC, cgroup, nftables)
+now run in CI on a self-hosted KVM host rather than being skipped, and the job
+fails if any of them skips. Items still open — hierarchical config, aarch64
+arch-timer restore, workspace/TTL, and the V2 hardening backlog (privilege
+separation, per-tenant quotas) — are tracked in
 [`docs/IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md), the issue tracker,
 and §12.2/§13 of the design. Deviations from the original design are recorded in
 §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
