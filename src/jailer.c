@@ -85,8 +85,22 @@ static int copy_file(const char* src, const char* dst, unsigned mode) {
 
 // Bind-mount a host file at a jail path (target created first).
 static int bind_file(const char* src, const char* dst) {
-    if (touch(dst) < 0) return -1;
-    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) return -1;
+    if (touch(dst) < 0) {
+        fprintf(stderr, "[jailer] bind: cannot create target %s: errno=%d (%s)\n",
+                dst, errno, strerror(errno));
+        return -1;
+    }
+    if (mount(src, dst, NULL, MS_BIND, NULL) < 0) {
+        // ENOENT from mount() means the *source* is missing, but "step 6
+        // failed: ENOENT" alone does not say which of five binds, or which
+        // path -- so name both and say whether the source is there.
+        struct stat sst;
+        fprintf(stderr,
+                "[jailer] bind %s -> %s failed: errno=%d (%s); source %s\n", src,
+                dst, errno, strerror(errno),
+                stat(src, &sst) == 0 ? "exists" : "MISSING");
+        return -1;
+    }
     return 0;
 }
 
@@ -116,8 +130,16 @@ static int jail_bind_files(const char* jail_root, const jail_files_t* files,
         // Firecracker opens this one read-write. 0600 keeps every other local
         // user out; the session store is also 0700.
         snprintf(dst, sizeof(dst), "%s" JAIL_WORKSPACE_PATH, jail_root);
-        if (chown(files->workspace_path, uid, gid) < 0) return -1;
-        if (chmod(files->workspace_path, 0600) < 0) return -1;
+        if (chown(files->workspace_path, uid, gid) < 0) {
+            fprintf(stderr, "[jailer] workspace chown(%s): errno=%d (%s)\n",
+                    files->workspace_path, errno, strerror(errno));
+            return -1;
+        }
+        if (chmod(files->workspace_path, 0600) < 0) {
+            fprintf(stderr, "[jailer] workspace chmod(%s): errno=%d (%s)\n",
+                    files->workspace_path, errno, strerror(errno));
+            return -1;
+        }
         if (bind_file(files->workspace_path, dst) < 0) return -1;
     }
     if (files->out_dir) {

@@ -380,6 +380,7 @@ static void jail_cleanup(const char* jail_root) {
     if (!jail_root || !*jail_root) return;
     const char* subs[] = { "/dev/kvm", "/dev/net/tun", "/dev/userfaultfd",
                            "/vmlinux", "/rootfs.ext4", "/vmstate", "/memory.snap",
+                           "/workspace.ext4",  // #23: live bind, or rm_rf fails
                            "/out" };
     char p[PATH_MAX];
     for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
