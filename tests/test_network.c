@@ -214,6 +214,23 @@ static int await_synack(int fd, const uint8_t* tap_mac, uint32_t sport_s,
     }
 }
 
+// Returns 0 if *this* SYN (sport_s, dport_s, seq) gets no SYN-ACK within ms.
+//
+// The drop verdict is about one specific connection, so the check must be keyed
+// on that connection's tuple. A retransmitted SYN-ACK from an earlier connection
+// is not a reply to this SYN, and the RST that is supposed to silence those can
+// arrive before the listener's side of the connection exists -- which is a real
+// race this test hit (a correct drop was reported as a failure because a stale
+// retransmission was in the tap when the window opened). await_synack already
+// matches on the tuple, and its timeout is exactly the inverse of what is wanted.
+static int expect_no_synack(int fd, const uint8_t* tap_mac, uint32_t sport_s,
+                            uint32_t dport_s, uint32_t seq, uint32_t server_ip,
+                            int ms) {
+    return await_synack(fd, tap_mac, sport_s, dport_s, seq, server_ip, ms) == 0
+               ? -1
+               : 0;
+}
+
 // Returns 0 if no IPv4 frame arrives within ms (drop verdict).
 // Non-IPv4 noise (ARP, IPv6 MLD on fresh interfaces) is ignored.
 static int expect_silence(int fd, int ms) {
@@ -525,7 +542,8 @@ int main(void) {
     CHECK_RC(run(cmd), "re-add drop rule");
     flen = build_syn(frame, tap_mac, 40004, 80, 0x20000003, outer_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject outer SYN 3");
-    if (expect_silence(net.tap_fd, 1000) < 0) {
+    if (expect_no_synack(net.tap_fd, tap_mac, 40004, 80, 0x20000003, outer_ip,
+                         1000) < 0) {
         fprintf(stderr, "FAIL forward_drop: reply after rule restore\n");
         abort();
     }
