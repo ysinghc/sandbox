@@ -314,7 +314,10 @@ int main(int argc, char** argv) {
     uint64_t first = 0, last = 0;
     int made = 0;
     for (int i = 0; i < count; i++) {
-        sandbox_spec_t spec;
+        // Zero-init: sandbox_spec_t is a growing struct, and every field the
+        // caller does not set must be 0/NULL. Do not drop this -- the #23 fields
+        // are pointers, and uninitialised stack garbage here is a segfault.
+        sandbox_spec_t spec = {0};
         spec.memory_mib = mem;
         spec.vcpu_count = vcpus;
         spec.template_name = tmpl;

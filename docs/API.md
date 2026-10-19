@@ -28,7 +28,18 @@ typedef struct {
     const char* template_name;  // snapshot template to restore
     const char** env_vars;      // NULL-terminated "KEY=VALUE" array (may be NULL)
     uint32_t    pool_wait_ms;   // max wait when the pool is empty (0 = fail fast)
+    const char* session_key;    // persistent /workspace volume; NULL = ephemeral
+    uint32_t    ttl_seconds;    // volume lifetime; 0 = platform default (7 days)
 } sandbox_spec_t;
+
+**Zero-initialise it** (`sandbox_spec_t spec = {0};`) and then set the fields you
+need. The struct grows as the engine gains features, and a field the caller did
+not set must read as 0/NULL. An uninitialised local is uninitialised stack
+garbage — for `session_key` that is a crash, not a wrong default.
+
+A spec is a *request*, not a description of what you get: the daemon clamps
+`ttl_seconds` to the platform maximum and rejects a `session_key` that is not
+1–127 printable bytes without `"` or `\`.
 
 typedef struct {
     uint32_t sandbox_id;
