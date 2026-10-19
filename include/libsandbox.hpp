@@ -31,7 +31,15 @@ public:
         return *this;
     }
     Spec& pool_wait(uint32_t ms) { pool_wait_ms_ = ms; return *this; }
-    
+    // #23: give this sandbox a persistent /workspace volume. Two sandboxes
+    // created with the same key share the volume's files (sequentially: one at a
+    // time), and the files outlive the sandbox until the TTL expires.
+    Spec& session(std::string key, uint32_t ttl_seconds = 0) {
+        session_key_ = std::move(key);
+        ttl_seconds_ = ttl_seconds;
+        return *this;
+    }
+
     sandbox_spec_t to_c_struct() const;
 private:
     uint64_t memory_mib_;
@@ -39,6 +47,8 @@ private:
     std::string template_name_;
     std::vector<std::string> env_vars_;
     uint32_t pool_wait_ms_;
+    std::string session_key_;
+    uint32_t ttl_seconds_ = 0;
     // Stable backing store for the const char* array handed to the C API.
     mutable std::vector<const char*> env_ptrs_;
 };

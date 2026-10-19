@@ -99,6 +99,17 @@ int workspace_reap(int64_t now, int* expired_out);
 // Accounted usage for one owner: allocated bytes and volume count.
 int workspace_usage(uid_t owner, uint64_t* bytes, uint32_t* count);
 
+// Exclusive-use lease on a session volume, held from create until the VM is
+// destroyed: two VMs on one image would corrupt it. Returns 0 with the lease
+// taken, or -1/EBUSY when another sandbox already holds it. process-local: only
+// this daemon binds volumes.
+int workspace_lease(const char* session_key);
+void workspace_release(const char* session_key);
+
+// Number of leases currently held, i.e. sessions with a live sandbox (a gauge,
+// not a counter: it is state, and it is reported rather than accumulated).
+int workspace_lease_count(void);
+
 // Path of the base image a template stores next to its snapshot files.
 void workspace_base_path(const char* template, char* out, size_t n);
 

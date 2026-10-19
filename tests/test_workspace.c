@@ -272,6 +272,27 @@ static void test_isolation_and_accounting(void) {
     CHECK(!image_contains("sess-y", "x-only"), "destroy does not touch other sessions");
 }
 
+static void test_lease(void) {
+    printf("[test] lease...\n");
+    // Two VMs on one image would write the same blocks through separate page
+    // caches and destroy each other's files, so a session volume is exclusive.
+    CHECK(workspace_lease_count() == 0, "no leases at rest");
+    CHECK(workspace_lease("locked") == 0, "lease acquired");
+    CHECK(workspace_lease_count() == 1, "lease counted");
+    CHECK(workspace_lease("locked") < 0 && errno == EBUSY,
+          "a second lease on the same session is refused");
+    CHECK(workspace_lease("other") == 0 && workspace_lease_count() == 2,
+          "an unrelated session can still be leased");
+    CHECK(workspace_lease("") < 0, "an empty key is refused");
+    workspace_release("locked");
+    CHECK(workspace_lease_count() == 1, "release frees the lease");
+    CHECK(workspace_lease("locked") == 0, "the session can be leased again");
+    workspace_release("locked");
+    workspace_release("other");
+    workspace_release("never-held");  // must not corrupt the table
+    CHECK(workspace_lease_count() == 0, "releasing an unheld lease is a no-op");
+}
+
 int main(void) {
     snprintf(g_root, sizeof(g_root), "/tmp/sbtest-ws-%d", (int)getpid());
     setenv("SANDBOX_WORKSPACE_ROOT", g_root, 1);
@@ -290,6 +311,7 @@ int main(void) {
     test_ttl_clamp_and_renew();
     test_reap();
     test_isolation_and_accounting();
+    test_lease();
 
     // The base image must never be handed out: it is shared by every session.
     CHECK(image_exists("sess-x") == 0, "destroyed session leaves nothing behind");

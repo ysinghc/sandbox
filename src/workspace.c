@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -456,8 +457,61 @@ static int reap_one(const char* dir, uint64_t* freed) {
     return sandbox_rm_rf(dir);
 }
 
-int workspace_reap(int64_t now, int* expired_out) {
-    int expired = 0;
+// --- exclusive-use leases (#23) --------------------------------------------
+//
+// Two VMs bound to one image would corrupt it: both would write the same blocks
+// through their own page caches, and neither would see the other's writes. The
+// engine is the only thing that binds a volume, so an in-process lease is
+// sufficient -- and it is the difference between "a second create is refused"
+// and "a second create silently destroys the session".
+#define WS_LEASE_MAX 256
+static char g_leases[WS_LEASE_MAX][65];
+static size_t g_lease_count;
+static pthread_mutex_t g_lease_lock = PTHREAD_MUTEX_INITIALIZER;
+
+int workspace_lease(const char* session_key) {
+    if (!key_valid(session_key)) { errno = EINVAL; return -1; }
+    char id[65];
+    session_id(session_key, id);
+    pthread_mutex_lock(&g_lease_lock);
+    for (size_t i = 0; i < g_lease_count; i++) {
+        if (strcmp(g_leases[i], id) == 0) {
+            pthread_mutex_unlock(&g_lease_lock);
+            errno = EBUSY;
+            return -1;
+        }
+    }
+    if (g_lease_count >= WS_LEASE_MAX) {
+        pthread_mutex_unlock(&g_lease_lock);
+        errno = ENOSPC;
+        return -1;
+    }
+    memcpy(g_leases[g_lease_count], id, sizeof(id));
+    g_lease_count++;
+    pthread_mutex_unlock(&g_lease_lock);
+    return 0;
+}
+
+void workspace_release(const char* session_key) {    if (!key_valid(session_key)) return;
+    char id[65];
+    session_id(session_key, id);
+    pthread_mutex_lock(&g_lease_lock);
+    for (size_t i = 0; i < g_lease_count; i++) {
+        if (strcmp(g_leases[i], id) == 0) {
+            g_leases[i][0] = '\0';  // tombstone; compact on the next free slot
+            if (i + 1 == g_lease_count) {
+                while (g_lease_count && g_leases[g_lease_count - 1][0] == '\0') {
+                    g_lease_count--;
+                }
+            }
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_lease_lock);
+}
+
+
+int workspace_reap(int64_t now, int* expired_out) {    int expired = 0;
     DIR* d = opendir(workspace_root());
     if (!d) {
         if (errno == ENOENT) { if (expired_out) *expired_out = 0; return 0; }
@@ -520,6 +574,16 @@ int workspace_reap(int64_t now, int* expired_out) {
     closedir(d);
     if (expired_out) *expired_out = expired;
     return 0;
+}
+
+int workspace_lease_count(void) {
+    int n = 0;
+    pthread_mutex_lock(&g_lease_lock);
+    for (size_t i = 0; i < g_lease_count; i++) {
+        if (g_leases[i][0]) n++;
+    }
+    pthread_mutex_unlock(&g_lease_lock);
+    return n;
 }
 
 int workspace_usage(uid_t owner, uint64_t* bytes, uint32_t* count) {

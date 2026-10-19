@@ -14,6 +14,9 @@ void telemetry_uffd_fault(void);
 void telemetry_vmm_crash(void);
 void telemetry_pool_exhausted(void);
 
+// #23: count of session workspaces deleted by the reaper.
+void telemetry_workspace_expired(uint32_t count);
+
 // Render the current metrics as Prometheus text into buf (NUL-terminated).
 // Returns the number of bytes written.
 int telemetry_render(char* buf, int cap);

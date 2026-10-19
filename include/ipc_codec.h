@@ -26,6 +26,7 @@ typedef enum {
 
 #define IPC_MAX_ENV 64
 #define IPC_MAX_TEMPLATE 128
+#define IPC_MAX_SESSION_KEY 128
 #define IPC_TOKEN_HEX_LEN 64
 #define IPC_MAX_ERRMSG 192
 
@@ -39,6 +40,9 @@ typedef struct {
     uint32_t pool_wait_ms;
     char* env_vars[IPC_MAX_ENV + 1];  // NULL-terminated, owned by the struct
     int n_env;
+    // #23: empty = ephemeral workspace. Non-empty = persistent session volume.
+    char session_key[IPC_MAX_SESSION_KEY];
+    uint32_t ttl_seconds;  // 0 = platform default
 
     // destroy/pause/resume/inspect
     uint32_t sandbox_id;

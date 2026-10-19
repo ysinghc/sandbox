@@ -42,6 +42,9 @@ typedef struct vm_handle_t {
     // supply a session volume. Owned by the handle: vmm_destroy unlinks it. Empty
     // when the volume belongs to a session (or the template has no workspace).
     char workspace_scratch[PATH_MAX];
+    // #23: session key of a persistent volume bound to this VM. Non-empty means
+    // the caller holds a workspace lease that vmm_destroy must release.
+    char session_key[128];
     vm_network_t net;  // per-VM tap; reclaimed by vmm_destroy
     bool has_net;
     pthread_t uffd_thread;
@@ -55,6 +58,13 @@ typedef struct vm_handle_t {
 
 // Restore a VM from the configured template via real Firecracker /snapshot/load.
 vm_handle_t* restore_vm_from_snapshot(void);
+
+// #23: same, but with an explicit writable workspace volume (NULL = an ephemeral
+// per-VM clone of the template's base image). Used for session-backed creates,
+// which cannot come from the warm pool: a pool member's workspace is already
+// bound before the request arrives, and Firecracker cannot swap a block device
+// after restore.
+vm_handle_t* restore_vm_with_workspace(const char* workspace_image);
 
 // Build the /snapshot/load request body. Pure string construction, so the
 // fields that decide guest behaviour after resume (tap retarget, per-VM vsock

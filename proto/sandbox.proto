@@ -18,6 +18,9 @@ message CreateRequest {
   string template_name = 3;
   repeated string env_vars = 4;  // "KEY=VALUE"
   uint32 pool_wait_ms = 5;
+  // #23: persistent session workspace. Empty = ephemeral (default).
+  string session_key = 6;
+  uint32 ttl_seconds = 7;  // 0 = platform default
 }
 
 message DestroyRequest {

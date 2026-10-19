@@ -41,6 +41,13 @@
 #define ENV_FILE "/tmp/sandbox-env"
 #define MAX_PAYLOAD 8192
 
+// #23: the session workspace. The probe below is a *diagnostic*: it lets the
+// host observe, from inside the guest, that /workspace is this session's own
+// volume and that it survives a destroy + re-create. It never writes the payload
+// itself (env values may be credentials) -- only a checksum of it.
+#define WS_PROBE_FILE "/workspace/.sandbox-probe"
+#define WS_PROBE_MAX 4096
+
 static int g_console = -1;
 
 static void say(const char* s) {
@@ -50,6 +57,76 @@ static void say(const char* s) {
 }
 
 static int got_env = 0;
+
+// FNV-1a. Chosen because it is trivially reproducible by eye and the test only
+// cares that different payloads give different lines.
+static unsigned probe_sum(const char* b, size_t n) {
+    unsigned s = 2166136261u;
+    for (size_t i = 0; i < n; i++) {
+        s ^= (unsigned char)b[i];
+        s *= 16777619u;
+    }
+    return s;
+}
+
+// Append a checksum of this injection to the workspace probe file and report the
+// file's shape on the serial console:
+//
+//   SANDBOX-WORKSPACE-PROBE mounted=1 lines=2 first=1a2b3c4d last=5e6f7a8b
+//
+// `mounted=0` means the probe file could not be opened, which is what a guest
+// without a workspace drive (or an unwritable volume) looks like.
+//
+// `first` is the point: after a destroy + re-create of the *same* session, the
+// first line is still the checksum written before, while a *different* session
+// starts with one line and a different value. That is the whole persistence
+// claim, observed from inside the guest rather than inferred by the host.
+static void workspace_probe(const char* payload, size_t n) {
+    char line[16];
+    int ln = snprintf(line, sizeof(line), "%08x\n", probe_sum(payload, n));
+    if (ln <= 0) return;
+
+    int fd = open(WS_PROBE_FILE, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) {
+        say("SANDBOX-WORKSPACE-PROBE mounted=0\n");
+        return;
+    }
+    ssize_t w = write(fd, line, (size_t)ln);
+    close(fd);
+    if (w != ln) {
+        say("SANDBOX-WORKSPACE-PROBE mounted=1 write_failed=1\n");
+        return;
+    }
+
+    fd = open(WS_PROBE_FILE, O_RDONLY);
+    if (fd < 0) {
+        say("SANDBOX-WORKSPACE-PROBE mounted=1 read_failed=1\n");
+        return;
+    }
+    char buf[WS_PROBE_MAX + 1];
+    ssize_t r = read(fd, buf, WS_PROBE_MAX);
+    close(fd);
+    if (r < 0) r = 0;
+    buf[r] = '\0';
+
+    int lines = 0;
+    for (ssize_t i = 0; i < r; i++) {
+        if (buf[i] == '\n') lines++;
+    }
+    char first[9] = "--------", last[9] = "--------";
+    if (r >= 9) memcpy(first, buf, 8);
+    // The last complete line: scan back over the final newline.
+    if (r >= 9 && buf[r - 1] == '\n') memcpy(last, buf + r - 9, 8);
+
+    char m[128];
+    int k = snprintf(m, sizeof(m),
+                     "SANDBOX-WORKSPACE-PROBE mounted=1 lines=%d first=%s last=%s\n",
+                     lines, first, last);
+    if (k > 0) {
+        ssize_t wr = write(g_console, m, (size_t)k);
+        (void)wr;
+    }
+}
 
 // ── #10: authenticate the host ───────────────────────────────────────────────
 //
@@ -132,6 +209,9 @@ static void serve(int cfd) {
     }
     say("SANDBOX-ENV-END\n");
     got_env = 1;
+
+    // #23: observe the session workspace from inside the guest (see above).
+    workspace_probe(buf, off);
 
     // #22: report the guest's wall clock once per injection. After a restore the
     // guest resumes with whatever the snapshot captured, so this line is the

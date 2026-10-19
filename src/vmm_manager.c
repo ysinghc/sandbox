@@ -831,8 +831,9 @@ int vmm_destroy(vm_handle_t* vm) {
     }
     jail_cleanup(vm->jail_root);
     // #23: an ephemeral workspace belongs to this VM alone; a session volume is
-    // owned by the registry and survives.
+    // owned by the registry and survives. Either way this VM's lease ends here.
     if (vm->workspace_scratch[0]) unlink(vm->workspace_scratch);
+    if (vm->session_key[0]) workspace_release(vm->session_key);
     // §10.11: the VMM is reaped, so its cgroup is empty and can be removed.
     cgroup_remove_vm(vm->cgroup_dir);
     free(vm);
@@ -1164,7 +1165,7 @@ void pool_set_restore_source(const char* template_name) {
     snprintf(g_template, sizeof(g_template), "%s", template_name ? template_name : "");
 }
 
-vm_handle_t* restore_vm_from_snapshot(void) {
+vm_handle_t* restore_vm_with_workspace(const char* workspace_image) {
     if (g_template[0] == '\0') {
         usleep(83000);  // no source configured: keep the restore latency shape
         return NULL;
@@ -1190,7 +1191,8 @@ vm_handle_t* restore_vm_from_snapshot(void) {
     memset(&net, 0, sizeof(net));
     if (network_setup(vm_id, &net) < 0) return NULL;
     uint64_t t_net = now_ms();
-    vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip, NULL);
+    vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip,
+                                  workspace_image);
     if (!vm) {
         network_cleanup(&net);
         return NULL;
@@ -1203,4 +1205,8 @@ vm_handle_t* restore_vm_from_snapshot(void) {
     vm->net = net;
     vm->has_net = true;
     return vm;
+}
+
+vm_handle_t* restore_vm_from_snapshot(void) {
+    return restore_vm_with_workspace(NULL);
 }

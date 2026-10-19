@@ -108,6 +108,51 @@ static long long serial_int(vm_handle_t* vm, const char* marker) {
     return v;
 }
 
+// #23: the guest's workspace probe. The agent appends one checksum line per env
+// injection to /workspace/.sandbox-probe and reports the file's shape, so the
+// host can see what the *guest* sees. The last line in the serial log describes
+// the state after the most recent injection.
+typedef struct {
+    int lines;
+    char first[9];
+    char last[9];
+} ws_probe_t;
+
+static int serial_probe(vm_handle_t* vm, ws_probe_t* out) {
+    char* b = serial_text(vm, NULL);
+    if (!b) return 0;
+    const char* p = NULL;
+    for (const char* q = b; (q = strstr(q, "SANDBOX-WORKSPACE-PROBE")) != NULL; q++) {
+        p = q;
+    }
+    int ok = 0;
+    if (p) {
+        const char* l = strstr(p, "lines=");
+        const char* f = strstr(p, "first=");
+        const char* la = strstr(p, "last=");
+        if (l && f && la) {
+            memset(out, 0, sizeof(*out));
+            out->lines = (int)strtol(l + 6, NULL, 10);
+            memcpy(out->first, f + 6, 8);
+            out->first[8] = '\0';
+            memcpy(out->last, la + 5, 8);
+            out->last[8] = '\0';
+            ok = 1;
+        }
+    }
+    free(b);
+    return ok;
+}
+
+// Wait until the guest reports at least `lines_want` probe lines.
+static int wait_probe(vm_handle_t* vm, ws_probe_t* out, int lines_want) {
+    for (int i = 0; i < 300; i++) {
+        if (serial_probe(vm, out) && out->lines >= lines_want) return 1;
+        usleep(10000);
+    }
+    return 0;
+}
+
 static pool_manager_t g_pool;
 static char g_engine_sock[256];
 static char g_bc_sock[256];
@@ -292,8 +337,80 @@ int main(void) {
         CHECK(guest_now > 1600000000LL, "clock: guest clock is plausible");
 #endif
 
-        CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
-        CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,
+        // --- #23: session workspaces. A sandbox created with a session key gets
+        // a *persistent* /workspace: its files survive the sandbox being
+        // destroyed, because the volume belongs to the session, not the VM. The
+        // guest proves it from the inside -- the agent appends a checksum of each
+        // injected payload to /workspace/.sandbox-probe and reports the file's
+        // line count, first line and last line -- so this is in-guest evidence,
+        // not the host reading back a file it wrote itself. ---
+        {
+            const char* payload_a[] = { "MYKEY=myvalue", "SANDBOX_MODE=test", NULL };
+            const char* payload_b[] = { "SECOND=injection", NULL };
+            sandbox_status_t wst;
+            memset(&wst, 0, sizeof(wst));
+
+            sandbox_spec_t s = spec;
+            s.session_key = "e2e-session-23";
+            s.ttl_seconds = 3600;
+            s.env_vars = payload_a;
+
+            sandbox_handle_t* w1 = NULL;
+            CHECK(sandbox_create(&s, &w1) == SANDBOX_OK && w1 != NULL,
+                  "session: create with a session key");
+            ws_probe_t p1;
+            memset(&p1, 0, sizeof(p1));
+            vm_handle_t* w1vm = (w1 && sandbox_inspect(w1, &wst) == SANDBOX_OK)
+                                    ? lifecycle_get(wst.sandbox_id) : NULL;
+            int got1 = w1vm && wait_probe(w1vm, &p1, 1);
+            if (!got1 && w1vm) dump_serial(w1vm, "workspace probe missing");
+            CHECK(got1, "session: guest mounted /workspace");
+            CHECK(got1 && p1.lines == 1, "session: a new volume starts empty");
+            char first_before[9];
+            memcpy(first_before, p1.first, sizeof(first_before));
+
+            // Destroy the sandbox: the volume is the session's and must stay.
+            CHECK(sandbox_destroy(w1) == SANDBOX_OK, "session: destroy the sandbox");
+
+            // Re-create the *same* session with a different payload. The file now
+            // has two lines: the one written before the destroy is still first.
+            sandbox_spec_t s2 = s;
+            s2.env_vars = payload_b;
+            sandbox_handle_t* w2 = NULL;
+            CHECK(sandbox_create(&s2, &w2) == SANDBOX_OK && w2 != NULL,
+                  "session: re-create with the same key");
+            ws_probe_t p2;
+            memset(&p2, 0, sizeof(p2));
+            vm_handle_t* w2vm = (w2 && sandbox_inspect(w2, &wst) == SANDBOX_OK)
+                                    ? lifecycle_get(wst.sandbox_id) : NULL;
+            int got2 = w2vm && wait_probe(w2vm, &p2, 2);
+            if (!got2 && w2vm) dump_serial(w2vm, "workspace probe missing on recreate");
+            CHECK(got2 && p2.lines == 2, "session: the file survived the destroy");
+            CHECK(got2 && strcmp(p2.first, first_before) == 0,
+                  "session: the pre-destroy line is still the first line");
+            CHECK(got2 && strcmp(p2.last, first_before) != 0,
+                  "session: the second injection appended its own line");
+            if (w2) sandbox_destroy(w2);
+
+            // A different key must not see any of that: one volume per session.
+            sandbox_spec_t s3 = spec;
+            s3.session_key = "e2e-session-23-other";
+            s3.ttl_seconds = 3600;
+            s3.env_vars = payload_a;
+            sandbox_handle_t* w3 = NULL;
+            CHECK(sandbox_create(&s3, &w3) == SANDBOX_OK && w3 != NULL,
+                  "session: create with a different key");
+            ws_probe_t p3;
+            memset(&p3, 0, sizeof(p3));
+            vm_handle_t* w3vm = (w3 && sandbox_inspect(w3, &wst) == SANDBOX_OK)
+                                    ? lifecycle_get(wst.sandbox_id) : NULL;
+            int got3 = w3vm && wait_probe(w3vm, &p3, 1);
+            CHECK(got3 && p3.lines == 1,
+                  "session: another key gets its own empty volume");
+            if (w3) sandbox_destroy(w3);
+        }
+
+        CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");        CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,
               "inspect paused");
         CHECK(sandbox_resume(h) == SANDBOX_OK, "sandbox_resume");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && st.is_running,

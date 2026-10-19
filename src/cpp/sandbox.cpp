@@ -21,6 +21,10 @@ sandbox_spec_t Spec::to_c_struct() const {
     spec.vcpu_count = vcpu_count_;
     spec.template_name = template_name_.c_str();
     spec.pool_wait_ms = pool_wait_ms_;
+    // #23: never leave these as stack garbage -- an uninitialized key would send
+    // a random session key over the wire.
+    spec.session_key = session_key_.empty() ? nullptr : session_key_.c_str();
+    spec.ttl_seconds = ttl_seconds_;
     // env_ptrs_ is mutable: it backs the const char* array for the C call.
     env_ptrs_.clear();
     env_ptrs_.reserve(env_vars_.size() + 1);

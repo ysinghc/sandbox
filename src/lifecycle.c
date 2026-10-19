@@ -159,6 +159,10 @@ sandbox_error_t sandbox_create(const sandbox_spec_t* spec,
     snprintf(req.template_name, sizeof(req.template_name), "%s",
              spec->template_name ? spec->template_name : "");
     req.pool_wait_ms = spec->pool_wait_ms;
+    // #23: session workspace. Empty key keeps the ephemeral (pool) path.
+    snprintf(req.session_key, sizeof(req.session_key), "%s",
+             spec->session_key ? spec->session_key : "");
+    req.ttl_seconds = spec->ttl_seconds;
     for (int i = 0; spec->env_vars && spec->env_vars[i] && i < IPC_MAX_ENV; i++) {
         req.env_vars[i] = strdup(spec->env_vars[i]);
         if (!req.env_vars[i]) break;

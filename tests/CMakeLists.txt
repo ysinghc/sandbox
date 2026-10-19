@@ -108,6 +108,7 @@ get_filename_component(TEST_BDIR ${CMAKE_CURRENT_BINARY_DIR} NAME)
 set(TEST_TMPROOT "${SANDBOX_TEST_TMPDIR}/sbtest-${TEST_BDIR}")
 set(TEST_SNAPROOT "${TEST_TMPROOT}/snapshots")
 set(TEST_JAILROOT "${TEST_TMPROOT}/jails")
+set(TEST_WSROOT "${TEST_TMPROOT}/workspaces")
 add_executable(make_template make_template.c)
 target_include_directories(make_template PRIVATE ../include)
 target_link_libraries(make_template sandbox)
@@ -115,7 +116,7 @@ add_test(NAME tmpl_setup COMMAND ${CMAKE_BINARY_DIR}/tests/make_template)
 set_tests_properties(tmpl_setup PROPERTIES
     TIMEOUT 300
     FIXTURES_SETUP tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
 
 add_executable(test_vmm test_vmm.c)
 target_include_directories(test_vmm PRIVATE ../include)
@@ -124,13 +125,13 @@ add_test(NAME vmm COMMAND ${CMAKE_BINARY_DIR}/tests/test_vmm)
 set_tests_properties(vmm PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
 
 # Pool now restores real VMs: same fixture + env (longer timeout for boots).
 set_tests_properties(pool PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
 
 # Phase 5: uffd lazy-restore tests (SKIPs where userfaultfd is denied).
 add_executable(test_uffd test_uffd.c)
@@ -157,7 +158,7 @@ add_test(NAME ipc COMMAND ${CMAKE_BINARY_DIR}/tests/test_ipc)
 set_tests_properties(ipc PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
 
 # Phase 11: daemon config parser (no root). Parses the packaged engine.conf.
 add_executable(test_config test_config.c)

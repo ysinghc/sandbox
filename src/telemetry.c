@@ -3,6 +3,7 @@
 // so the pool/gateway/uffd paths can bump them without a lock.
 
 #include "telemetry.h"
+#include "workspace.h"  // #23: workspace gauges
 
 #include <dirent.h>
 #include <stdatomic.h>
@@ -71,6 +72,15 @@ void telemetry_uffd_fault(void) { atomic_fetch_add(&g_uffd_faults, 1); }
 void telemetry_vmm_crash(void) { atomic_fetch_add(&g_vmm_crashes, 1); }
 void telemetry_pool_exhausted(void) { atomic_fetch_add(&g_pool_exhaustions, 1); }
 
+// #23: session volumes live outside the pool, so the pool counters cannot see
+// them. The gauge is read from the registry at scrape time (it must reflect
+// volumes created by an earlier daemon run too, i.e. it is state, not a delta).
+static atomic_long g_workspace_expirations = 0;
+
+void telemetry_workspace_expired(uint32_t count) {
+    atomic_fetch_add(&g_workspace_expirations, (long)count);
+}
+
 int telemetry_render(char* buf, int cap) {
     if (!buf || cap <= 0) return 0;
     int off = 0;
@@ -108,6 +118,23 @@ int telemetry_render(char* buf, int cap) {
     EMIT("sandbox_uffd_faults_total %ld\n", atomic_load(&g_uffd_faults));
     EMIT("# TYPE sandbox_vmm_crashes_total counter\n");
     EMIT("sandbox_vmm_crashes_total %ld\n", atomic_load(&g_vmm_crashes));
+    // #23: session workspaces. The gauges are read from the registry, not
+    // counted: volumes outlive the daemon that created them.
+    {
+        uint64_t ws_bytes = 0;
+        uint32_t ws_count = 0;
+        if (workspace_usage((uid_t)-1, &ws_bytes, &ws_count) == 0) {
+            EMIT("# TYPE sandbox_workspace_sessions gauge\n");
+            EMIT("sandbox_workspace_sessions %u\n", ws_count);
+            EMIT("# TYPE sandbox_workspace_bytes gauge\n");
+            EMIT("sandbox_workspace_bytes %llu\n", (unsigned long long)ws_bytes);
+        }
+        EMIT("# TYPE sandbox_workspace_in_use gauge\n");
+        EMIT("sandbox_workspace_in_use %d\n", workspace_lease_count());
+        EMIT("# TYPE sandbox_workspace_expired_total counter\n");
+        EMIT("sandbox_workspace_expired_total %ld\n",
+             atomic_load(&g_workspace_expirations));
+    }
     // §10.13: process self-stats so operators can spot fd/memory leaks.
     unsigned long virt_kb = 0, rss_kb = 0;
     proc_memory(&virt_kb, &rss_kb);

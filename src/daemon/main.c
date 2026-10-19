@@ -17,6 +17,7 @@
 #include "telemetry.h"
 #include "version.h"
 #include "vmm_manager.h"
+#include "workspace.h"
 
 #include <errno.h>
 #include <pthread.h>
@@ -86,6 +87,29 @@ static void* watchdog_thread(void* arg) {
 #else
     return NULL;
 #endif
+}
+
+// #23: expire session workspaces. A volume outlives the sandbox that created it
+// (that is the feature), so nothing else ever deletes it -- without this loop a
+// session volume would live until an operator noticed the disk. Runs in the
+// daemon because only the daemon knows the platform's TTL policy; the work
+// itself (`workspace_reap`) is idempotent and safe to run concurrently with
+// creates, so a daemon restart cannot leak or double-delete a volume.
+static void* workspace_reaper_thread(void* arg) {
+    (void)arg;
+    const char* e = getenv("SANDBOX_REAP_INTERVAL_SECONDS");
+    unsigned interval = (e && *e) ? (unsigned)strtoul(e, NULL, 10) : 60u;
+    if (interval < 1) interval = 1;
+    for (;;) {
+        int expired = 0;
+        if (workspace_reap((int64_t)time(NULL), &expired) == 0 && expired > 0) {
+            LOGF(LOG_INFO, "daemon", "workspace_expired",
+                 "\"count\":%d", expired);
+            telemetry_workspace_expired((uint32_t)expired);
+        }
+        sleep(interval);
+    }
+    return NULL;
 }
 
 // Phase 11: --validate-config pre-flight. Prints a report and returns 0/1.
@@ -369,6 +393,15 @@ int main(int argc, char** argv) {
 
     // Phase 11: tell systemd (Type=notify) we are ready to accept connections.
     notify_systemd("READY=1");
+
+    // #23: session workspaces expire on a timer, not on sandbox destroy.
+    {
+        pthread_t rt;
+        if (pthread_create(&rt, NULL, workspace_reaper_thread, NULL) == 0)
+            pthread_detach(rt);
+        else
+            fprintf(stderr, "[sandboxd] workspace reaper thread failed\n");
+    }
     if (getenv("NOTIFY_SOCKET")) {
         pthread_t wt;
         if (pthread_create(&wt, NULL, watchdog_thread, NULL) == 0)

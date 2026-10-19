@@ -19,6 +19,17 @@ typedef struct {
     const char* template_name;  // Snapshot template to restore from (e.g., "python-agent")
     const char** env_vars;      // NULL-terminated array of "KEY=VALUE" strings
     uint32_t pool_wait_ms;      // Max time to wait if pool exhausted, 0 = fail immediately
+    // #23: session key of the writable /workspace volume. NULL (or empty) gives
+    // the sandbox an ephemeral workspace that dies with it, which is the old
+    // behaviour. A non-empty key gives the sandbox a *persistent* volume: a
+    // second sandbox created with the same key sees the files the first one
+    // left, in any template built with a workspace. The volume outlives the
+    // sandbox; it is deleted when its TTL expires.
+    const char* session_key;
+    // Lifetime of a session volume, in seconds, counted from its creation.
+    // 0 selects the platform default (7 days); requests are clamped to the
+    // platform maximum (default 30 days). Ignored when session_key is NULL.
+    uint32_t ttl_seconds;
 } sandbox_spec_t;
 
 // Error codes

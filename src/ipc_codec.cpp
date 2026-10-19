@@ -52,6 +52,10 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
             c->set_vcpu_count(req->vcpu_count);
             c->set_template_name(req->template_name);
             c->set_pool_wait_ms(req->pool_wait_ms);
+            // #23: session_key/ttl_seconds. Defaults (empty/0) are not written,
+            // so an ephemeral create stays byte-identical on the wire.
+            if (req->session_key[0]) c->set_session_key(req->session_key);
+            if (req->ttl_seconds) c->set_ttl_seconds(req->ttl_seconds);
             for (int i = 0; i < req->n_env; i++) {
                 if (req->env_vars[i]) c->add_env_vars(req->env_vars[i]);
             }
@@ -93,6 +97,8 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
             set_str(out->template_name, sizeof(out->template_name),
                     c.template_name());
             out->pool_wait_ms = c.pool_wait_ms();
+            set_str(out->session_key, sizeof(out->session_key), c.session_key());
+            out->ttl_seconds = c.ttl_seconds();
             for (int i = 0; i < c.env_vars_size() && out->n_env < IPC_MAX_ENV; i++) {
                 out->env_vars[out->n_env] = strdup(c.env_vars(i).c_str());
                 if (!out->env_vars[out->n_env]) break;

@@ -23,6 +23,7 @@
 #include "pool_manager.h"
 #include "telemetry.h"
 #include "vmm_manager.h"
+#include "workspace.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -70,6 +71,10 @@ typedef struct create_job {
     uint32_t vcpu_count;
     uint32_t pool_wait_ms;
     char template_name[IPC_MAX_TEMPLATE];
+    // #23: empty = ephemeral workspace (warm-pool path). Non-empty = persistent
+    // session volume, which forces a dedicated restore (see create_worker_fn).
+    char session_key[IPC_MAX_SESSION_KEY];
+    uint32_t ttl_seconds;
     char* env[IPC_MAX_ENV + 1];  // NULL-terminated
     struct create_job* next;
 } create_job_t;
@@ -524,6 +529,9 @@ static create_job_t* build_job(const ipc_request_t* req, session_t* s) {
     j->pool_wait_ms = req->pool_wait_ms ? req->pool_wait_ms
                                         : g.default_pool_wait_ms;
     snprintf(j->template_name, sizeof(j->template_name), "%s", g.template_name);
+    // #23
+    snprintf(j->session_key, sizeof(j->session_key), "%s", req->session_key);
+    j->ttl_seconds = req->ttl_seconds;
     int n = 0;
     for (int i = 0; i < req->n_env && i < IPC_MAX_ENV; i++) {
         if (!req->env_vars[i]) break;
@@ -535,10 +543,61 @@ static create_job_t* build_job(const ipc_request_t* req, session_t* s) {
     return j;
 }
 
+// #23: create with a persistent session workspace. Deliberately not the pool
+// path: a warm VM's workspace is bound before the request arrives, and
+// Firecracker cannot swap a block device after restore, so the volume has to be
+// decided (and cloned) first. Costs one restore, measured well inside budget.
+static sandbox_error_t session_provision(const create_job_t* job,
+                                         vm_handle_t** out_vm) {
+    *out_vm = NULL;
+    char base[PATH_MAX];
+    workspace_base_path(g.template_name, base, sizeof(base));
+    struct stat st;
+    if (stat(base, &st) < 0) {
+        fprintf(stderr, "[ipc_server] template %s has no workspace base image (%s); "
+                        "rebuild the template to use session_key\n",
+                g.template_name, base);
+        return SANDBOX_ERR_INVALID_SPEC;
+    }
+
+    // One VM per session volume: two would write the same blocks through
+    // separate page caches and destroy each other's files. Take the lease before
+    // touching the image; vmm_destroy releases it.
+    if (workspace_lease(job->session_key) < 0) {
+        fprintf(stderr, "[ipc_server] session %s is already in use (errno=%d)\n",
+                job->session_key, errno);
+        return SANDBOX_ERR_INVALID_SPEC;
+    }
+
+    workspace_meta_t meta;
+    if (workspace_ensure(job->session_key, job->uid, 0, job->ttl_seconds, base,
+                         &meta) < 0) {
+        fprintf(stderr, "[ipc_server] cannot prepare workspace for session %s: %s\n",
+                job->session_key, strerror(errno));
+        workspace_release(job->session_key);
+        return SANDBOX_ERR_INTERNAL;
+    }
+    fprintf(stderr,
+            "[ipc_server] session %s volume %s owner=%u ttl=%llds expires=%lld\n",
+            job->session_key, meta.id, (unsigned)meta.owner_uid,
+            (long long)(meta.expires_at - meta.created_at),
+            (long long)meta.expires_at);
+
+    char image[PATH_MAX];
+    workspace_paths(job->session_key, NULL, 0, image, sizeof(image));
+    vm_handle_t* vm = restore_vm_with_workspace(image);
+    if (!vm) {
+        workspace_release(job->session_key);
+        return SANDBOX_ERR_POOL_EXHAUSTED;
+    }
+    snprintf(vm->session_key, sizeof(vm->session_key), "%s", job->session_key);
+    *out_vm = vm;
+    return SANDBOX_OK;
+}
+
 // A pool restore + env inject + token mint. Runs off the epoll loop; the only
 // shared mutation is the token registry (token_lock) and the result queue.
-static void* create_worker_fn(void* arg) {
-    (void)arg;
+static void* create_worker_fn(void* arg) {    (void)arg;
     for (;;) {
         pthread_mutex_lock(&g.q_lock);
         while (!g.q_stop && !g.q_head)
@@ -568,7 +627,17 @@ static void* create_worker_fn(void* arg) {
 
         uint64_t t0 = now_ms();
         vm_handle_t* vm = NULL;
-        sandbox_error_t err = pool_provision(g.pool, &spec, &vm);
+        sandbox_error_t err;
+        if (job->session_key[0]) {
+            // #23: a session-backed create needs its workspace bound *before*
+            // Firecracker loads the snapshot, so it cannot be served from the
+            // warm pool (a pool member's volume is already mounted). Clone the
+            // session's volume, then restore directly. Costs a restore, not a
+            // wait: still ~50 ms against a 250 ms budget.
+            err = session_provision(job, &vm);
+        } else {
+            err = pool_provision(g.pool, &spec, &vm);
+        }
         telemetry_provision_latency(now_ms() - t0);
         if (err != SANDBOX_OK || !vm) {
             r->code = (err != SANDBOX_OK) ? err : SANDBOX_ERR_INTERNAL;
