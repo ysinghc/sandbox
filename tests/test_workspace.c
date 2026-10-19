@@ -97,6 +97,56 @@ static int image_exists(const char* key) {
 
 // --- tests -----------------------------------------------------------------
 
+// Offset of the first differing byte, or -1 if identical, -2 if unreadable.
+static long long first_diff(const char* a, const char* b) {
+    int fa = open(a, O_RDONLY);
+    int fb = open(b, O_RDONLY);
+    if (fa < 0 || fb < 0) {
+        if (fa >= 0) close(fa);
+        if (fb >= 0) close(fb);
+        return -2;
+    }
+    static char ba[1 << 16], bb[1 << 16];
+    long long off = 0, diff = -1;
+    for (;;) {
+        ssize_t na = read(fa, ba, sizeof(ba));
+        ssize_t nb = read(fb, bb, sizeof(bb));
+        if (na != nb) { diff = off; break; }
+        if (na <= 0) break;
+        for (ssize_t i = 0; i < na; i++) {
+            if (ba[i] != bb[i]) { diff = off + i; break; }
+        }
+        if (diff >= 0) break;
+        off += na;
+    }
+    close(fa);
+    close(fb);
+    return diff;
+}
+
+// A session volume is a live ext4 filesystem that the guest mounts, so a clone
+// must be byte-identical to its base -- not merely the same size with the
+// extents that SEEK_DATA happened to report. The hand-made sparse file below
+// covers the copy logic; this covers the real artifact, whose extents come from
+// mke2fs and look nothing like a hand-written file. A clone that silently drops
+// a block here is not a small bug: the guest reports "group descriptors
+// corrupted!" on mount, or worse, mounts a filesystem that is quietly wrong.
+static void test_clone_of_formatted_image(void) {
+    printf("[test] clone (formatted image)...\n");
+    char base[PATH_MAX], copy[PATH_MAX];
+    snprintf(base, sizeof(base), "%s/fmt-base.ext4", g_root);
+    snprintf(copy, sizeof(copy), "%s/fmt-copy.ext4", g_root);
+    unlink(base);
+    unlink(copy);
+    CHECK(workspace_format_base(base, 16) == 0, "format a base image");
+    CHECK(workspace_clone(base, copy) == 0, "clone a formatted image");
+    long long d = first_diff(base, copy);
+    if (d != -1) fprintf(stderr, "[test] clone differs at byte %lld\n", d);
+    CHECK(d == -1, "a cloned image is byte-identical to its base");
+    unlink(base);
+    unlink(copy);
+}
+
 static void test_clone_fidelity(void) {
     printf("[test] clone...\n");
     // A sparse source: a hole, data, a hole, data. A clone that ignores sparseness
@@ -306,6 +356,7 @@ int main(void) {
     if (pwrite(fd, "END", 3, (4u << 20) - 3) != 3) abort();
     close(fd);
 
+    test_clone_of_formatted_image();
     test_clone_fidelity();
     test_ensure_and_persistence();
     test_ttl_clamp_and_renew();

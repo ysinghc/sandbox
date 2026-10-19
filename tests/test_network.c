@@ -301,11 +301,38 @@ static void set_ip_forward(int v) {
     CHECK_RC(run(cmd), "set ip_forward");
 }
 
+// The port guests may reach on the host is configurable (SANDBOX_BROKER_PORT):
+// 8080 is a busy port, and on a shared runner something else holding it made
+// this test fail with "Address already in use" for a reason that has nothing to
+// do with the engine. Pick a port nobody holds now, and use that same value for
+// both the rule assertion and the listener below.
+static uint16_t pick_free_port(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return 8080;
+    struct sockaddr_in a = { .sin_family = AF_INET,
+                             .sin_port = 0,
+                             .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    uint16_t p = 8080;
+    socklen_t n = sizeof(a);
+    if (bind(fd, (struct sockaddr*)&a, sizeof(a)) == 0 &&
+        getsockname(fd, (struct sockaddr*)&a, &n) == 0)
+        p = ntohs(a.sin_port);
+    close(fd);
+    return p;
+}
+
+static uint16_t g_broker_port = 8080;
+
 int main(void) {
     if (geteuid() != 0) {
         printf("SKIP (needs root: tap + nftables)\n");
         return 0;
     }
+    // Before any rule is programmed: the allowlist and the listener must agree.
+    g_broker_port = pick_free_port();
+    char portenv[16];
+    snprintf(portenv, sizeof(portenv), "%u", (unsigned)g_broker_port);
+    setenv("SANDBOX_BROKER_PORT", portenv, 1);
     char vm_id[64];
     snprintf(vm_id, sizeof(vm_id), "vmt%d", (int)getpid() % 100000);
 
@@ -371,13 +398,18 @@ int main(void) {
     char* rules = capture("nft -a list chain ip sandbox_policy forward 2>/dev/null");
     char want[IFNAMSIZ + 16];
     snprintf(want, sizeof(want), "iifname \"%s\"", tap);
-    if (!strstr(rules, want) || !strstr(rules, "dport 8080 accept") || !strstr(rules, " drop")) {
+    char want_port[32];
+    snprintf(want_port, sizeof(want_port), "dport %u accept",
+             (unsigned)g_broker_port);
+    if (!strstr(rules, want) || !strstr(rules, want_port) ||
+        !strstr(rules, " drop")) {
         fprintf(stderr, "rules missing:\n%s\n", rules);
         abort();
     }
     free(rules);
     rules = capture("nft -a list chain ip sandbox_policy input 2>/dev/null");
-    if (!strstr(rules, want) || !strstr(rules, "dport 8080 accept") || !strstr(rules, " drop")) {
+    if (!strstr(rules, want) || !strstr(rules, want_port) ||
+        !strstr(rules, " drop")) {
         fprintf(stderr, "input rules missing:\n%s\n", rules);
         abort();
     }
@@ -385,29 +417,29 @@ int main(void) {
     printf("[test] setup_state: PASS\n");
     fflush(stdout);
 
-    // --- broker path: SYN to 169.254.0.1:8080 gets SYN-ACK ---
+    // --- broker path: SYN to the host:broker port gets SYN-ACK ---
     printf("[test] broker_path...\n");
     fflush(stdout);
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
     int one = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     struct sockaddr_in la = { .sin_family = AF_INET,
-                              .sin_port = htons(8080),
+                              .sin_port = htons(g_broker_port),
                               .sin_addr.s_addr = g_host_ip };
-    CHECK_SYS(bind(listen_fd, (struct sockaddr*)&la, sizeof(la)), "bind 8080");
+    CHECK_SYS(bind(listen_fd, (struct sockaddr*)&la, sizeof(la)), "bind broker");
     CHECK_SYS(listen(listen_fd, 5), "listen");
     uint8_t tap_mac[6];
     get_tap_mac(tap, tap_mac);
     uint8_t frame[256];
     uint32_t broker_ip = g_host_ip;
-    size_t flen = build_syn(frame, tap_mac, 40001, 8080, 0x10000001, broker_ip);
+    size_t flen = build_syn(frame, tap_mac, 40001, g_broker_port, 0x10000001, broker_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject SYN");
-    if (await_synack(net.tap_fd, tap_mac, 40001, 8080, 0x10000001, broker_ip, 3000) < 0) {
+    if (await_synack(net.tap_fd, tap_mac, 40001, g_broker_port, 0x10000001, broker_ip, 3000) < 0) {
         fprintf(stderr, "FAIL broker_path: no SYN-ACK\n");
         abort();
     }
     close(listen_fd);
-    send_rst(net.tap_fd, tap_mac, 40001, 8080, 0x10000002, broker_ip);
+    send_rst(net.tap_fd, tap_mac, 40001, g_broker_port, 0x10000002, broker_ip);
     printf("[test] broker_path: PASS\n");
     fflush(stdout);
 

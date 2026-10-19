@@ -25,7 +25,11 @@
 #include <nftables/libnftables.h>
 #endif
 
-#define BROKER_PORT 8080
+#include "broker.h"
+
+// The port a guest may reach on the host. It is not a constant here: the broker
+// listens on the same value (SANDBOX_BROKER_PORT), and a mismatch between the
+// two would silently black-hole every guest egress connection.
 
 // Per-VM /30 subnets from 169.254.0.0/16 (16384 slots): subnet i holds
 // .4i+1 (host) and .4i+2 (guest). FNV-1a hash keeps string vm_ids stable.
@@ -217,7 +221,7 @@ int network_setup(const char* vm_id, vm_network_t* out_net) {
         snprintf(nft_cmd, sizeof(nft_cmd),
             "add rule ip sandbox_policy %s "
             "iifname %s ip daddr %s tcp dport %d accept",
-            chains[c], tap_name, host_ip_s, BROKER_PORT);
+            chains[c], tap_name, host_ip_s, broker_port());
         if (nft_exec(nft_cmd, NULL, 0) != 0) goto fail_tap;
         snprintf(nft_cmd, sizeof(nft_cmd),
             "add rule ip sandbox_policy %s iifname %s drop",

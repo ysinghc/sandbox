@@ -65,8 +65,20 @@ static const char* env_or(const char* key, const char* def) {
     return (v && *v) ? v : def;
 }
 
+// The broker port has exactly one source of truth, and it is not this file.
+// src/network_manager.c programs each VM's egress rules with a single
+// "ip daddr <host> tcp dport <port> accept" -- everything else to the host is
+// dropped -- so if the listener and the rules disagree, every guest is cut off
+// from the network with no diagnostic. broker_port() (include/broker.h) is that
+// one value; SANDBOX_BROKER_LISTEN may still move the listener to another
+// interface, as long as its port agrees. (8080 is a busy port on real hosts;
+// self-hosters hit the collision immediately.)
 const char* broker_listen_addr(void) {
-    return env_or("SANDBOX_BROKER_LISTEN", "0.0.0.0:8080");
+    const char* v = getenv("SANDBOX_BROKER_LISTEN");
+    if (v && *v) return v;
+    static char buf[64];
+    snprintf(buf, sizeof(buf), "0.0.0.0:%d", broker_port());
+    return buf;
 }
 const char* broker_credentials_path(void) {
     return env_or("SANDBOX_BROKER_CREDENTIALS", "/etc/sandbox-engine/credentials.conf");

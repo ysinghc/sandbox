@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "sandbox_fs.h"
 #include "snapshot_manager.h"
 
 #define ASSET_KERNEL "/opt/sandbox-assets/vmlinux"
@@ -51,6 +52,24 @@ int main(void) {
              "umount -l \"$m\" 2>/dev/null; done; true",
              snap_root, jail_root ? jail_root : "/nonexistent-jail-root");
     if (system(clean) != 0) return 1;
+    // The test root must *start* clean. This suite is re-run on the same runner,
+    // and what lives under here is deliberately durable (a session volume
+    // outlives its VM by design, and the template is rebuilt only with an
+    // explicit rm below), so an un-wiped root hands this run the previous run's
+    // session volumes. That is not hypothetical: a session image written by the
+    // older, broken restore path was reused as this run's "empty" volume, and
+    // the guest then failed to mount it. tests/CMakeLists.txt passes
+    // SANDBOX_TEST_ROOT as the common parent of the snapshot, jail and workspace
+    // roots; refuse to act on anything that is not a real subdirectory.
+    const char* test_root = getenv("SANDBOX_TEST_ROOT");
+    if (test_root && *test_root && strlen(test_root) > 1 &&
+        strcmp(test_root, "/") != 0) {
+        if (sandbox_rm_rf(test_root) < 0) {
+            fprintf(stderr, "FAIL template setup: cannot clear %s\n", test_root);
+            return 1;
+        }
+        fprintf(stderr, "[tmpl] cleared test root %s\n", test_root);
+    }
     // Default "e2e" keeps the CTest fixture unchanged; scripts/benchmark.sh
     // sets SANDBOX_TEMPLATE_NAME so the stamped template matches the name the
     // daemon is told to restore (otherwise the daemon finds no such template

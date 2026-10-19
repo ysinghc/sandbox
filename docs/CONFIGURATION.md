@@ -35,6 +35,9 @@ integrity before starting.
 | `jailer_gid` | `SANDBOX_JAILER_GID` | `65534` | Unprivileged gid inside the jail. |
 | `jail_root` | `SANDBOX_JAIL_ROOT` | *(state dir)* | Root under which per-VM jail directories are created. |
 | `snapshot_root` | `SANDBOX_SNAPSHOT_ROOT` | *(state dir)* | Root of the template/snapshot store. |
+| — | `SANDBOX_WORKSPACE_ROOT` | `/var/lib/sandbox-engine/workspaces` | Root of the session workspace store (#23). One 0700 directory per session, holding its `workspace.ext4` and `meta.json`. |
+| — | `SANDBOX_WORKSPACE_MAX_TTL` | `2592000` (30 d) | Platform maximum session-workspace lifetime, in seconds. A create asking for more is clamped to it; a renewal can never exceed `created_at + this`. |
+| — | `SANDBOX_REAP_INTERVAL_SECONDS` | `60` | How often the daemon expires session workspaces whose TTL has passed. |
 | `vsock_settle_ms` | `SANDBOX_VSOCK_SETTLE_MS` | `1000` | Fallback settle time before the first vsock `CONNECT` if the guest readiness marker is not seen (§10.9). |
 | `metrics_port` | `SANDBOX_METRICS_PORT` | `9180` | Metrics/health port. |
 | `metrics_bind` | `SANDBOX_METRICS_BIND` | `0.0.0.0` | Metrics bind address; **empty disables** the listener. |
@@ -80,7 +83,8 @@ production-oriented):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SANDBOX_BROKER_LISTEN` | `0.0.0.0:8080` | Broker listen address. |
+| `SANDBOX_BROKER_LISTEN` | `0.0.0.0:<port>` | Broker listen address. |
+| `SANDBOX_BROKER_PORT` | `8080` | The tcp port guests may reach on the host. This is a single value, not two: the per-VM egress rules allow exactly this port and the broker listens on it, so changing `SANDBOX_BROKER_LISTEN` alone would silently cut every guest off from the network. Set this if something else already holds 8080 on the host — a common self-hosting collision. |
 | `SANDBOX_BROKER_CREDENTIALS` | `/etc/sandbox-engine/credentials.conf` | Credential store (must be `0600`). |
 | `SANDBOX_BROKER_CONTROL` | `/var/run/sandbox-engine/broker-control.sock` | Engine token-validation socket. |
 | `SANDBOX_BROKER_UPSTREAM_SCHEME` | `https` | Scheme used to reach upstreams. |

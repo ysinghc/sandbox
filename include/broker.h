@@ -14,6 +14,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/types.h>
 
 // ---------------------------------------------------------------------------
@@ -134,5 +136,29 @@ int broker_metrics_serve(int listen_fd);
 const char* broker_listen_addr(void);       // SANDBOX_BROKER_LISTEN
 const char* broker_credentials_path(void);  // SANDBOX_BROKER_CREDENTIALS
 const char* broker_control_path(void);      // SANDBOX_BROKER_CONTROL
+// The tcp port guests may reach on the host: SANDBOX_BROKER_PORT (default 8080).
+// The guest-egress rules in src/network_manager.c allow this exact port, so the
+// listener must use it too; broker_listen_addr() derives its default from here.
+//
+// Defined inline in the header because the two users live in different link
+// units that cannot share a symbol: the rules are in libsandbox, while
+// src/broker/core.c is the standalone sandbox_broker_core that links no engine
+// code. One definition of the rule, no second copy to drift.
+static inline int broker_port(void) {
+    const char* p = getenv("SANDBOX_BROKER_PORT");
+    if (p && *p) {
+        int n = atoi(p);
+        if (n > 0 && n <= 65535) return n;
+    }
+    const char* l = getenv("SANDBOX_BROKER_LISTEN");
+    if (l && *l) {
+        const char* colon = strrchr(l, ':');
+        if (colon) {
+            int n = atoi(colon + 1);
+            if (n > 0 && n <= 65535) return n;
+        }
+    }
+    return 8080;
+}
 
 #endif // BROKER_H
