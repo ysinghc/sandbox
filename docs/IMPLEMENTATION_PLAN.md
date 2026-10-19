@@ -99,11 +99,16 @@ was needed — only the `..`/`getcwd` assertion the plan named, which is now in
 the probe (exit 12). Note what actually closes the `/proc/self/root` escape:
 **`/proc` is not mounted in the jail**, not the chroot alone.
 
-### C8 — #22: `vmstate_sha256` already exists (WAS PROPOSED AS NEW)
+### C8 — #22: `vmstate_sha256` already exists; the real gap was the rootfs (WAS WRONG TWICE)
 
-`snap_manifest_t` (`include/snapshot_manager.h`) already carries both
-`memory_sha256` and `vmstate_sha256`, and `build_manifest()` populates them. The
-real #22C gap is narrower: pin the **kernel image identity**, not the vmstate.
+`snap_manifest_t` (`include/snapshot_manager.h`) already carried both
+`memory_sha256` and `vmstate_sha256`, so "add vmstate" was already done. The
+plan then guessed the remaining gap was **kernel image identity** — also wrong:
+a restore never loads the kernel (`/snapshot/load` needs only vmstate, memory
+and the disk image the VM booted from). The actual unbound file was
+**`rootfs.ext4`**: the guest resumes with that image's page cache and inode
+state, so swapping it changes the sandbox while every hashed file still
+matches. That is what #22 binds now.
 
 ### C9 — #19: the published asset layout is not what the plan assumes (WAS WRONG)
 
@@ -203,8 +208,9 @@ asserts the positive direction (`SANDBOX-VSOCK-HOST cid=2` in serial).
 | Chroot `..`-escape assertion (#2) | ✅ `jailer_probe` exit 12 |
 | `scripts/install.sh` + release docs (#19) | ✅ verified offline against a staged tree |
 | vsock peer authentication (#10) | ✅ guest+host code; classifier unit-tested on the host, host CID asserted in-guest |
+| #22 determinism (clock + rootfs pinning) | ✅ verified on the kvm runner: guest skew 0 s vs host with a 16 s-old template |
 | M1 ARM timer (#6) | ⏳ needs an ARM host (no aarch64 runner yet) |
-| M2 (#22–#28) | ⏳ not started; #22 clock fix needs a booting guest to verify |
+| M2 #23–#28 | ⏳ not started (#23 is next) |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -354,15 +360,26 @@ Dependency order:
               #28 remote MCP server (Go, D6)
 ```
 
-### #22 — Determinism & time correctness
-- **Stale clock:** add `"clock_realtime": true` to the `/snapshot/load` body
-  (`src/vmm_manager.c:989`) **on x86_64 only**, with a load-failure fallback and a
-  pre-check that the snapshot carries a TSC-based clock (C1). aarch64: guest-side
-  time sync in the agent.
-- **Duplicate entropy:** confirm the guest kernel is ≥ 5.18 (VMGenID reseed);
-  have the agent reseed user-space entropy after restore.
-- **Pinned images:** add `vmstate_sha256` + kernel identity to `snap_manifest_t`
-  (`include/snapshot_manager.h`) and populate them in `build_manifest()`.
+### #22 — Determinism & time correctness — **delivered**
+- **Stale clock:** `vmm_build_load_request()` (`src/vmm_manager.c`) sets
+  `"clock_realtime": true` on x86_64 only, with `SANDBOX_FC_CLOCK_REALTIME=0` as
+  the escape hatch for a host kernel < 5.16 (where the field makes the load fail
+  — C1). No TSC pre-check was added: Firecracker validates the field itself, and
+  a rejected load fails loudly rather than silently keeping a stale clock.
+  aarch64: not sent at all (unknown field); the guest-side time sync is still
+  open, and `tests/test_ipc.c` says so rather than pretending.
+- **Duplicate entropy:** the reference guest kernel is **4.14.174**, so there is
+  no VMGenID (5.18+) and no way to reseed the guest CRNG from the host on
+  resume. Recorded as a guarantee the product does *not* make (§15.16): a
+  template must carry no secrets, and per-session secrets are generated after
+  the sandbox starts. The fix is a newer guest image, tracked, not faked.
+- **Pinned images:** the gap was **not** kernel identity (C8 was wrong: a
+  restore never loads the kernel). It was `rootfs.ext4`, which was not bound at
+  all while the guest resumed with that image's page cache and inode state. It
+  is now `rootfs_sha256`/`rootfs_size` in `snap_manifest_t`, computed at build
+  time and verified once per template on restore; `sandbox-cli verify` re-hashes.
+- **Docs:** §15.16 and `docs/API.md` state what determinism does and does not
+  guarantee; `docs/UPGRADE.md` records that 0.12.0 templates must be rebuilt.
 
 ### #23 — Session workspace volumes + TTL
 Follow `docs/WORKSPACE_DISK.md` (D7) — do not re-design. Extend `sandbox_spec_t`
@@ -431,8 +448,10 @@ Done     #3 credentials.conf permissions gate; #19 scripts/install.sh + prebuilt
 Done     #20 privileged e2e now *runs*: warm 0.18 ms / provisioned 45.33 ms on sandbox-x86-01,
          with a gate that fails the job if a privileged test skips (C11)
 Done     #10 vsock peer authentication (C12), verified host-side + in-guest
+Done     #22 determinism: clock_realtime on load (guest skew 0 s vs host with a
+         16 s-old template) + rootfs digest in the manifest + docs
+Next     #23 session workspace volume + TTL — follow docs/WORKSPACE_DISK.md (D7)
 Next     #6  aarch64 arch timer — needs an ARM host; register one and set PRIVILEGED_ARM
-Next     #22 x86_64 clock_realtime (guest boots now, so this is observable) → #23 workspace + TTL
          → #24 guest RPC → #25/#26 → #27 control-plane API → #28 MCP gateway
          (#4, #12, #17, #9, #11, #7, #13–#16, #18 follow in the burn-down order)
 ```
