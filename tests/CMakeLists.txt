@@ -6,6 +6,13 @@
 # that cannot fire is worse than no test, because it reads like coverage.
 add_compile_options(-UNDEBUG)
 
+# Phase 15: session workspace registry + TTL (#23). No root, no KVM.
+add_executable(test_workspace test_workspace.c)
+target_include_directories(test_workspace PRIVATE ../include)
+target_link_libraries(test_workspace sandbox)
+add_test(NAME workspace COMMAND ${CMAKE_BINARY_DIR}/tests/test_workspace)
+set_tests_properties(workspace PROPERTIES TIMEOUT 120)
+
 # Phase 1: pool concurrency + invariant test (run under TSan via build-tsan).
 add_executable(test_pool test_pool.c)
 target_include_directories(test_pool PRIVATE ../include)
