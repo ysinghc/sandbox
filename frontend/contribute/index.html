@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Contribute — Sandbox Engine</title>
+  <meta name="description" content="Sandbox Engine is a small systems project. Here is how to build it, test it, and send a focused pull request.">
+  <link rel="canonical" href="https://sandbox.ysinghc.in/contribute/">
+  <meta name="theme-color" content="#eef0e9">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Contribute — Sandbox Engine">
+  <meta property="og:description" content="Build it, test it, and send a focused pull request.">
+  <meta property="og:url" content="https://sandbox.ysinghc.in/contribute/">
+  <meta property="og:image" content="https://sandbox.ysinghc.in/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="9" height="9"></rect>
+          <rect x="13.5" y="1.5" width="9" height="9"></rect>
+          <rect x="1.5" y="13.5" width="9" height="9"></rect>
+          <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+        </svg>
+        <span>Sandbox Engine</span>
+      </a>
+
+      <nav class="site-nav" id="site-nav" aria-label="Primary">
+        <ul>
+          <li><a href="/">Overview</a></li>
+          <li><a href="/download/">Download</a></li>
+          <li><a href="/docs/">Docs</a></li>
+          <li><a href="/contribute/" aria-current="page">Contribute</a></li>
+          <li><a href="/security/">Security</a></li>
+        </ul>
+      </nav>
+
+      <a class="header-github" href="https://github.com/ysinghc/sandbox" rel="noopener">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.5 7.5 0 0 1 8 3.8c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+        <span>GitHub</span>
+      </a>
+
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+        <span class="sr-only">Open menu</span>
+        <span class="menu-icon" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="page-hero">
+      <div class="container">
+        <h1>Contribute</h1>
+        <p class="lede">
+          Sandbox Engine is small on purpose. Changes should stay focused, keep the
+          design honest, and leave the tests better than they found them.
+        </p>
+        <div class="page-meta">
+          <span><strong>License</strong> GPL-2.0-only</span>
+          <span><strong>Language</strong> C11 / C++17</span>
+          <span><strong>Start</strong> <a href="https://github.com/ysinghc/sandbox/issues" rel="noopener">Open issues</a></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="content">
+      <div class="container content-grid">
+        <aside class="content-aside">
+          <h2>Good changes are legible.</h2>
+          <p>
+            Explain what changed and why. If the implementation has to differ from the
+            design, write the deviation down rather than letting the docs drift.
+          </p>
+          <ul class="plain-list">
+            <li>Follow the existing style and file layout.</li>
+            <li>Keep commits atomic with imperative subjects.</li>
+            <li>Update docs and the changelog in the same change.</li>
+            <li>Say how privileged tests were validated.</li>
+          </ul>
+          <p>
+            Read the full
+            <a href="https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md" rel="noopener">contributing guide</a>
+            before opening a pull request.
+          </p>
+        </aside>
+
+        <div class="prose">
+          <h2>Build and test</h2>
+          <p>
+            The default build is enough for development. Most end-to-end tests need
+            root, <code>/dev/kvm</code>, and guest assets; the unprivileged subset runs
+            anywhere the dependencies are installed.
+          </p>
+
+          <div class="code-block">
+            <div class="code-head">
+              <span>terminal</span>
+              <button class="copy-button" type="button" data-copy="contribute-build">Copy</button>
+            </div>
+            <pre id="contribute-build"><code><span class="comment"># release build and the unprivileged suite</span>
+<span class="prompt">$</span> cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+<span class="prompt">$</span> cmake --build build -j
+<span class="prompt">$</span> ctest --test-dir build --output-on-failure
+
+<span class="comment"># sanitizer pass</span>
+<span class="prompt">$</span> cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+    -DSANDBOX_SANITIZE=address,undefined
+<span class="prompt">$</span> cmake --build build-asan -j
+<span class="prompt">$</span> ctest --test-dir build-asan --output-on-failure</code></pre>
+          </div>
+
+          <p>
+            The privileged tests run on a lab host with real KVM and Firecracker.
+            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/TESTING.md" rel="noopener">docs/TESTING.md</a>
+            explains the split and the runner prerequisites.
+          </p>
+
+          <h2>Pull request checklist</h2>
+          <ol class="number-list">
+            <li>Branch from <code>master</code>.</li>
+            <li>Keep the change focused. Separate refactors from behavior changes.</li>
+            <li>Pass build, unprivileged tests, ASan/UBSan, and the fuzz smoke job.</li>
+            <li>Update the affected design section, <code>docs/</code>, and <code>CHANGELOG.md</code>.</li>
+            <li>In the PR, state exactly which privileged tests you ran and how.</li>
+          </ol>
+
+          <h2>Where to help</h2>
+          <div class="resources">
+            <article class="resource">
+              <h3>Fix a bug</h3>
+              <p>Pick an open issue, reproduce it, and include a regression test where the suite allows one.</p>
+              <a href="https://github.com/ysinghc/sandbox/issues" rel="noopener">Browse issues →</a>
+            </article>
+            <article class="resource">
+              <h3>Harden the engine</h3>
+              <p>Seccomp auditing, privilege separation, vsock payload authentication, and per-tenant quotas are open in the V2 backlog.</p>
+              <a href="https://github.com/ysinghc/sandbox/blob/master/docs/IMPLEMENTATION_LOG.md" rel="noopener">See the backlog →</a>
+            </article>
+            <article class="resource">
+              <h3>Improve the docs</h3>
+              <p>If a guide was wrong while you set up the host, fix it. Deployment details are the most valuable kind of correction.</p>
+              <a href="https://github.com/ysinghc/sandbox/tree/master/docs" rel="noopener">Open docs/ →</a>
+            </article>
+            <article class="resource">
+              <h3>Report a bug</h3>
+              <p>Include expected vs. actual behavior, exact commands, <code>uname -a</code>, <code>sandboxd --version</code>, and relevant log lines.</p>
+              <a href="https://github.com/ysinghc/sandbox/issues/new" rel="noopener">Open an issue →</a>
+            </article>
+          </div>
+
+          <div class="callout callout--spaced">
+            <h3>Security-sensitive reports</h3>
+            <p>
+              Do not open a public issue for a vulnerability. Use the private advisory
+              flow described on the <a href="/security/">security page</a>.
+            </p>
+          </div>
+
+          <h2>License</h2>
+          <p>
+            By contributing you agree that your contributions are licensed under the
+            GNU General Public License v2 (<code>GPL-2.0-only</code>). See
+            <a href="https://github.com/ysinghc/sandbox/blob/master/LICENSE" rel="noopener">LICENSE</a>.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-main">
+        <div class="footer-brand">
+          <a class="brand" href="/">
+            <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="9" height="9"></rect>
+              <rect x="13.5" y="1.5" width="9" height="9"></rect>
+              <rect x="1.5" y="13.5" width="9" height="9"></rect>
+              <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+            </svg>
+            <span>Sandbox Engine</span>
+          </a>
+          <p>Fast, isolated microVM sandboxes for untrusted code. Pooled, snapped, and ready in a fraction of a second.</p>
+        </div>
+
+        <div class="footer-col">
+          <h2>Project</h2>
+          <ul>
+            <li><a href="/download/">Download</a></li>
+            <li><a href="/docs/">Documentation</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CHANGELOG.md" rel="noopener">Changelog</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/LICENSE" rel="noopener">License</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Community</h2>
+          <ul>
+            <li><a href="/contribute/">Contribute</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/issues" rel="noopener">Issues</a></li>
+            <li><a href="/security/">Security</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Source</h2>
+          <ul>
+            <li><a href="https://github.com/ysinghc/sandbox" rel="noopener">GitHub</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/releases" rel="noopener">Releases</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md" rel="noopener">Contributing guide</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <span>© 2026 Sandbox Engine contributors</span>
+        <span>GPL-2.0-only</span>
+        <span>Built for Linux, KVM, and userfaultfd</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

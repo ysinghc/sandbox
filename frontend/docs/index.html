@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Documentation — Sandbox Engine</title>
+  <meta name="description" content="Build, deploy, operate, and understand Sandbox Engine. Guides for the C and C++ API, configuration, testing, and the threat model.">
+  <link rel="canonical" href="https://sandbox.ysinghc.in/docs/">
+  <meta name="theme-color" content="#eef0e9">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Documentation — Sandbox Engine">
+  <meta property="og:description" content="Build, deploy, operate, and understand Sandbox Engine.">
+  <meta property="og:url" content="https://sandbox.ysinghc.in/docs/">
+  <meta property="og:image" content="https://sandbox.ysinghc.in/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="9" height="9"></rect>
+          <rect x="13.5" y="1.5" width="9" height="9"></rect>
+          <rect x="1.5" y="13.5" width="9" height="9"></rect>
+          <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+        </svg>
+        <span>Sandbox Engine</span>
+      </a>
+
+      <nav class="site-nav" id="site-nav" aria-label="Primary">
+        <ul>
+          <li><a href="/">Overview</a></li>
+          <li><a href="/download/">Download</a></li>
+          <li><a href="/docs/" aria-current="page">Docs</a></li>
+          <li><a href="/contribute/">Contribute</a></li>
+          <li><a href="/security/">Security</a></li>
+        </ul>
+      </nav>
+
+      <a class="header-github" href="https://github.com/ysinghc/sandbox" rel="noopener">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.5 7.5 0 0 1 8 3.8c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+        <span>GitHub</span>
+      </a>
+
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+        <span class="sr-only">Open menu</span>
+        <span class="menu-icon" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="page-hero">
+      <div class="container">
+        <h1>Documentation</h1>
+        <p class="lede">
+          The guides live beside the source, so they change with the code. Start with the
+          overview, then pick the path that matches what you are doing.
+        </p>
+        <div class="page-meta">
+          <span><strong>Version</strong> 0.12.0</span>
+          <span><strong>Format</strong> Markdown in the repository</span>
+          <span><strong>Source</strong> <a href="https://github.com/ysinghc/sandbox/tree/master/docs" rel="noopener">docs/</a></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="content">
+      <div class="container">
+        <div class="doc-groups">
+          <div class="doc-group">
+            <h2>Start here</h2>
+            <ul class="doc-list">
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/README.md" rel="noopener">
+                  <span class="doc-title">Overview and quick start</span>
+                  <span class="doc-desc">What it is, build, install, first sandbox</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/BUILDING.md" rel="noopener">
+                  <span class="doc-title">Building</span>
+                  <span class="doc-desc">Dependencies, CMake options, sanitizers, fuzzers</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/DEPLOYMENT.md" rel="noopener">
+                  <span class="doc-title">Deployment</span>
+                  <span class="doc-desc">Host prep, install layout, systemd, hardening</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/API.md" rel="noopener">
+                  <span class="doc-title">API and CLI</span>
+                  <span class="doc-desc">C and C++ libraries, wire protocol, broker HTTP</span>
+                </a>
+              </li>
+            </ul>
+          </div>
+
+          <div class="doc-group">
+            <h2>Operate</h2>
+            <ul class="doc-list">
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/CONFIGURATION.md" rel="noopener">
+                  <span class="doc-title">Configuration</span>
+                  <span class="doc-desc">Every key, environment variable, and default</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/RUNBOOK.md" rel="noopener">
+                  <span class="doc-title">Runbook</span>
+                  <span class="doc-desc">Day-2 operations, health checks, metrics</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/UPGRADE.md" rel="noopener">
+                  <span class="doc-title">Upgrade</span>
+                  <span class="doc-desc">Version changes and on-disk formats</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/BACKUP.md" rel="noopener">
+                  <span class="doc-title">Backup</span>
+                  <span class="doc-desc">What to keep and how to restore it</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/TROUBLESHOOTING.md" rel="noopener">
+                  <span class="doc-title">Troubleshooting</span>
+                  <span class="doc-desc">Common failures and fixes</span>
+                </a>
+              </li>
+            </ul>
+          </div>
+
+          <div class="doc-group">
+            <h2>Understand</h2>
+            <ul class="doc-list">
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/ARCHITECTURE.md" rel="noopener">
+                  <span class="doc-title">Architecture</span>
+                  <span class="doc-desc">Components, data flow, trust boundaries</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/THREAT_MODEL.md" rel="noopener">
+                  <span class="doc-title">Threat model</span>
+                  <span class="doc-desc">What is defended, and what is explicitly not</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/TESTING.md" rel="noopener">
+                  <span class="doc-title">Testing</span>
+                  <span class="doc-desc">Test suite, privileged runners, CI layout</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/SYSTEM%20DESIGN.md" rel="noopener">
+                  <span class="doc-title">System design</span>
+                  <span class="doc-desc">Authoritative design and recorded deviations</span>
+                </a>
+              </li>
+            </ul>
+          </div>
+
+          <div class="doc-group">
+            <h2>Project</h2>
+            <ul class="doc-list">
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/CHANGELOG.md" rel="noopener">
+                  <span class="doc-title">Changelog</span>
+                  <span class="doc-desc">Release notes and known limitations</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md" rel="noopener">
+                  <span class="doc-title">Contributing</span>
+                  <span class="doc-desc">Ground rules, tests, pull requests</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/docs/IMPLEMENTATION_LOG.md" rel="noopener">
+                  <span class="doc-title">Implementation log</span>
+                  <span class="doc-desc">Phase-by-phase record of what changed</span>
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/ysinghc/sandbox/blob/master/LICENSE" rel="noopener">
+                  <span class="doc-title">License</span>
+                  <span class="doc-desc">GNU General Public License v2</span>
+                </a>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="callout callout--spaced">
+          <h2>Looking for the wire format?</h2>
+          <p>
+            The protobuf definitions are in <code>proto/</code>, and the API guide covers
+            the request lifecycle, sessions, and broker endpoints. Start with
+            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/API.md" rel="noopener">docs/API.md</a>.
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-main">
+        <div class="footer-brand">
+          <a class="brand" href="/">
+            <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="9" height="9"></rect>
+              <rect x="13.5" y="1.5" width="9" height="9"></rect>
+              <rect x="1.5" y="13.5" width="9" height="9"></rect>
+              <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+            </svg>
+            <span>Sandbox Engine</span>
+          </a>
+          <p>Fast, isolated microVM sandboxes for untrusted code. Pooled, snapped, and ready in a fraction of a second.</p>
+        </div>
+
+        <div class="footer-col">
+          <h2>Project</h2>
+          <ul>
+            <li><a href="/download/">Download</a></li>
+            <li><a href="/docs/">Documentation</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CHANGELOG.md" rel="noopener">Changelog</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/LICENSE" rel="noopener">License</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Community</h2>
+          <ul>
+            <li><a href="/contribute/">Contribute</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/issues" rel="noopener">Issues</a></li>
+            <li><a href="/security/">Security</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Source</h2>
+          <ul>
+            <li><a href="https://github.com/ysinghc/sandbox" rel="noopener">GitHub</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/releases" rel="noopener">Releases</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md" rel="noopener">Contributing guide</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <span>© 2026 Sandbox Engine contributors</span>
+        <span>GPL-2.0-only</span>
+        <span>Built for Linux, KVM, and userfaultfd</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

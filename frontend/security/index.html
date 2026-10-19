@@ -1,0 +1,220 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security — Sandbox Engine</title>
+  <meta name="description" content="How to report a vulnerability in Sandbox Engine, what is in scope, and where the security model stops.">
+  <link rel="canonical" href="https://sandbox.ysinghc.in/security/">
+  <meta name="theme-color" content="#eef0e9">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Security — Sandbox Engine">
+  <meta property="og:description" content="The guest is untrusted. The host is the boundary.">
+  <meta property="og:url" content="https://sandbox.ysinghc.in/security/">
+  <meta property="og:image" content="https://sandbox.ysinghc.in/assets/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="1.5" y="1.5" width="9" height="9"></rect>
+          <rect x="13.5" y="1.5" width="9" height="9"></rect>
+          <rect x="1.5" y="13.5" width="9" height="9"></rect>
+          <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+        </svg>
+        <span>Sandbox Engine</span>
+      </a>
+
+      <nav class="site-nav" id="site-nav" aria-label="Primary">
+        <ul>
+          <li><a href="/">Overview</a></li>
+          <li><a href="/download/">Download</a></li>
+          <li><a href="/docs/">Docs</a></li>
+          <li><a href="/contribute/">Contribute</a></li>
+          <li><a href="/security/" aria-current="page">Security</a></li>
+        </ul>
+      </nav>
+
+      <a class="header-github" href="https://github.com/ysinghc/sandbox" rel="noopener">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82A7.5 7.5 0 0 1 8 3.8c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"></path></svg>
+        <span>GitHub</span>
+      </a>
+
+      <button class="menu-toggle" type="button" aria-expanded="false" aria-controls="site-nav">
+        <span class="sr-only">Open menu</span>
+        <span class="menu-icon" aria-hidden="true"></span>
+      </button>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="page-hero">
+      <div class="container">
+        <h1>Security</h1>
+        <p class="lede">
+          The guest is untrusted. The host is the boundary. A report that crosses that
+          line, or that exposes a credential, is what matters most.
+        </p>
+        <div class="page-meta">
+          <span><strong>Supported</strong> 0.12.x</span>
+          <span><strong>Model</strong> Single trusted operator</span>
+          <span><strong>Details</strong> <a href="https://github.com/ysinghc/sandbox/blob/master/docs/THREAT_MODEL.md" rel="noopener">Threat model</a></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="content">
+      <div class="container content-grid">
+        <aside class="content-aside">
+          <h2>Report privately.</h2>
+          <p>
+            Use GitHub's private security advisory flow. Please do not open a public
+            issue for a vulnerability, and do not paste credentials or session tokens
+            into a report.
+          </p>
+          <p>
+            <a class="button" href="https://github.com/ysinghc/sandbox/security/advisories/new" rel="noopener">Open a private advisory</a>
+          </p>
+          <p>
+            Include the version (<code>sandboxd --version</code>), the host
+            architecture, the exact steps to reproduce, and the impact you believe
+            is possible. A minimal proof of concept helps more than a long write-up.
+          </p>
+        </aside>
+
+        <div class="prose">
+          <div class="callout">
+            <h2>Scope, in one paragraph</h2>
+            <p>
+              Sandbox Engine is an isolation layer for one trusted operator running
+              untrusted code on one host. It is not a multi-tenant isolation boundary.
+              Once code is inside the guest, it owns the guest; containment within the
+              VM is not the security boundary. The boundary is guest to host, guest to
+              network, and caller to daemon.
+            </p>
+          </div>
+
+          <h2>In scope</h2>
+          <ul class="plain-list">
+            <li>A guest escaping the Firecracker jail or reaching the host filesystem.</li>
+            <li>A guest reading upstream credentials, or bypassing the broker allow-list.</li>
+            <li>An unprivileged local user driving the daemon outside <code>allowed_uids</code>.</li>
+            <li>A tampered snapshot or release archive being accepted as valid.</li>
+            <li>Privilege escalation in <code>sandboxd</code>, the jailer, or the broker.</li>
+          </ul>
+
+          <h2>Not in scope</h2>
+          <ul class="plain-list">
+            <li>Code doing destructive things <em>inside</em> its own VM. The VM is the blast radius.</li>
+            <li>Confidentiality from the host operator, who owns the host and the credentials.</li>
+            <li>Network anonymity. Egress policy limits destinations, not content.</li>
+            <li>Prompt injection in code supplied by a caller. That is an application concern.</li>
+          </ul>
+
+          <h2>What is already in place</h2>
+          <p>
+            A restored Firecracker process runs chrooted, as an unprivileged uid, under
+            a seccomp allowlist, with <code>no_new_privs</code> set and a per-VM cgroup.
+            Guest egress is dropped except for the host broker, which validates a
+            per-session token and injects real credentials host-side. Snapshots are
+            checked against a SHA-256 manifest before restore. The daemon allow-lists
+            peer uids on its Unix socket.
+          </p>
+          <p>
+            The
+            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/THREAT_MODEL.md" rel="noopener">threat model</a>
+            records the threats, mitigations, and open items row by row. The
+            <a href="https://github.com/ysinghc/sandbox/blob/master/docs/IMPLEMENTATION_LOG.md" rel="noopener">implementation log</a>
+            tracks the hardening backlog.
+          </p>
+
+          <h2>Known limitations</h2>
+          <ul class="plain-list">
+            <li>The daemon is still a single root trusted computing base. Privilege separation is planned for V2.</li>
+            <li>The seccomp filter has not been audited against a real Firecracker syscall trace.</li>
+            <li>Releases include SHA-256 checksums but are not cryptographically signed yet.</li>
+            <li>Per-tenant quotas and full vsock payload authentication are future work.</li>
+          </ul>
+
+          <h2>Release integrity</h2>
+          <p>
+            Every archive has a matching <code>.sha256</code> file on the release page.
+            Verify it before extracting. If a checksum does not match, stop and report
+            it privately.
+          </p>
+          <div class="code-block">
+            <div class="code-head">
+              <span>terminal</span>
+              <button class="copy-button" type="button" data-copy="security-verify">Copy</button>
+            </div>
+            <pre id="security-verify"><code><span class="prompt">$</span> sha256sum -c sandbox-engine-0.12.0-linux-x86_64.tar.gz.sha256</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-main">
+        <div class="footer-brand">
+          <a class="brand" href="/">
+            <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true">
+              <rect x="1.5" y="1.5" width="9" height="9"></rect>
+              <rect x="13.5" y="1.5" width="9" height="9"></rect>
+              <rect x="1.5" y="13.5" width="9" height="9"></rect>
+              <rect class="mark-live" x="13.5" y="13.5" width="9" height="9"></rect>
+            </svg>
+            <span>Sandbox Engine</span>
+          </a>
+          <p>Fast, isolated microVM sandboxes for untrusted code. Pooled, snapped, and ready in a fraction of a second.</p>
+        </div>
+
+        <div class="footer-col">
+          <h2>Project</h2>
+          <ul>
+            <li><a href="/download/">Download</a></li>
+            <li><a href="/docs/">Documentation</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CHANGELOG.md" rel="noopener">Changelog</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/LICENSE" rel="noopener">License</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Community</h2>
+          <ul>
+            <li><a href="/contribute/">Contribute</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/issues" rel="noopener">Issues</a></li>
+            <li><a href="/security/">Security</a></li>
+          </ul>
+        </div>
+
+        <div class="footer-col">
+          <h2>Source</h2>
+          <ul>
+            <li><a href="https://github.com/ysinghc/sandbox" rel="noopener">GitHub</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/releases" rel="noopener">Releases</a></li>
+            <li><a href="https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md" rel="noopener">Contributing guide</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom">
+        <span>© 2026 Sandbox Engine contributors</span>
+        <span>GPL-2.0-only</span>
+        <span>Built for Linux, KVM, and userfaultfd</span>
+      </div>
+    </div>
+  </footer>
+
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
