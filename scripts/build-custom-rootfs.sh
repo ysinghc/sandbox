@@ -65,9 +65,14 @@ done
 # ── 3b. Guest env agent (Phase 9b) ────────────────────────────────────────────
 # Static binary; started by /init before capture, resumes blocked in accept()
 # after a snapshot restore to receive the host's per-VM env over vsock.
+# The peer classifier (#10) lives in the repo so the host unit test can link the
+# same file; it is freestanding (libc + linux/vm_sockets.h only).
 log "Building guest env agent..."
-AGENT_SRC="$(cd "$(dirname "$0")" && pwd)/sandbox-agent.c"
-gcc -static -O2 -o "$MNTDIR/bin/sandbox-agent" "$AGENT_SRC"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+AGENT_SRC="$REPO_ROOT/scripts/sandbox-agent.c"
+gcc -static -O2 -Wall -Wextra -I"$REPO_ROOT/include" \
+    -o "$MNTDIR/bin/sandbox-agent" \
+    "$AGENT_SRC" "$REPO_ROOT/src/vsock_peer.c"
 chmod +x "$MNTDIR/bin/sandbox-agent"
 log "  agent: $(file -b "$MNTDIR/bin/sandbox-agent")"
 

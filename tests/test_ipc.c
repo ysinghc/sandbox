@@ -46,6 +46,24 @@ static int serial_has(vm_handle_t* vm, const char* needle) {
     return strstr(buf, needle) != NULL;
 }
 
+// Print the (bounded) serial log so the CI log shows the guest's own account of
+// a failed guest-side assertion.
+static void dump_serial(vm_handle_t* vm, const char* why) {
+    if (!vm || !vm->jail_root[0]) return;
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "--- serial.log (%s) unavailable ---\n", path);
+        return;
+    }
+    static char b[1 << 16];
+    size_t n = fread(b, 1, sizeof(b) - 1, f);
+    b[n] = '\0';
+    fprintf(stderr, "--- serial.log (%s) [%s] ---\n%s\n--- end ---\n", path, why, b);
+    fclose(f);
+}
+
 static pool_manager_t g_pool;
 static char g_engine_sock[256];
 static char g_bc_sock[256];
@@ -155,58 +173,36 @@ int main(void) {
             if (serial_has(hvm, "MYKEY")) { seen = 1; break; }
             usleep(10000);
         }
-        if (!seen && hvm) {
-            char sp[PATH_MAX + 16];
-            snprintf(sp, sizeof(sp), "%s/serial.log", hvm->jail_root);
-            FILE* sf = fopen(sp, "r");
-            if (sf) {
-                static char b[1 << 16];
-                size_t k = fread(b, 1, sizeof(b) - 1, sf);
-                b[k] = '\0';
-                fprintf(stderr, "--- serial.log (%s) ---\n%s\n--- end ---\n", sp, b);
-                fclose(sf);
-            }
-        }
+        if (!seen && hvm) dump_serial(hvm, "env not seen");
         CHECK(seen, "env: injected into guest");
         CHECK(serial_has(hvm, "SANDBOX-ENV-BEGIN"), "env: guest marker");
         // Phase 10.2: the guest must not echo env *values* to the persistent
         // serial console (only key names).
         CHECK(!serial_has(hvm, "myvalue"), "env: value redacted in serial");
 
-        // #10: only the host may drive the control channel. After the host's
-        // first injection the agent opens a loopback connection to its own
-        // listener; the production accept path must reject that peer (it is
-        // CID_LOCAL, not CID_HOST) and log it. Reaching the end of this block
-        // proves the host peer was accepted (env landed above) AND a non-host
-        // peer was refused.
-        int auth_test = 0, auth_skip = 0, rejected = 0;
-        for (int i = 0; i < 200; i++) {
-            auth_test = serial_has(hvm, "SANDBOX-VSOCK-AUTH-TEST");
-            auth_skip = serial_has(hvm, "SANDBOX-VSOCK-AUTH-SKIP");
-            rejected = serial_has(hvm, "SANDBOX-VSOCK-REJECT cid=");
-            if (rejected || auth_skip) break;
+        // #10: the guest must classify the host connection by its vsock CID.
+        // The agent logs the CID it actually observed on the first accepted
+        // host connection: that is in-guest proof the classification input is
+        // real (and is the host's, 2) rather than "every peer is accepted".
+        //
+        // The negative direction -- a non-CID_HOST peer is refused -- cannot be
+        // produced inside this guest: the guest kernel is 4.14 and guest-local
+        // vsock (VMADDR_CID_LOCAL) only exists from Linux 5.6, so an in-guest
+        // connection to our own listener blocks in connect() instead of
+        // completing. It is covered by tests/test_vsock_peer.c, which runs the
+        // same classifier against a real non-host AF_VSOCK peer on the host.
+        int host_seen = 0;
+        for (int i = 0; i < 100; i++) {
+            if (serial_has(hvm, "SANDBOX-VSOCK-HOST cid=2")) {
+                host_seen = 1;
+                break;
+            }
             usleep(10000);
         }
-        CHECK(!serial_has(hvm, "SANDBOX-VSOCK-AUTH-FAIL"),
-              "vsock: a guest-local peer is not mistaken for the host");
-        if (auth_skip) {
-            // The guest kernel exposes no vsock loopback, so the in-guest probe
-            // cannot be made. Surface it loudly instead of passing silently:
-            // the host-vs-guest half is still covered by the env checks above.
-            fprintf(stderr,
-                    "  NOTE: vsock peer-auth probe unavailable: this guest "
-                    "kernel has no vsock loopback\n");
-        } else {
-            fprintf(stderr,
-                    "  vsock peer-auth evidence: self-test ran=%d, guest-local "
-                    "peer rejected=%d\n", auth_test, rejected);
-            CHECK(auth_test, "vsock: peer-auth self-test ran");
-            CHECK(rejected, "vsock: a guest-local peer was rejected");
-            // A rejected *host* would mean the fix broke the real path; the
-            // env checks above already prove it did not, so assert it directly.
-            CHECK(!serial_has(hvm, "SANDBOX-VSOCK-REJECT cid=2"),
-                  "vsock: the host (cid 2) was not rejected");
-        }
+        if (!host_seen) dump_serial(hvm, "vsock host peer not classified");
+        CHECK(host_seen, "vsock: host peer authenticated as cid 2");
+        CHECK(!serial_has(hvm, "SANDBOX-VSOCK-REJECT"),
+              "vsock: the host connection was not rejected");
 
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,

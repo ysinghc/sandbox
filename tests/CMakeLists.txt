@@ -33,6 +33,16 @@ target_link_libraries(test_seccomp sandbox)
 add_test(NAME seccomp COMMAND test_seccomp)
 set_tests_properties(seccomp PROPERTIES TIMEOUT 60)
 
+# #10: the guest control channel may only be driven by the host. Unprivileged
+# (it needs no VM), so the decision table runs on the hosted CI too; the
+# integration half additionally needs host vsock loopback and SKIPs without it.
+# ../src/vsock_peer.c is compiled in directly: the guest agent links the same
+# file, and nothing in the engine itself calls it.
+add_executable(test_vsock_peer test_vsock_peer.c ../src/vsock_peer.c)
+target_include_directories(test_vsock_peer PRIVATE ../include)
+add_test(NAME vsock_peer COMMAND test_vsock_peer)
+set_tests_properties(vsock_peer PROPERTIES TIMEOUT 60)
+
 # Phase 3: network manager test (root only: tap + nftables; SKIPs otherwise).
 # The cleanup fixture runs even if the test aborts, so leaked netns/routes/
 # nft rules can never poison later runs.

@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sandbox-engine",
+  "compatibility_date": "2026-10-19",
+  "observability": {
+    "enabled": true
+  },
+  "assets": {
+    "directory": "frontend",
+    "not_found_handling": "404-page"
+  },
+  "routes": [
+    {
+      "pattern": "sandbox.ysinghc.in",
+      "custom_domain": true
+    }
+  ]
+}
