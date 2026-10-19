@@ -95,17 +95,21 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
 mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 
 # Session workspace (Phase 15, #23). The host attaches this template's workspace
-# drive second, so it enumerates as /dev/vdb; the mount is made *here*, before
-# capture, so the snapshot records the mounted filesystem. Every restore then
-# binds a different host file behind the same device: the guest keeps this mount
-# across a destroy + recreate, which is what makes a session's files persist.
-# Clones are byte-identical to the base image, so the page cache captured with
-# the template stays valid for the session's own copy.
-mkdir -p /workspace 2>/dev/null || true
-if mount -t ext4 /dev/vdb /workspace 2>/dev/null; then
-    echo "SANDBOX-WORKSPACE-MOUNTED"
+# drive second, so it enumerates as /dev/vdb.
+#
+# It is deliberately NOT mounted here. The template is snapshotted with this
+# process's memory, so mounting before the capture would bake the *base* image's
+# ext4 superblock, inode tables and page cache into the snapshot -- and every
+# restore serves a different file (the session's own copy) behind the same
+# device. The guest would then read stale metadata from RAM and report
+# "EXT4-fs error: checksumming directory block 0" as soon as it touched
+# /workspace. Instead the agent mounts the volume after each restore (see
+# scripts/sandbox-agent.c), which also means ext4 replays the journal of a
+# session that was killed mid-write, so a volume cannot come back inconsistent.
+if [ -b /dev/vdb ]; then
+    echo "SANDBOX-WORKSPACE-DEVICE present"
 else
-    echo "SANDBOX-WORKSPACE-NODEVICE"
+    echo "SANDBOX-WORKSPACE-DEVICE absent"
 fi
 
 # Configure lo

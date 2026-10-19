@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -47,6 +48,35 @@
 // itself (env values may be credentials) -- only a checksum of it.
 #define WS_PROBE_FILE "/workspace/.sandbox-probe"
 #define WS_PROBE_MAX 4096
+#define WS_DEVICE "/dev/vdb"
+#define WS_DIR "/workspace"
+
+// #23: mount the session volume on first use *after* a restore.
+//
+// The template snapshots this process with the volume unmounted (see
+// scripts/build-custom-rootfs.sh for why: a mount captured in the template bakes
+// the base image's metadata and page cache into the snapshot, and a restore
+// serves the session's own file behind the same device). So the mount has to
+// happen here, once, after each restore -- which also means ext4 replays the
+// journal of a session whose VM was killed mid-write, so a persisted volume
+// cannot come back with a torn filesystem.
+//
+// `g_ws_mounted` lives in snapshot memory and is 0 at capture time, because no
+// env injection happens before the snapshot is taken.
+static int g_ws_mounted = 0;
+
+static int ws_ensure_mount(void) {
+    if (g_ws_mounted) return 0;
+    if (mount(WS_DEVICE, WS_DIR, "ext4", 0, NULL) == 0) {
+        g_ws_mounted = 1;
+        return 0;
+    }
+    if (errno == EBUSY) {  // already mounted by an earlier life of this process
+        g_ws_mounted = 1;
+        return 0;
+    }
+    return -1;
+}
 
 static int g_console = -1;
 
@@ -82,6 +112,13 @@ static unsigned probe_sum(const char* b, size_t n) {
 // starts with one line and a different value. That is the whole persistence
 // claim, observed from inside the guest rather than inferred by the host.
 static void workspace_probe(const char* payload, size_t n) {
+    if (ws_ensure_mount() < 0) {
+        char m[96];
+        int k = snprintf(m, sizeof(m),
+                         "SANDBOX-WORKSPACE-PROBE mounted=0 errno=%d\n", errno);
+        if (k > 0) { ssize_t wr = write(g_console, m, (size_t)k); (void)wr; }
+        return;
+    }
     char line[16];
     int ln = snprintf(line, sizeof(line), "%08x\n", probe_sum(payload, n));
     if (ln <= 0) return;

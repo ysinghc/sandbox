@@ -499,8 +499,11 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     // #23/D7: format the session workspace's base image *here*, once, at template
     // build time. Sessions clone it (reflink or a sparse copy) instead of
     // running mkfs, which is what keeps session creation inside the latency
-    // budget. The guest mounts this device at /workspace during the boot below,
-    // so the capture records the mount and every restore sees the same device.
+    // budget. The drive is attached for the boot below, but the guest does not
+    // mount it before the capture -- a captured mount would bake the base
+    // image's ext4 state and page cache into the snapshot, and a restore serves a
+    // different file behind the same device. The guest agent mounts the volume
+    // after each restore instead.
     char ws_base[PATH_MAX];
     ws_base[0] = '\0';
     if (config->workspace_size_mb) {
