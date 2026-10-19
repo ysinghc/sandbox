@@ -22,6 +22,18 @@
 
 extern char** environ;
 
+// The jailed child cannot return an error, and a bare _exit(N) leaves an
+// operator (or a CI log) with a number and no reason — which is exactly how a
+// "step 1 failed" report cost a debugging cycle. Say which step failed and why
+// on stderr, which is still the inherited daemon/CI log at this point.
+static void jail_fail(int step) {
+    int e = errno;
+    fprintf(stderr, "[jailer] step %d failed: errno=%d (%s)\n", step, e,
+            strerror(e));
+    _exit(step);
+}
+#define JAIL_FAIL(step) jail_fail(step)
+
 int mkdir_recursive(const char* path, unsigned mode) {
     if (!path || !*path) { errno = EINVAL; return -1; }
     char tmp[PATH_MAX];
@@ -235,45 +247,45 @@ pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
     // 1=mkdir, 2=chown, 3=copy_fc, 5=devices, 6=bind_files,
     // 7=cgroup, 8=serial_open, 9=chroot, 10=chdir, 11=caps, 12=setgid,
     // 13=setuid, 16=ambient_cap, 14=seccomp, 15=execve_fail
-    if (mkdir_recursive(jail_root, 0700) < 0) _exit(1);
+    if (mkdir_recursive(jail_root, 0700) < 0) JAIL_FAIL(1);
     // The jailed uid must create sockets/files at the jail top level
     // (api.sock, uffd.sock). chown normally; 0777 fallback where chown is
     // unsupported (e.g. 9p test mounts); fatal only if both fail.
     if (chown(jail_root, config->jailer_uid, config->jailer_gid) < 0 &&
         chmod(jail_root, 0777) < 0)
-        _exit(2);
+        JAIL_FAIL(2);
     if (files && files->firecracker_bin) {
         char dst[PATH_MAX];
         snprintf(dst, sizeof(dst), "%s/firecracker", jail_root);
-        if (copy_file(files->firecracker_bin, dst, 0755) < 0) _exit(3);
+        if (copy_file(files->firecracker_bin, dst, 0755) < 0) JAIL_FAIL(3);
     }
     if (mount_devices && make_jail_devices(jail_root, config->jailer_uid,
                                                  config->jailer_gid) < 0)
-        _exit(5);
+        JAIL_FAIL(5);
     if (files && jail_bind_files(jail_root, files, config->jailer_uid,
                                   config->jailer_gid) < 0)
-        _exit(6);
+        JAIL_FAIL(6);
     if (config->cgroup_path && write_cgroup_procs(config->cgroup_path, getpid()) < 0)
-        _exit(7);
+        JAIL_FAIL(7);
     int serial_fd = -1;
     if (serial_log) {
         // Opened pre-chroot on the host path and dup2'd post-setuid. The fd
         // is already write-capable (checked at open), so the chown is only
         // ownership hygiene and best-effort (9p mounts reject chown).
         serial_fd = open(serial_log, O_WRONLY | O_CREAT | O_APPEND, 0600);
-        if (serial_fd < 0) _exit(8);
+        if (serial_fd < 0) JAIL_FAIL(8);
         fchown(serial_fd, config->jailer_uid, config->jailer_gid);
     }
-    if (chroot(jail_root) < 0) _exit(9);
-    if (chdir("/") < 0) _exit(10);
-    if (drop_capabilities() < 0) _exit(11);
+    if (chroot(jail_root) < 0) JAIL_FAIL(9);
+    if (chdir("/") < 0) JAIL_FAIL(10);
+    if (drop_capabilities() < 0) JAIL_FAIL(11);
     // Retain the permitted set across the uid transition so CAP_SYS_PTRACE can
     // be re-raised as ambient below.
-    if (prctl(PR_SET_KEEPCAPS, 1) < 0) _exit(11);
-    if (setgid(config->jailer_gid) < 0) _exit(12);
-    if (setuid(config->jailer_uid) < 0) _exit(13);
-    if (raise_ambient_sys_ptrace() < 0) _exit(16);
-    if (apply_seccomp && apply_seccomp_filter() < 0) _exit(14);
+    if (prctl(PR_SET_KEEPCAPS, 1) < 0) JAIL_FAIL(11);
+    if (setgid(config->jailer_gid) < 0) JAIL_FAIL(12);
+    if (setuid(config->jailer_uid) < 0) JAIL_FAIL(13);
+    if (raise_ambient_sys_ptrace() < 0) JAIL_FAIL(16);
+    if (apply_seccomp && apply_seccomp_filter() < 0) JAIL_FAIL(14);
     if (serial_fd >= 0) {
         dup2(serial_fd, STDOUT_FILENO);
         dup2(serial_fd, STDERR_FILENO);
@@ -281,7 +293,7 @@ pid_t spawn_jailed(const char* jail_root, const jailer_config_t* config,
             close(serial_fd);
     }
     execve(bin, argv, environ);
-    _exit(15);  // exec failed
+    JAIL_FAIL(15);  // exec failed
 }
 
 int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {

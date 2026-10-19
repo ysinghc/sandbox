@@ -222,6 +222,19 @@ static void userns_sequence_child(const char* jail, const char* probe_in_jail,
                 if (!strstr(out, marker)) _exit(5);
                 _exit(0);
             }
+            if (WIFEXITED(st) && WEXITSTATUS(st) != 0) {
+                // Diagnose from inside the same user namespace the jailer child
+                // had: if it could not create the jail, say why, instead of
+                // relaying a bare step number.
+                int mk = mkdir(jail, 0700);
+                int me = errno;
+                fprintf(stderr,
+                        "[jailer-test] probe/jailer exit=%d; userns mkdir(%s)=%d "
+                        "errno=%d (%s)\n",
+                        WEXITSTATUS(st), jail, mk, mk < 0 ? me : 0,
+                        mk < 0 ? strerror(me) : "ok");
+                if (out[0]) fprintf(stderr, "[jailer-test] probe output: %s\n", out);
+            }
             if (WIFEXITED(st)) _exit(100 + WEXITSTATUS(st));  // probe/child exit code
             _exit(200 + WTERMSIG(st));  // unexpected signal
         }
@@ -322,7 +335,19 @@ static void test_jailer_sequence(void) {
         fflush(stdout);
         return;
     }
-    fprintf(stderr, "FAIL jailer_sequence: status=%d\n", status);
+    fprintf(stderr, "FAIL jailer_sequence: status=%d", status);
+    if (WIFEXITED(status)) {
+        int c = WEXITSTATUS(status);
+        if (c >= 100 && c < 200)
+            fprintf(stderr, " (jailer step or probe exit %d)", c - 100);
+        else if (c >= 200)
+            fprintf(stderr, " (killed by signal %d)", c - 200);
+        else
+            fprintf(stderr, " (harness exit %d)", c);
+    } else if (WIFSIGNALED(status)) {
+        fprintf(stderr, " (killed by signal %d)", WTERMSIG(status));
+    }
+    fprintf(stderr, "\n");
     abort();
 }
 
