@@ -644,11 +644,20 @@ int vmm_resume_vcpus(vm_handle_t* vm) {
     return 0;
 }
 
-// Per-VM env injection (Phase 9b). Connects to this VM's Firecracker vsock UDS
-// and speaks the hybrid-vsock handshake ("CONNECT <port>\n" -> "OK <host>\n"),
-// then streams KEY=VALUE lines and half-closes; the guest agent reads to EOF.
-int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
-    if (!vm || !env_vars || !env_vars[0]) return 0;  // nothing to inject
+// Per-VM guest control channel. Connects to this VM's Firecracker vsock UDS and
+// speaks the hybrid-vsock handshake ("CONNECT <port>\n" -> "OK <host>\n"), then
+// streams `lines` (each with a trailing newline) and half-closes; the guest
+// agent reads to EOF. Waits for `confirm` on the guest's serial console, so a
+// return of 0 means the guest applied the payload, not merely that it was
+// written. Shared by env injection and the #23 pre-teardown flush: one channel,
+// two payloads, two acknowledgements.
+static int vsock_send(vm_handle_t* vm, const char* const* lines,
+                      const char* confirm, int confirm_ms) {
+    if (!vm || !lines || !lines[0]) return 0;  // nothing to send
+    if (!confirm || !*confirm) {
+        errno = EINVAL;
+        return -1;
+    }
     if (!vm->vsock_uds[0]) {
         errno = ENOTSUP;
         return -1;
@@ -701,7 +710,7 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
             nanosleep(&nap, NULL);
         }
         if (cres < 0) {
-            fprintf(stderr, "[vmm_inject_env] connect %s failed: %s (attempt %d)\n",
+            fprintf(stderr, "[vsock] connect %s failed: %s (attempt %d)\n",
                     vm->vsock_uds, strerror(errno), attempt);
             close(fd);
             continue;
@@ -716,7 +725,7 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
         char hs[64];
         int hn = snprintf(hs, sizeof(hs), "CONNECT %d\n", FC_VSOCK_ENV_PORT);
         if (write_full(fd, hs, (size_t)hn) < 0) {
-            fprintf(stderr, "[vmm_inject_env] handshake write failed: %s (attempt %d)\n",
+            fprintf(stderr, "[vsock] handshake write failed: %s (attempt %d)\n",
                     strerror(errno), attempt);
             close(fd);
             continue;
@@ -729,7 +738,7 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
             ssize_t r = read(fd, rbuf + roff, 1);
             if (r < 0) {
                 if (errno == EINTR) continue;
-                fprintf(stderr, "[vmm_inject_env] handshake read failed: %s (attempt %d)\n",
+                fprintf(stderr, "[vsock] handshake read failed: %s (attempt %d)\n",
                         strerror(errno), attempt);
                 hfail = 1;
                 break;
@@ -743,17 +752,17 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
             continue;
         }
         if (strncmp(rbuf, "OK", 2) != 0) {
-            fprintf(stderr, "[vmm_inject_env] handshake got '%s' (attempt %d)\n",
+            fprintf(stderr, "[vsock] handshake got '%s' (attempt %d)\n",
                     rbuf, attempt);
             close(fd);
             continue;
         }
 
         int wfail = 0;
-        for (int i = 0; env_vars[i]; i++) {
-            if (write_full(fd, env_vars[i], strlen(env_vars[i])) < 0 ||
+        for (int i = 0; lines[i]; i++) {
+            if (write_full(fd, lines[i], strlen(lines[i])) < 0 ||
                 write_full(fd, "\n", 1) < 0) {
-                fprintf(stderr, "[vmm_inject_env] env write failed: %s (attempt %d)\n",
+                fprintf(stderr, "[vsock] write failed: %s (attempt %d)\n",
                         strerror(errno), attempt);
                 wfail = 1;
                 break;
@@ -767,17 +776,43 @@ int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
         errno = EPROTO;
         return rc;
     }
-    // §10.9: confirm delivery — the guest agent echoes SANDBOX-ENV-END to the
-    // serial console only after it has applied the payload. Turns best-effort
-    // injection into confirmed delivery within a bounded window.
-    static const char* const done_markers[] = { "SANDBOX-ENV-END" };
-    int confirm_ms = env_int_ms("SANDBOX_VSOCK_CONFIRM_MS", 2000);
+    // §10.9: confirm delivery — the guest agent echoes `confirm` to the serial
+    // console only after it has applied the payload. Turns best-effort delivery
+    // into confirmed delivery within a bounded window.
+    const char* done_markers[1] = { confirm };
     if (wait_markers(vm, done_markers, 1, confirm_ms) != 0) {
-        fprintf(stderr,
-                "[vmm_inject_env] write OK but no SANDBOX-ENV-END within %dms "
-                "(unconfirmed)\n",
-                confirm_ms);
+        fprintf(stderr, "[vsock] write OK but no %s within %dms (unconfirmed)\n",
+                confirm, confirm_ms);
         errno = EPROTO;
+        return -1;
+    }
+    return 0;
+}
+
+int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars) {
+    return vsock_send(vm, env_vars, "SANDBOX-ENV-END",
+                      env_int_ms("SANDBOX_VSOCK_CONFIRM_MS", 2000));
+}
+
+// #23: make a session volume's contents durable before this VM disappears.
+//
+// The guest's page cache is the only copy of a write until *the guest* writes it
+// back, and vmm_destroy SIGKILLs the VMM: testing showed a re-created session
+// mounting the volume without the file the previous VM had already written, so
+// the persistence claim was false for everything the workload had not itself
+// flushed. Ask the guest to sync() -- which covers every filesystem in it, the
+// workload's writes included -- and wait for its acknowledgement.
+//
+// Best effort by design: a wedged or unresponsive guest must not turn destroy
+// into a hang, and a missing flush is reported rather than hidden.
+int vmm_flush_workspace(vm_handle_t* vm) {
+    static const char* const flush[] = { "SANDBOX_CONTROL=flush", NULL };
+    if (!vm || vm->vmm_pid <= 0) return 0;  // nothing to flush
+    int ms = env_int_ms("SANDBOX_FLUSH_MS", 5000);
+    if (vsock_send(vm, flush, "SANDBOX-FLUSH-OK", ms) != 0) {
+        fprintf(stderr,
+                "[vmm_flush_workspace] no SANDBOX-FLUSH-OK within %dms: session "
+                "volume writes may be lost\n", ms);
         return -1;
     }
     return 0;
@@ -819,6 +854,9 @@ int vmm_destroy(vm_handle_t* vm) {
         return -1;
     }
     if (vm->vmm_pid > 0) {
+        // #23: a session volume must be durable before the guest is killed (see
+        // vmm_flush_workspace). Only sessions have one to lose.
+        if (vm->session_key[0]) vmm_flush_workspace(vm);
         kill(vm->vmm_pid, SIGKILL);
         int st = 0;
         while (waitpid(vm->vmm_pid, &st, 0) < 0 && errno == EINTR) {

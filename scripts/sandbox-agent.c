@@ -42,6 +42,11 @@
 #define ENV_FILE "/tmp/sandbox-env"
 #define MAX_PAYLOAD 8192
 
+// #23: the engine's pre-teardown flush request. It is *not* an env var: it is a
+// control verb that happens to arrive on the env channel, and it is matched
+// exactly so no user-supplied KEY=VALUE can trigger it.
+#define CONTROL_FLUSH "SANDBOX_CONTROL=flush"
+
 // #23: the session workspace. The probe below is a *diagnostic*: it lets the
 // host observe, from inside the guest, that /workspace is this session's own
 // volume and that it survives a destroy + re-create. It never writes the payload
@@ -221,6 +226,23 @@ static void serve(int cfd) {
     }
     close(cfd);
     buf[off] = '\0';
+
+    // #23: writes to the session volume live in this guest's page cache until
+    // the guest writes them back, and the engine tears a VM down with SIGKILL --
+    // so without this request, a file the workload had already written is simply
+    // absent when the next VM mounts the volume. (Observed, not theorised: the
+    // re-created session saw only its own new line.) sync() flushes every
+    // filesystem in the guest, which is what makes this cover the workload's
+    // writes and not just this agent's.
+    {
+        size_t m = strlen(CONTROL_FLUSH);
+        if (off == m + 1 && memcmp(buf, CONTROL_FLUSH, m) == 0 &&
+            buf[m] == '\n') {
+            sync();
+            say("SANDBOX-FLUSH-OK\n");
+            return;
+        }
+    }
 
     int fd = open(ENV_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd >= 0) {

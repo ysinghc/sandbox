@@ -108,6 +108,12 @@ int vmm_wait_ready(vm_handle_t* vm, const char* marker, int timeout_ms);
 // is empty; -1 if the VM has no vsock or the injection fails.
 int vmm_inject_env(vm_handle_t* vm, const char* const* env_vars);
 
+// #23: flush a session volume's pending writes from the guest to the host file
+// before the VM is destroyed. Returns 0 on a confirmed flush, -1 if the guest
+// did not acknowledge within SANDBOX_FLUSH_MS (the caller may still destroy the
+// VM: a wedged guest must not become an unclearable sandbox).
+int vmm_flush_workspace(vm_handle_t* vm);
+
 int vmm_pause_vcpus(vm_handle_t* vm);
 int vmm_resume_vcpus(vm_handle_t* vm);
 
