@@ -19,6 +19,12 @@ typedef struct snap_manifest_t {
     uint32_t page_count;     // guest_mem_size / page_size
     uint8_t  memory_sha256[32];   // SHA-256 of memory.snap (§10.10)
     uint8_t  vmstate_sha256[32];  // SHA-256 of vmstate (§10.10)
+    // #22: the rootfs is part of the captured state, not a bystander. The
+    // guest's page cache, mount state and inode expectations all refer to the
+    // image it booted from, so swapping rootfs.ext4 under a snapshot silently
+    // changes the sandbox. Bound at capture, verified at restore.
+    uint8_t  rootfs_sha256[32];   // SHA-256 of rootfs.ext4
+    uint64_t rootfs_size;         // bytes, checked before hashing
     uint8_t  page_bitmap[];  // 1 bit per page: 1=present, 0=zero (packed)
 } snap_manifest_t;
 

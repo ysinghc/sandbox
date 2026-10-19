@@ -819,6 +819,41 @@ int vmm_destroy(vm_handle_t* vm) {
     return 0;
 }
 
+int vmm_build_load_request(char* buf, size_t cap, const char* tap_name) {
+    if (!buf || cap == 0 || !tap_name) {
+        errno = EINVAL;
+        return -1;
+    }
+    // #22: without this, a restored guest resumes with the wall clock it had at
+    // capture time -- so a template built last week hands out sandboxes that are
+    // a week behind, which breaks TLS, JWT signing, apt/pip/npm and every
+    // timestamp the agent writes. Firecracker can reset the KVM clock's realtime
+    // base at load: x86_64 only, host kernel >= 5.16.
+    //
+    // The field is rejected as unknown on aarch64, so it must not be sent
+    // there; and an operator on an older host can turn it off rather than have
+    // every restore fail.
+    const char* clock_field = "";
+#if defined(__x86_64__)
+    if (!(getenv("SANDBOX_FC_CLOCK_REALTIME") &&
+          strcmp(getenv("SANDBOX_FC_CLOCK_REALTIME"), "0") == 0)) {
+        clock_field = "\"clock_realtime\": true, ";
+    }
+#endif
+    int n = snprintf(buf, cap,
+                     "{%s\"snapshot_path\": \"/vmstate\", \"mem_backend\": "
+                     "{\"backend_path\": \"/uffd.sock\", \"backend_type\": \"Uffd\"}, "
+                     "\"network_overrides\": [{\"iface_id\": \"%s\", \"host_dev_name\": \"%s\"}], "
+                     "\"vsock_override\": {\"uds_path\": \"%s\"}, "
+                     "\"resume_vm\": false}",
+                     clock_field, FC_TEMPLATE_IFACE, tap_name, FC_VSOCK_JAILVIEW);
+    if (n < 0 || (size_t)n >= cap) {
+        errno = EOVERFLOW;
+        return -1;
+    }
+    return n;
+}
+
 vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
                          const char* tap_name, uint32_t guest_ip) {
     uint64_t t_enter = now_ms();
@@ -984,13 +1019,13 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     unlink(vm->vsock_uds);
     fprintf(stderr, "[vmm_restore] sending /snapshot/load...\n");
     char load_req[1024];
-    snprintf(load_req, sizeof(load_req),
-             "{\"snapshot_path\": \"/vmstate\", \"mem_backend\": "
-             "{\"backend_path\": \"/uffd.sock\", \"backend_type\": \"Uffd\"}, "
-             "\"network_overrides\": [{\"iface_id\": \"%s\", \"host_dev_name\": \"%s\"}], "
-             "\"vsock_override\": {\"uds_path\": \"%s\"}, "
-             "\"resume_vm\": false}",
-             FC_TEMPLATE_IFACE, tap_name, FC_VSOCK_JAILVIEW);
+    if (vmm_build_load_request(load_req, sizeof(load_req), tap_name) < 0) {
+        fprintf(stderr, "[vmm_restore] FAIL: cannot build load request\n");
+        close(listen_fd);
+        cold_fail(vm);
+        free(manifest);
+        return NULL;
+    }
     int load_fd = fc_send_request(vm->api_sock_path, "PUT", "/snapshot/load", load_req);
     if (load_fd < 0) {
         fprintf(stderr, "[vmm_restore] FAIL: send /snapshot/load errno=%d\n", errno);

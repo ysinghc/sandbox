@@ -35,6 +35,12 @@ builds both architectures natively from one tag.
   mitigation, location, and status; residual risk ranked.
 - **SPDX enforcement** (#8): `GPL-2.0-only` identifiers on every source file,
   checked by `scripts/check-spdx.sh` in CI.
+- **Deterministic restore** (#22): `/snapshot/load` now carries
+  `clock_realtime` (x86_64), so a restored guest starts at host time instead of
+  the template's capture time; the template manifest also binds `rootfs.ext4`
+  by SHA-256, so the disk image cannot drift away from the captured memory
+  state. Both are asserted (`vmm` for the request, `ipc` for the guest clock,
+  `snapshot` for the image digest).
 - **Project site** with downloads and a contribution guide.
 
 ### Changed
@@ -55,6 +61,10 @@ builds both architectures natively from one tag.
   `sudo -E`, which drops the environment, so the fixture roots never arrived and
   `tmpl_setup` plus every test depending on it skipped with exit 0. The suite now
   runs as root and the job **fails if any privileged test skips**.
+- **Tests were not asserting in Release builds**: CMake defines `NDEBUG`, which
+  compiles `assert()` out, so 34 assertions in `test_snapshot` never ran. Test
+  binaries now build with `-UNDEBUG`; the rootfs-digest checks above are covered
+  as a direct result.
 - Benchmark: the template name handed to the daemon now matches the one built,
   and the daemon log is dumped when the warm pool fails to fill.
 

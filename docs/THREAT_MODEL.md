@@ -87,7 +87,7 @@ Three boundaries matter:
 
 | # | Threat | Mitigation | Status |
 |---|---|---|---|
-| T17 | Tampered snapshot restores arbitrary guest code | `memory.snap` + `vmstate` SHA-256 in the manifest, verified on restore (`src/snapshot_manager.c`) | implemented |
+| T17 | Tampered snapshot restores arbitrary guest code | `memory.snap`, `vmstate` **and `rootfs.ext4`** are SHA-256-bound in the manifest and verified on restore (`src/snapshot_manager.c`); the rootfs was the gap — a swapped image changes the guest without touching either hashed file (#22) | implemented |
 | T18 | Counterfeit release binary | releases ship `.sha256` per archive; `scripts/install.sh` verifies before writing | fixed (`install.sh`) |
 | T19 | Unsigned releases | **none** — no signing yet | **open (#19)** |
 | T20 | World-readable workspace/snapshot dirs | state lives under `/var/lib/sandbox-engine`; snapshot store permissions are not asserted at startup | **open** |

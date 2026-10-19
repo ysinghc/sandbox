@@ -52,6 +52,13 @@ typedef struct vm_handle_t {
 // Restore a VM from the configured template via real Firecracker /snapshot/load.
 vm_handle_t* restore_vm_from_snapshot(void);
 
+// Build the /snapshot/load request body. Pure string construction, so the
+// fields that decide guest behaviour after resume (tap retarget, per-VM vsock
+// UDS, clock) can be asserted without booting a VM. Paths are jail-view paths:
+// Firecracker is chrooted, so the host paths never appear in its API.
+// Returns the number of bytes written, or -1 on invalid input/overflow.
+int vmm_build_load_request(char* buf, size_t cap, const char* tap_name);
+
 // Set the template restore source for pool replenishment (global by design:
 // restore_vm_from_snapshot() takes no args per LLD).
 void pool_set_restore_source(const char* template_name);

@@ -9,8 +9,26 @@ ctest --test-dir build --output-on-failure
 ```
 
 Most end-to-end tests need **root, `/dev/kvm`, Firecracker, and guest assets**,
-so run `ctest` as root on a prepared host. `sudo -E` preserves the environment
-(the tests re-exec themselves under `sudo` where needed).
+so run the whole suite **as root** on a prepared host — not via `sudo`, and not
+via `sudo -E`:
+
+```sh
+sudo ctest --test-dir build -V   # or: run ctest as root directly
+```
+
+`sudo` resets the environment, and ctest supplies each test's roots through its
+`ENVIRONMENT` property, so `sudo -E` still loses them. A test that cannot find
+its roots SKIPs with exit 0 (deliberately, so an unprivileged run stays honest),
+which is exactly how the privileged CI spent several runs "passing" while
+executing nothing. The privileged workflow therefore runs the set with `-V` and
+fails if any test reports Skipped/Not Run. Two rules follow:
+
+- **Never let "passed" mean "ran".** Assert execution (duration, a marker in the
+  output, a non-skip assertion), not just exit status.
+- **A test that only calls `assert()` is not testing in Release.** CMake's
+  Release flags define `NDEBUG`, which compiles `assert()` out. `tests/` adds
+  `-UNDEBUG` to every test binary for this reason; without it, 34 assertions in
+  `test_snapshot` were no-ops and its "PASS" proved nothing.
 
 The template fixture (`tmpl_setup`) builds the `e2e` template once per build
 directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
@@ -23,9 +41,9 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `pool` | yes (fixture) | yes | Warm pool concurrency/invariants; real restores. Run under TSan via `build-tsan`. |
 | `jailer` | no* | no | seccomp enforcement (always); full chroot+uid-drop sequence (*SKIPs where unprivileged user namespaces are restricted, e.g. Ubuntu 24.04 AppArmor). |
 | `network` / `network_cleanup` | yes | no | Per-VM tap + nftables rules; leaks are cleaned by fixture teardown. |
-| `snapshot` | no | no | Manifest build/read, `header_size` guard, SHA-256 integrity. |
+| `snapshot` | no | no | Manifest build/read, `header_size` guard, SHA-256 integrity of `memory.snap`, `vmstate` **and `rootfs.ext4`**. |
 | `tmpl_setup` | yes | yes | Builds the `e2e` template (fixture setup). |
-| `vmm` | yes | yes | Restore, env inject, readiness/confirm, cgroup placement. |
+| `vmm` | yes | yes | Restore, env inject, readiness/confirm, cgroup placement; the `/snapshot/load` body (clock/tap/vsock) is asserted even without root. |
 | `uffd` | no | no | Lazy-restore page-fault handling (SKIPs if userfaultfd denied). |
 | `broker` | no | no | Request pipeline against an in-process mock engine + upstream. |
 | `ipc` | yes | yes | Daemon IPC, async `Create`, client API, broker-control. |

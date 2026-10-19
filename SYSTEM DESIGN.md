@@ -2072,3 +2072,47 @@ authoritative.
   playbook, cleanup), `docs/UPGRADE.md` (drain → install → **rebuild templates**
   → verify → rollback; manifest compatibility table), `docs/BACKUP.md` (what to
   back up, integrity, secrets, cadence).
+
+### 15.16 Phase 14 — Determinism (#22)
+
+Determinism here means **a reproducible start state**, not bit-exact execution.
+Two capture-time behaviours had to be handled explicitly.
+
+- **Wall clock.** A restored microVM resumes with the guest clock it had at
+  capture, so a template built last week hands out sandboxes a week behind —
+  which breaks TLS, JWT/API signing, `apt`/`pip`/`npm` (signature and
+  `Release` date checks) and every timestamp the agent writes. The load request
+  now sets `"clock_realtime": true`
+  (`vmm_build_load_request()`, `src/vmm_manager.c`), which makes Firecracker
+  reset the KVM clock's realtime base to host time at load. It is x86_64-only
+  and needs host kernel ≥ 5.16, so it is compiled out on aarch64 (Firecracker
+  rejects unknown fields) and can be disabled with
+  `SANDBOX_FC_CLOCK_REALTIME=0` on an older host.
+  Verified in `tests/test_ipc.c`: the test waits until the fixture snapshot is
+  ≥ 6 s old, then asserts the guest's own `CLOCK_REALTIME` (logged by the agent
+  as `SANDBOX-GUEST-CLOCK epoch=`) is within ±3 s of the host's. Without the
+  field the skew is the template's age, so the check cannot pass vacuously.
+- **Template identity.** `manifest.bin` already bound `memory.snap` and
+  `vmstate` by SHA-256; it now also binds `rootfs.ext4`
+  (`rootfs_sha256`/`rootfs_size`). The image is part of the state: the guest
+  resumes with the page cache and inode expectations of the disk it booted from,
+  so swapping the image changes the sandbox without touching either hashed file.
+  The digest is computed at build time; the restore path verifies it once per
+  template (`snapshot_verify_manifest`'s cache is keyed on the stat signature of
+  all three files), so the cost is paid on pool fill, not per restore.
+  `sandbox-cli verify` re-hashes everything on demand.
+
+**Not guaranteed (by design, and not to be claimed):**
+
+- *Entropy.* Restoring one snapshot into N microVMs duplicates the guest kernel
+  CRNG state and any randomness cached in user space. Linux ≥ 5.18 reseeds its
+  in-kernel CRNG from the VMGenID device on resume; the reference guest kernel
+  here is **4.14.174**, which has no VMGenID. Consequences: cryptographic keys,
+  session IDs or UUIDs *generated before the snapshot* repeat across sandboxes.
+  Sandboxes must generate per-session secrets after resume (or the template must
+  carry no secrets), and a 5.18+ guest image plus VMGenID is the fix. Tracked,
+  not solved.
+- *Bit-exact execution.* Scheduler interleaving, device timing and memory
+  layout after restore are not reproducible in the strict sense.
+- *Host fingerprint.* A restored guest sees the host CPU model and kernel
+  versions the template was captured on, not the machine it runs on.

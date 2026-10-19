@@ -365,11 +365,46 @@ static void test_verify(void) {
     if (!m) abort();
     m->version = 1;
     if (sha256_file(state, m->vmstate_sha256) < 0) abort();
+
+    // #22: the template's disk image is part of the captured state. Bind it the
+    // way create_snapshot_template does, then prove that swapping the image --
+    // same size and different content -- is refused.
+    char rootfs[PATH_MAX];
+    snprintf(rootfs, sizeof(rootfs), "%s/rootfs.ext4", vdir);
+    fd = open(rootfs, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) abort();
+    if (ftruncate(fd, 8 * 4096) < 0) abort();
+    uint8_t rv = 0x5a;
+    if (pwrite(fd, &rv, 1, 4096) != 1) abort();
+    close(fd);
+    struct stat rst;
+    if (stat(rootfs, &rst) < 0) abort();
+    m->rootfs_size = (uint64_t)rst.st_size;
+    if (sha256_file(rootfs, m->rootfs_sha256) < 0) abort();
+
     snprintf(mp, sizeof(mp), "%s/manifest.bin", vdir);
     CHECK_RC(write_manifest(mp, m), "write verify manifest");
     free(m);
 
     assert(snapshot_verify("vtpl") == 0);
+
+    // Same size, different content: only the digest can catch this.
+    fd = open(rootfs, O_WRONLY);
+    if (fd < 0) abort();
+    uint8_t rv2 = 0x5b;
+    if (pwrite(fd, &rv2, 1, 4096) != 1) abort();
+    close(fd);
+    assert(snapshot_verify("vtpl") < 0);
+    // Put it back so the memory test below sees a valid image.
+    fd = open(rootfs, O_WRONLY);
+    if (fd < 0) abort();
+    if (pwrite(fd, &rv, 1, 4096) != 1) abort();
+    close(fd);
+    assert(snapshot_verify("vtpl") == 0);
+    // A missing image is a missing template, not a half-template.
+    assert(unlink(rootfs) == 0);
+    assert(snapshot_verify("vtpl") < 0);
+
     // Corrupt memory.snap -> mismatch -> refused.
     fd = open(mem, O_WRONLY);
     if (fd < 0) abort();

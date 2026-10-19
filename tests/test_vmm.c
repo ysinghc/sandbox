@@ -227,6 +227,33 @@ static void test_pool_e2e(void) {
 }
 
 int main(void) {
+    // #22: the /snapshot/load body decides what the guest sees after resume
+    // (its clock, its NIC, its vsock UDS). It is pure string construction, so
+    // it is asserted here, before the skip checks, and therefore runs on hosted
+    // CI too.
+    {
+        char req[1024];
+        unsetenv("SANDBOX_FC_CLOCK_REALTIME");  // test the default, not the escape hatch
+        int n = vmm_build_load_request(req, sizeof(req), "tapX");
+        bool ok = n > 0 &&
+                  strstr(req, "\"host_dev_name\": \"tapX\"") != NULL &&
+                  strstr(req, "\"vsock_override\": {\"uds_path\": \"/vsock.sock\"}") != NULL;
+#if defined(__x86_64__)
+        ok = ok && strstr(req, "\"clock_realtime\": true") != NULL;
+#else
+        // x86_64-only field: Firecracker rejects it as unknown elsewhere.
+        ok = ok && strstr(req, "clock_realtime") == NULL;
+#endif
+        char tiny[16];
+        bool trunc_ok =
+            vmm_build_load_request(tiny, sizeof(tiny), "tapX") == -1;
+        if (!ok || !trunc_ok) {
+            fprintf(stderr, "FAIL load request: %s\n", n > 0 ? req : "(build failed)");
+            return 1;
+        }
+        printf("[test] %-28s PASS\n", "load request: clock/tap/vsock");
+    }
+
     if (geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0 ||
         !have_file(asset_path("SANDBOX_KERNEL", ASSET_KERNEL)) ||
         !have_file(asset_path("SANDBOX_ROOTFS", ASSET_ROOTFS)) ||

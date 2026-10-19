@@ -225,6 +225,35 @@ static int verify_files(const char* template_name, const snap_manifest_t* m) {
                 template_name, got, want);
         return -1;
     }
+
+    // #22: the disk image is part of the template. A restored guest keeps the
+    // page cache and inode state of the image it booted from, so a swapped
+    // rootfs changes the sandbox without touching memory.snap or vmstate.
+    snprintf(path, sizeof(path), "%s/%s/rootfs.ext4", snapshot_root(), template_name);
+    struct stat rst;
+    if (stat(path, &rst) < 0) {
+        fprintf(stderr, "[snapshot] verify %s: cannot stat %s\n", template_name, path);
+        return -1;
+    }
+    if (m->rootfs_size && (uint64_t)rst.st_size != m->rootfs_size) {
+        fprintf(stderr,
+                "[snapshot] verify %s: rootfs.ext4 is %lld bytes, snapshot expects %llu\n",
+                template_name, (long long)rst.st_size,
+                (unsigned long long)m->rootfs_size);
+        return -1;
+    }
+    if (sha256_file(path, digest) < 0) {
+        fprintf(stderr, "[snapshot] verify %s: cannot read %s\n", template_name, path);
+        return -1;
+    }
+    if (memcmp(digest, m->rootfs_sha256, 32) != 0) {
+        sha256_hex(digest, got);
+        sha256_hex(m->rootfs_sha256, want);
+        fprintf(stderr,
+                "[snapshot] verify %s: rootfs hash mismatch (got %s want %s)\n",
+                template_name, got, want);
+        return -1;
+    }
     return 0;
 }
 
@@ -241,6 +270,7 @@ typedef struct {
     char   name[64];
     dev_t  mem_dev; ino_t mem_ino; off_t mem_size; time_t mem_mtime;
     dev_t  vms_dev; ino_t vms_ino; off_t vms_size; time_t vms_mtime;
+    dev_t  rfs_dev; ino_t rfs_ino; off_t rfs_size; time_t rfs_mtime;
     bool   valid;
 } verify_cache_t;
 
@@ -255,14 +285,15 @@ static bool verify_sig_eq(dev_t dev, ino_t ino, off_t size, time_t mtime,
 }
 
 static bool verify_cache_hit(const char* name, const struct stat* ms,
-                             const struct stat* vs) {
+                             const struct stat* vs, const struct stat* rs) {
     bool hit = false;
     pthread_mutex_lock(&g_verify_cache_lock);
     for (size_t i = 0; i < g_verify_cache_len; i++) {
         verify_cache_t* c = &g_verify_cache[i];
         if (c->valid && strcmp(c->name, name) == 0 &&
             verify_sig_eq(c->mem_dev, c->mem_ino, c->mem_size, c->mem_mtime, ms) &&
-            verify_sig_eq(c->vms_dev, c->vms_ino, c->vms_size, c->vms_mtime, vs)) {
+            verify_sig_eq(c->vms_dev, c->vms_ino, c->vms_size, c->vms_mtime, vs) &&
+            verify_sig_eq(c->rfs_dev, c->rfs_ino, c->rfs_size, c->rfs_mtime, rs)) {
             hit = true;
             break;
         }
@@ -272,7 +303,7 @@ static bool verify_cache_hit(const char* name, const struct stat* ms,
 }
 
 static void verify_cache_put(const char* name, const struct stat* ms,
-                             const struct stat* vs) {
+                             const struct stat* vs, const struct stat* rs) {
     pthread_mutex_lock(&g_verify_cache_lock);
     verify_cache_t* c = NULL;
     for (size_t i = 0; i < g_verify_cache_len; i++) {
@@ -291,6 +322,8 @@ static void verify_cache_put(const char* name, const struct stat* ms,
     c->mem_size = ms->st_size; c->mem_mtime = ms->st_mtime;
     c->vms_dev = vs->st_dev; c->vms_ino = vs->st_ino;
     c->vms_size = vs->st_size; c->vms_mtime = vs->st_mtime;
+    c->rfs_dev = rs->st_dev; c->rfs_ino = rs->st_ino;
+    c->rfs_size = rs->st_size; c->rfs_mtime = rs->st_mtime;
     c->valid = true;
     pthread_mutex_unlock(&g_verify_cache_lock);
 }
@@ -301,15 +334,17 @@ int snapshot_verify_manifest(const char* template_name,
     const char* e = getenv("SANDBOX_VERIFY_SNAPSHOT");
     if (e && (strcmp(e, "0") == 0 || strcmp(e, "false") == 0)) return 0;
 
-    char mpath[PATH_MAX], vpath[PATH_MAX];
-    struct stat ms, vs;
+    char mpath[PATH_MAX], vpath[PATH_MAX], rpath[PATH_MAX];
+    struct stat ms, vs, rs;
     snprintf(mpath, sizeof(mpath), "%s/%s/memory.snap", snapshot_root(), template_name);
     snprintf(vpath, sizeof(vpath), "%s/%s/vmstate", snapshot_root(), template_name);
-    bool have_sig = stat(mpath, &ms) == 0 && stat(vpath, &vs) == 0;
-    if (have_sig && verify_cache_hit(template_name, &ms, &vs)) return 0;
+    snprintf(rpath, sizeof(rpath), "%s/%s/rootfs.ext4", snapshot_root(), template_name);
+    bool have_sig = stat(mpath, &ms) == 0 && stat(vpath, &vs) == 0 &&
+                    stat(rpath, &rs) == 0;
+    if (have_sig && verify_cache_hit(template_name, &ms, &vs, &rs)) return 0;
 
     int rc = verify_files(template_name, manifest);
-    if (rc == 0 && have_sig) verify_cache_put(template_name, &ms, &vs);
+    if (rc == 0 && have_sig) verify_cache_put(template_name, &ms, &vs, &rs);
     return rc;
 }
 
@@ -476,27 +511,44 @@ int create_snapshot_template(const char* template_name, const template_config_t*
         return -1;
     }
 
-    char manifest_path[PATH_MAX];
-    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.bin", temp_dir);
-    int rc = write_manifest(manifest_path, manifest);
     uint32_t new_version = manifest->version;
-    free(manifest);
-    if (rc < 0) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
 
     // Bundle kernel+rootfs so restores are store-contained (same jail paths).
     char dst[PATH_MAX];
     snprintf(dst, sizeof(dst), "%s/vmlinux", temp_dir);
     if (copy_into(config->kernel_path, dst) < 0) {
+        free(manifest);
         vmm_destroy(vm);
         rm_rf(temp_dir);
         return -1;
     }
-    snprintf(dst, sizeof(dst), "%s/rootfs.ext4", temp_dir);
-    if (copy_into(config->rootfs_path, dst) < 0) {
+    char rootfs_dst[PATH_MAX];
+    snprintf(rootfs_dst, sizeof(rootfs_dst), "%s/rootfs.ext4", temp_dir);
+    if (copy_into(config->rootfs_path, rootfs_dst) < 0) {
+        free(manifest);
         vmm_destroy(vm);
         rm_rf(temp_dir);
         return -1;
     }
+    // #22: pin the image the captured memory state booted from. Computed here,
+    // at build time, so the restore path only has to hash it once (the
+    // verify-once cache) instead of on every restore.
+    struct stat rst;
+    if (stat(rootfs_dst, &rst) < 0 ||
+        sha256_file(rootfs_dst, manifest->rootfs_sha256) < 0) {
+        fprintf(stderr, "[snapshot] failed to hash %s\n", rootfs_dst);
+        free(manifest);
+        vmm_destroy(vm);
+        rm_rf(temp_dir);
+        return -1;
+    }
+    manifest->rootfs_size = (uint64_t)rst.st_size;
+
+    char manifest_path[PATH_MAX];
+    snprintf(manifest_path, sizeof(manifest_path), "%s/manifest.bin", temp_dir);
+    int rc = write_manifest(manifest_path, manifest);
+    free(manifest);
+    if (rc < 0) { vmm_destroy(vm); rm_rf(temp_dir); return -1; }
 
     // Debug artifact: preserve the template VM's boot serial (guest init +
     // Firecracker device logs before capture). Best-effort.

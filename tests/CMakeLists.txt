@@ -1,3 +1,11 @@
+# Tests must actually assert.
+#
+# CMake's Release flags (the default in CI) add -DNDEBUG, which compiles every
+# assert() out. test_snapshot alone relies on 34 of them, so its "PASS" under
+# Release was proving nothing. Undefine it for the test binaries: an assertion
+# that cannot fire is worse than no test, because it reads like coverage.
+add_compile_options(-UNDEBUG)
+
 # Phase 1: pool concurrency + invariant test (run under TSan via build-tsan).
 add_executable(test_pool test_pool.c)
 target_include_directories(test_pool PRIVATE ../include)

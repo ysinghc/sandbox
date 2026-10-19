@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "vsock_peer.h"
@@ -130,6 +131,23 @@ static void serve(int cfd) {
     }
     say("SANDBOX-ENV-END\n");
     got_env = 1;
+
+    // #22: report the guest's wall clock once per injection. After a restore the
+    // guest resumes with whatever the snapshot captured, so this line is the
+    // in-guest evidence that the host's clock_realtime load field did its job
+    // (tests/test_ipc.c compares it against host time).
+    {
+        struct timespec ts;
+        if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+            char m[64];
+            int n = snprintf(m, sizeof(m), "SANDBOX-GUEST-CLOCK epoch=%lld\n",
+                             (long long)ts.tv_sec);
+            if (n > 0) {
+                ssize_t w = write(g_console, m, (size_t)n);
+                (void)w;
+            }
+        }
+    }
 }
 
 int main(void) {

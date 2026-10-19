@@ -19,6 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int g_fail = 0;
@@ -64,6 +65,22 @@ static void dump_serial(vm_handle_t* vm, const char* why) {
     fclose(f);
 }
 
+// Extract the integer after `marker` from the serial log (-1 if absent).
+static long long serial_int(vm_handle_t* vm, const char* marker) {
+    if (!vm || !vm->jail_root[0]) return -1;
+    char path[PATH_MAX + 16];
+    snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
+    FILE* f = fopen(path, "r");
+    if (!f) return -1;
+    static char b[1 << 16];
+    size_t n = fread(b, 1, sizeof(b) - 1, f);
+    fclose(f);
+    b[n] = '\0';
+    const char* p = strstr(b, marker);
+    if (!p) return -1;
+    return strtoll(p + strlen(marker), NULL, 10);
+}
+
 static pool_manager_t g_pool;
 static char g_engine_sock[256];
 static char g_bc_sock[256];
@@ -97,6 +114,25 @@ int main(void) {
              (int)getpid());
     unlink(g_engine_sock);
     unlink(g_bc_sock);
+
+    // #22: the guest-clock check below is only meaningful if the snapshot is
+    // older than the tolerance it asserts. Firecracker resets the KVM clock's
+    // realtime base at load (clock_realtime); without it the guest resumes at
+    // the time of capture. Waiting here makes "capture time" and "now" far
+    // enough apart that a regression cannot hide behind test timing.
+    {
+        char vmstate[PATH_MAX];
+        snprintf(vmstate, sizeof(vmstate), "%s/e2e/vmstate", snap);
+        struct stat st;
+        if (stat(vmstate, &st) == 0) {
+            long age = (long)(time(NULL) - st.st_mtime);
+            if (age < 6) {
+                fprintf(stderr, "[test] waiting %lds so the snapshot is older "
+                                "than the clock tolerance\n", 6 - age);
+                sleep((unsigned)(6 - age));
+            }
+        }
+    }
 
     pool_set_restore_source("e2e");
     if (pool_manager_init(&g_pool, 2) < 0) {
@@ -203,6 +239,31 @@ int main(void) {
         CHECK(host_seen, "vsock: host peer authenticated as cid 2");
         CHECK(!serial_has(hvm, "SANDBOX-VSOCK-REJECT"),
               "vsock: the host connection was not rejected");
+
+        // #22: the guest must see host wall-clock time, not the time the
+        // template was captured. The snapshot is at least 6 s old by now (see
+        // main), so a missing clock_realtime on /snapshot/load would show up as
+        // a skew of >= 6 s and fail here.
+        long long guest_now = -1;
+        for (int i = 0; i < 100; i++) {
+            guest_now = serial_int(hvm, "SANDBOX-GUEST-CLOCK epoch=");
+            if (guest_now > 0) break;
+            usleep(10000);
+        }
+        if (guest_now <= 0) dump_serial(hvm, "guest clock marker missing");
+        CHECK(guest_now > 0, "clock: guest reported its clock");
+#if defined(__x86_64__)
+        long long skew = guest_now - (long long)time(NULL);
+        fprintf(stderr, "[test] guest clock skew vs host: %llds\n", skew);
+        CHECK(skew <= 3 && skew >= -3, "clock: guest tracks host time");
+#else
+        // clock_realtime is an x86_64-only Firecracker field, so on aarch64 the
+        // guest keeps the captured clock and the eventual fix is a guest-side
+        // time sync. Assert only that the value is plausible, and say why.
+        fprintf(stderr, "[test] aarch64: clock_realtime unsupported by FC; "
+                        "guest clock is not reset on load\n");
+        CHECK(guest_now > 1600000000LL, "clock: guest clock is plausible");
+#endif
 
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");
         CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,

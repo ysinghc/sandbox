@@ -107,9 +107,14 @@ may also require restoring the **previous templates**, not just the binaries.
 |---|---|---|
 | ≤ 0.10.x | no header_size / no digests | Rejected by ≥ 0.12.0 |
 | 0.12.0 | `header_size` + SHA-256 | Templates must be rebuilt from ≤ 0.10.x |
+| 0.13.0 | + `rootfs_sha256` / `rootfs_size` | **Rebuild templates.** A 0.12.0 manifest is refused (`header_size` mismatch); the rootfs is now integrity-checked, so the image and the captured memory state cannot drift apart |
 
 Environment variables that carry over between versions (all optional):
 `SANDBOX_LOG_LEVEL`, `SANDBOX_VSOCK_SETTLE_MS`, `SANDBOX_VSOCK_CONFIRM_MS`,
 `SANDBOX_VERIFY_SNAPSHOT`, `SANDBOX_CREATE_WORKERS`,
 `SANDBOX_MAX_CREATES_PER_SESSION`, `SANDBOX_MAX_CREATES_PER_UID`,
 `SANDBOX_CGROUP_*`, `SANDBOX_BROKER_*`.
+
+New in 0.13.0: `SANDBOX_FC_CLOCK_REALTIME=0` suppresses `clock_realtime` on
+`/snapshot/load` (only needed on a host kernel < 5.16, where Firecracker would
+otherwise reject the load request).

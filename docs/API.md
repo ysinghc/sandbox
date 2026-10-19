@@ -135,6 +135,36 @@ sandbox-cli verify --template NAME
 - `verify` runs the snapshot integrity check (`§10.10`) for a template and
   returns `0` if the manifest and files match, `1` otherwise.
 
+## Determinism
+
+"Deterministic" here means **a reproducible environment and start state**, not
+bit-exact execution. For a given template (identified by `manifest.bin`, which
+binds `memory.snap`, `vmstate` and `rootfs.ext4` by SHA-256), every sandbox
+starts from the same state:
+
+- **Wall clock**: the guest starts at current host time, not the template's
+  capture time (`clock_realtime` on `/snapshot/load`; x86_64, host kernel
+  ≥ 5.16). A template is therefore safe to keep for as long as you like.
+- **Installed software and files**: identical, because all three files are
+  hash-verified before the guest is resumed; a template cannot be changed
+  silently. `sandbox-cli verify --template NAME` re-checks on demand.
+- **Host view**: the guest sees the CPU model and kernel it was captured on.
+
+What is **not** guaranteed:
+
+- **Entropy and unique IDs.** Firecracker restores memory, so a template's
+  kernel CRNG state (and any random bytes read before capture) repeat across
+  sandboxes. Generate per-session secrets *after* the sandbox starts, and never
+  bake secrets into a template. This is fixed only by a guest kernel ≥ 5.18
+  (VMGenID reseeding); the reference image (4.14) predates it.
+- **Timing/interleaving**: scheduler and device timing after resume are not
+  reproducible, so lock-free races that a test wins on one run may lose on the
+  next. That is a property of the workload, not of the sandbox.
+
+A sandbox is therefore the right place for work that must *start* from a known
+state (builds, tests, reproducible agent sessions), and the wrong place to store
+long-lived secrets that were captured in a template.
+
 ## Wire protocol
 
 Unix socket, length-prefixed protobuf messages (see
