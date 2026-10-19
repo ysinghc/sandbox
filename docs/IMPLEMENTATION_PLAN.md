@@ -120,6 +120,49 @@ Broker TLS verification is **on by default** (`CURLOPT_SSL_VERIFYPEER=1`,
 token already comes from `getrandom()` (`/dev/urandom` is a fallback). Both
 were ticked off with evidence rather than "fixed".
 
+### C11 — the privileged suite was green while executing nothing (WAS BELIEVED VERIFIED)
+
+`privileged-e2e.yml` reported success from its first run, but `tmpl_setup`
+exited in **0.01 s** and `pool`/`vmm`/`ipc` skipped behind it (only `network`
+did real work). The e2e scripts were unaffected because `benchmark.sh` builds
+its own template.
+
+Root cause: the tests were invoked as `sudo -E`, and sudo resets the
+environment, so the roots ctest supplies through its `ENVIRONMENT` property
+(`SANDBOX_SNAPSHOT_ROOT`, `SANDBOX_JAIL_ROOT`) never reached `make_template`. A
+test missing its roots SKIPs with exit 0 — deliberately, so an unprivileged
+`ctest` stays honest — so the whole chain looked green.
+
+Fix: no `sudo` inside the test commands; the *suite* runs as root (the labs job
+does, and `docs/TESTING.md` documents it), so ctest's environment arrives
+intact. `privileged-e2e-run.yml` now runs the set with `-V` and **fails the job
+if any of those tests report Skipped/Not Run** — a skipped privileged test is a
+green no-op and must not pass.
+
+Lesson applied elsewhere: never let "passed" stand for "ran". Assert execution,
+not just exit status.
+
+### C12 — #10: a per-session token cannot authenticate host→guest (C4 WAS WRONG)
+
+C4's "reuse `session_token`" does not work in the direction that matters. The
+token would have to reach the guest *over the channel being authenticated*, and
+a snapshot template is built once and restored per session, so nothing
+per-session can be baked into the guest. Guest→host needs no token either: each
+VM has its own vsock UDS, so provenance is already per-VM.
+
+What actually authenticates the host is the **peer CID**. Only the hypervisor's
+proxy presents `VMADDR_CID_HOST` (2), and a guest process cannot forge it:
+`connect()` to CID 2 from inside the guest is routed out to the host, never back
+into the guest's own listener.
+
+Second correction: the guest kernel here is **4.14.174**, and guest-local vsock
+(`VMADDR_CID_LOCAL`) only exists from Linux **5.6**. An in-guest self-test that
+connects to its own listener therefore *blocks in `connect()`* — the first
+attempt at this test wedged the agent's serve loop. The negative direction
+cannot be produced inside this guest at all, so it is verified on the host
+(`tests/test_vsock_peer.c` against a real loopback peer, cid 1) and the guest
+asserts the positive direction (`SANDBOX-VSOCK-HOST cid=2` in serial).
+
 ### Sharper alternatives adopted
 
 - **#19** — checksums already ship for both architectures (`.sha256` since
@@ -153,14 +196,15 @@ were ticked off with evidence rather than "fixed".
 | Perf fixes (`snapshot_manager.c`, `vmm_manager.c`) | ✅ `e5a5cc7` |
 | `jail_cleanup` shell-injection fix (#5) | ✅ `d2eff09` — **plus three more call sites the plan missed** |
 | SPDX headers + `scripts/check-spdx.sh` + CI gate (#8) | ✅ `085d594` — 66 files |
-| `tests/e2e/smoke.sh` + `tests/e2e/latency.sh`, gated `privileged-e2e.yml` (#20) | ✅ `639b25e` — inert until runners exist |
+| `tests/e2e/smoke.sh` + `tests/e2e/latency.sh`, gated `privileged-e2e.yml` (#20) | ✅ **executed on a real runner**: warm 0.18 ms, provisioned 45.33 ms |
 | Threat model + §12.2 close-out (#21, #5) | ✅ `13b36ce`/later |
 | `credentials.conf` permissions gate (#3) | ✅ + `test_broker` coverage |
 | Seccomp allow-list regression test (#1) | ✅ `tests/test_seccomp.c` — runs unprivileged in CI |
 | Chroot `..`-escape assertion (#2) | ✅ `jailer_probe` exit 12 |
 | `scripts/install.sh` + release docs (#19) | ✅ verified offline against a staged tree |
-| M1 ARM timer (#6), vsock auth (#10) | ⏳ need a privileged/ARM host |
-| M2 (#22–#28) | ⏳ not started; #22 clock fix unverifiable without a VM |
+| vsock peer authentication (#10) | ✅ guest+host code; classifier unit-tested on the host, host CID asserted in-guest |
+| M1 ARM timer (#6) | ⏳ needs an ARM host (no aarch64 runner yet) |
+| M2 (#22–#28) | ⏳ not started; #22 clock fix needs a booting guest to verify |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -199,17 +243,25 @@ nftables ship silently.
 - `tests/e2e/latency.sh` — runs the benchmark once and asserts **warm < 5 ms** and
   **cold < 250 ms** (flags override). *Replaces the planned `bench_warm.sh` +
   `bench_provisioned.sh`, which would each have re-run the full harness.*
-- `.github/workflows/privileged-e2e.yml` — matrix over `[self-hosted, sandbox-x86]`
-  and `[self-hosted, sandbox-arm64]`, gated by
-  `if: vars.PRIVILEGED_RUNNERS == 'true'`. **Gated on purpose:** with no runners
-  registered, an unguarded job queues forever and blocks PRs. Enable with
-  `gh variable set PRIVILEGED_RUNNERS --body true` once the runners exist.
+- `.github/workflows/privileged-e2e.yml` — per-arch jobs (a `matrix` is not a
+  valid context in `jobs.<job_id>.if`, so the two legs are separate jobs over a
+  reusable body), gated by `if: vars.PRIVILEGED_RUNNERS == 'true'` (x86_64) and
+  `vars.PRIVILEGED_ARM` (aarch64). Fork PRs are refused outright: the runner
+  executes code as root.
+- `.github/workflows/privileged-e2e-run.yml` builds the guest image from the
+  checkout, runs the root/KVM tests with `-V`, and **fails if any of them
+  skipped** (C11).
 - `docs/TESTING.md` §"Privileged runners" — the host prerequisites (KVM, tun,
-  nftables, Firecracker, guest assets, dev-capable workdir).
+  nftables, Firecracker, guest assets, dev-capable workdir) and the registration
+  sequence.
 
-**Remaining (needs the user's host):** register the two runners and set the
-variable. The aarch64 job will expose #6 — that is intentional; it should fail
-loudly until #6 is fixed.
+**Verified on the operator's host** (`sandbox-x86-01`, root service): warm
+**0.18 ms**, provisioned **45.33 ms** (budget 5 ms / 250 ms); `tmpl_setup`
+really boots (2.01 s); `pool`, `network`, `network_cleanup`, `vmm`, `ipc`,
+`cgroup` execute rather than skip.
+
+**Remaining:** the aarch64 leg is written but unrun — no ARM runner yet, so
+`PRIVILEGED_ARM` stays unset. It will expose #6 when one exists.
 
 ### #8 — SPDX headers + CI gate
 
@@ -248,10 +300,25 @@ parsing: refuse if `st_mode & 0o077` or `st_uid != getuid()`. Unit-test in
 `tests/test_broker.c` (exists). Document in `docs/CONFIGURATION.md`.
 
 ### #10 — Authenticate vsock payloads
-Reuse the existing per-create `session_token` (C4). Host sends
-`nonce || HMAC-SHA256(session_token, nonce)` before the env payload; the guest
-agent (`scripts/sandbox-agent.c`, `ENV_PORT 5001`) verifies and closes on
-mismatch. No new key material, no bootstrap problem.
+**Delivered (C12).** The channel is authenticated by **peer CID**, not a token:
+`include/vsock_peer.h` + `src/vsock_peer.c` hold the classifier
+(`vsock_peer_is_host()`), and the agent
+(`scripts/sandbox-agent.c`, `ENV_PORT 5001`) accepts only a peer whose CID is
+`VMADDR_CID_HOST`; anything else is closed and logged as
+`SANDBOX-VSOCK-REJECT cid=<n>`. The classifier is freestanding so the same file
+is linked into a host test and into the static guest agent (built by
+`scripts/build-custom-rootfs.sh`).
+
+Verification is split because the guest cannot test it from the inside:
+- host: `tests/test_vsock_peer.c` — decision table plus a real AF_VSOCK
+  loopback peer (kernel reports cid 1) that must be refused; unprivileged, so it
+  runs in hosted CI;
+- guest: the agent logs `SANDBOX-VSOCK-HOST cid=2` on the first accepted
+  connection, asserted by `tests/test_ipc.c`, which proves the CID it reads is
+  real and is the host's.
+
+Rejected from the plan: the `session_token` HMAC (C4) — the token cannot reach
+the guest over the channel it would authenticate, across a snapshot boundary.
 
 ### #6 — aarch64 arch-timer after restore
 `scripts/sandbox-agent.c:11-20` documents the workaround: the arch timer does not
@@ -361,20 +428,16 @@ helper; also enables `pivot_root`) · **#11** per-tenant quotas incl. storage by
 Done     perf fixes; e2e smoke + latency harness; 4 shell-outs removed; SPDX sweep + CI gate
 Done     #21 threat model + §12.2 close-out; #1 seccomp regression test; #2 chroot ".." assertion
 Done     #3 credentials.conf permissions gate; #19 scripts/install.sh + prebuilt-release docs
-Deferred #20 privileged e2e — runners switched off by the operator; set PRIVILEGED_RUNNERS=true
-         and register the host when it is ready. The workflow is correct and skipped, not broken.
-Next     the whole remaining critical path needs /dev/kvm to *verify*:
-           #10 vsock authentication      — host + guest code; a guest rebuild is what proves it
-           #6  aarch64 arch timer        — needs an ARM host (native, or the ubuntu-24.04-arm runner)
-           #22 x86_64 clock_realtime     — trivial code, but only provable with a guest that boots
-           #23 workspace bind-mount + TTL — the M2 product core
-         Code can be written and compile-checked here; treat it as unverified until the privileged
-         host is back, and do not claim a latency/reliability number for it.
+Done     #20 privileged e2e now *runs*: warm 0.18 ms / provisioned 45.33 ms on sandbox-x86-01,
+         with a gate that fails the job if a privileged test skips (C11)
+Done     #10 vsock peer authentication (C12), verified host-side + in-guest
+Next     #6  aarch64 arch timer — needs an ARM host; register one and set PRIVILEGED_ARM
+Next     #22 x86_64 clock_realtime (guest boots now, so this is observable) → #23 workspace + TTL
+         → #24 guest RPC → #25/#26 → #27 control-plane API → #28 MCP gateway
+         (#4, #12, #17, #9, #11, #7, #13–#16, #18 follow in the burn-down order)
 ```
 
-> **Note on the order.** The plan's burn-down assumed the privileged host was available from Day 3.
-> With runners off, the honest split is: M0/M1 hygiene (done above) is verifiable anywhere; everything
-> from #10 onward has a *runtime* claim attached (a timer works, a clock is right, a workspace
-> persists) that this environment cannot confirm. Writing it is still useful — it unblocks a
-> one-shot verification pass — but the plan should not report those items as *done* until they have
-> been observed once.
+> **Note on the order.** The privileged host came online on Day 3, and it changed what "done"
+> means: the labs job now executes the root/KVM tests and fails if they skip, so an item can be
+> *observed* rather than merely written. Items are only marked done here after a green run that
+> shows them executing (C11 is the counter-example that made this rule).

@@ -70,9 +70,9 @@ Three boundaries matter:
 | T7 | Guest reads an upstream credential | credentials live only in the broker; the guest sees just its session token | by design |
 | T8 | Local user reads `credentials.conf` | broker now refuses a group/world-readable or foreign-owned file (#3) | `tests/test_broker.c` |
 | T9 | Upstream TLS interception / MITM | `CURLOPT_SSL_VERIFYPEER=1`, `VERIFYHOST=2` by default (`src/broker/core.c:343-345`); off only via `SANDBOX_BROKER_TLS_VERIFY=0` | default-safe |
-| T10 | A guest forges host→guest control traffic on vsock :5001 | **none today** — any in-guest process can connect and inject env | **open (#10)** |
+| T10 | A guest forges host→guest control traffic on vsock :5001 | the agent accepts only a peer whose vsock CID is `VMADDR_CID_HOST`; anything else is closed and logged (`include/vsock_peer.h`, `scripts/sandbox-agent.c`). A guest cannot forge CID 2: `connect()` to it is routed out to the host, never back to the guest's listener | fixed (#10): host test with a real loopback peer + in-guest `cid=2` assertion |
 | T11 | Token guessing | 32 bytes from `getrandom()`, `/dev/urandom` only as fallback (`src/ipc_server.c:290`) | adequate |
-| T12 | Stolen token replayed by another guest | the token is per-session and validated against the engine; no binding to the peer VM | **open** (fold into #10) |
+| T12 | Stolen token replayed by another guest | the token is per-session and validated against the engine; no binding to the peer VM. The vsock control channel is now peer-CID authenticated (T10), but the broker token itself still has no VM binding | partially mitigated; VM binding stays open for #17 |
 
 ### 4.3 Caller → engine
 
@@ -94,14 +94,15 @@ Three boundaries matter:
 
 ## 5. Residual risk, ranked
 
-1. **#10 — vsock control channel is unauthenticated (T10/T12).** The guest is
-   already untrusted, so injecting env into *its own* VM is low-impact today;
-   it becomes real when #24 adds `exec`/file RPC over the same transport, and
-   under multi-tenancy (#17). Fix before #24.
-2. **#9 — the daemon is one big root TCB (T4/T5/T15).** Every mitigation above
+1. **#9 — the daemon is one big root TCB (T4/T5/T15).** Every mitigation above
    runs inside `sandboxd` (root). Splitting the privileged operations into a
    small helper is what makes the seccomp/capability surface auditable, and
    lets the jail move to `pivot_root`.
+2. **T12 — the broker token is not bound to a VM.** The vsock control channel is
+   peer-CID authenticated now, but a token stolen inside one sandbox still
+   authorises broker requests from any guest that can present it. Real under
+   multi-tenancy (#17); cheap to bind by including the VM identity in the token
+   claims when #24 lands.
 3. **T5 — ambient `CAP_SYS_PTRACE`.** Justified and currently inert (seccomp
    blocks `ptrace`), but it is a single filter edit away from being dangerous;
    assert the two invariants together if either changes.
