@@ -55,7 +55,20 @@ jobs:
         run: cmake --build build -j
 
       - name: Unit tests that need no privileges
-        run: ctest --test-dir build --output-on-failure -E "pool|network|tmpl_setup|vmm|ipc|cgroup"
+        run: |
+          set -euo pipefail
+          # -V so that a SKIP is visible and can be judged. This runner is root
+          # with KVM, so the only legitimate skips are environmental: user
+          # namespaces blocked (e.g. a container's seccomp profile) and
+          # userfaultfd denied. Anything else means a test did not execute.
+          ctest --test-dir build -V \
+            -E "pool|network|tmpl_setup|vmm|ipc|cgroup" \
+            | tee /tmp/ctest-all.log
+          if grep -E 'SKIP' /tmp/ctest-all.log \
+               | grep -vE 'userns id-mapping|user namespaces are restricted|uffd|userfaultfd'; then
+            echo "::error::a test skipped for an unexpected reason"
+            exit 1
+          fi
 
       # The whole point of a self-hosted runner: the tests that cannot run on
       # hosted CI. They need root, /dev/kvm, Firecracker and the guest assets.
