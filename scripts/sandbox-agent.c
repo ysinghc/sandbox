@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -136,16 +137,27 @@ static void serve(int cfd) {
     // guest resumes with whatever the snapshot captured, so this line is the
     // in-guest evidence that the host's clock_realtime load field did its job
     // (tests/test_ipc.c compares it against host time).
+    //
+    // Deliberately the syscall, not clock_gettime(3): the libc call reads the
+    // vDSO, whose data page was captured in the snapshot, and a restored vDSO
+    // can leave the pvclock seqlock reading as in-flux -- the read then spins or
+    // fails, which is exactly the kind of silent no-marker flake this test hit
+    // once. The syscall goes to the kernel timekeeper and cannot be stale.
     {
         struct timespec ts;
-        if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-            char m[64];
-            int n = snprintf(m, sizeof(m), "SANDBOX-GUEST-CLOCK epoch=%lld\n",
-                             (long long)ts.tv_sec);
-            if (n > 0) {
-                ssize_t w = write(g_console, m, (size_t)n);
-                (void)w;
-            }
+        char m[96];
+        long rc = syscall(SYS_clock_gettime, CLOCK_REALTIME, &ts);
+        int n;
+        if (rc == 0) {
+            n = snprintf(m, sizeof(m), "SANDBOX-GUEST-CLOCK epoch=%lld\n",
+                         (long long)ts.tv_sec);
+        } else {
+            n = snprintf(m, sizeof(m), "SANDBOX-GUEST-CLOCK-FAIL errno=%d\n",
+                         errno);
+        }
+        if (n > 0) {
+            ssize_t w = write(g_console, m, (size_t)n);
+            (void)w;
         }
     }
 }

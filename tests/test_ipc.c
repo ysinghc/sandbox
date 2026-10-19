@@ -33,52 +33,79 @@ static int g_fail = 0;
         }                                             \
     } while (0)
 
-// Scan a restored VM's serial log for a marker (guest-side observability).
-static int serial_has(vm_handle_t* vm, const char* needle) {
-    if (!vm || !vm->jail_root[0]) return 0;
+// Read the whole serial log. It grows with SANDBOX-TICK, and a marker beyond a
+// fixed window is indistinguishable from a missing one — a 64 KiB cap turned a
+// real value into "missing marker" once. Bounded so a runaway log cannot eat the
+// test host.
+#define SERIAL_MAX (8u << 20)
+static char* serial_text(vm_handle_t* vm, size_t* out_len) {
+    if (!vm || !vm->jail_root[0]) return NULL;
     char path[PATH_MAX + 16];
     snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
     FILE* f = fopen(path, "r");
-    if (!f) return 0;
-    static char buf[1 << 16];
-    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    if (!f) return NULL;
+    size_t cap = 1 << 16, n = 0;
+    char* b = malloc(cap);
+    if (!b) { fclose(f); return NULL; }
+    for (;;) {
+        if (n + 1 >= cap) {
+            if (cap >= SERIAL_MAX) break;
+            size_t ncap = cap * 2;
+            char* nb = realloc(b, ncap);
+            if (!nb) break;
+            b = nb;
+            cap = ncap;
+        }
+        size_t r = fread(b + n, 1, cap - 1 - n, f);
+        n += r;
+        if (r == 0) break;
+    }
     fclose(f);
-    buf[n] = '\0';
-    return strstr(buf, needle) != NULL;
+    b[n] = '\0';
+    if (out_len) *out_len = n;
+    return b;
+}
+
+// Scan a restored VM's serial log for a marker (guest-side observability).
+static int serial_has(vm_handle_t* vm, const char* needle) {
+    char* b = serial_text(vm, NULL);
+    if (!b) return 0;
+    int hit = strstr(b, needle) != NULL;
+    free(b);
+    return hit;
 }
 
 // Print the (bounded) serial log so the CI log shows the guest's own account of
 // a failed guest-side assertion.
 static void dump_serial(vm_handle_t* vm, const char* why) {
-    if (!vm || !vm->jail_root[0]) return;
-    char path[PATH_MAX + 16];
-    snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
-    FILE* f = fopen(path, "r");
-    if (!f) {
-        fprintf(stderr, "--- serial.log (%s) unavailable ---\n", path);
+    size_t n = 0;
+    char* b = serial_text(vm, &n);
+    if (!b) {
+        fprintf(stderr, "--- serial.log for %p unavailable ---\n", (void*)vm);
         return;
     }
-    static char b[1 << 16];
-    size_t n = fread(b, 1, sizeof(b) - 1, f);
-    b[n] = '\0';
-    fprintf(stderr, "--- serial.log (%s) [%s] ---\n%s\n--- end ---\n", path, why, b);
-    fclose(f);
+    fprintf(stderr, "--- serial.log [%s] (%zu bytes) ---\n", why, n);
+    if (n <= (128u << 10)) {
+        fwrite(b, 1, n, stderr);
+    } else {
+        // Head and tail: the boot/ready sequence is at the start, the assertion
+        // failure is at the end.
+        fwrite(b, 1, 48u << 10, stderr);
+        fprintf(stderr, "\n--- [%zu bytes elided] ---\n", n - (96u << 10));
+        fwrite(b + (n - (48u << 10)), 1, 48u << 10, stderr);
+    }
+    fprintf(stderr, "--- end ---\n");
+    free(b);
 }
 
 // Extract the integer after `marker` from the serial log (-1 if absent).
 static long long serial_int(vm_handle_t* vm, const char* marker) {
-    if (!vm || !vm->jail_root[0]) return -1;
-    char path[PATH_MAX + 16];
-    snprintf(path, sizeof(path), "%s/serial.log", vm->jail_root);
-    FILE* f = fopen(path, "r");
-    if (!f) return -1;
-    static char b[1 << 16];
-    size_t n = fread(b, 1, sizeof(b) - 1, f);
-    fclose(f);
-    b[n] = '\0';
+    char* b = serial_text(vm, NULL);
+    if (!b) return -1;
     const char* p = strstr(b, marker);
-    if (!p) return -1;
-    return strtoll(p + strlen(marker), NULL, 10);
+    long long v = p ? strtoll(p + strlen(marker), NULL, 10) : -1;
+    free(b);
+    return v;
 }
 
 static pool_manager_t g_pool;
