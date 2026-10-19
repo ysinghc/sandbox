@@ -61,6 +61,12 @@ builds both architectures natively from one tag.
   `sudo -E`, which drops the environment, so the fixture roots never arrived and
   `tmpl_setup` plus every test depending on it skipped with exit 0. The suite now
   runs as root and the job **fails if any privileged test skips**.
+- **Security**: the jailer's seccomp default action was selected with
+  `#ifdef NDEBUG`, so a Debug build (or any target compiled with `-UNDEBUG`)
+  silently installed the *permissive* filter — forbidden syscalls returned
+  `EPERM` instead of killing the process. The default is now always
+  `SCMP_ACT_KILL_PROCESS`; tests that need to observe the denial opt in with
+  `SANDBOX_SECCOMP_ACTION=errno`.
 - **Tests were not asserting in Release builds**: CMake defines `NDEBUG`, which
   compiles `assert()` out, so 34 assertions in `test_snapshot` never ran. Test
   binaries now build with `-UNDEBUG`; the rootfs-digest checks above are covered

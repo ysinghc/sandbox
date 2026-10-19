@@ -619,15 +619,21 @@ int spawn_firecracker_jailed(const char* vm_id, const jailer_config_t* config) {
 
 ### 5.5 Jailer Seccomp Policy
 
-**Default action:** Build-time toggle
+**Default action:** always `SCMP_ACT_KILL_PROCESS`
 
 ```c
-#ifdef NDEBUG
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_KILL_PROCESS  // Release
-#else
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_ERRNO(EPERM)  // Debug
-#endif
+// runtime policy, not a compiler flag; SANDBOX_SECCOMP_ACTION=errno opts into
+// EPERM for tests that need to observe the denial
+static uint32_t jailer_seccomp_default(void) { ... }
 ```
+
+The document originally made this a **build-time toggle** (`#ifdef NDEBUG`).
+That is kept in the record because it was implemented that way for a while and
+it is a real hazard: a Debug build — or any target compiled with `-UNDEBUG` —
+silently installed the *permissive* filter, so forbidden syscalls returned
+`EPERM` instead of killing the VMM. Production was only safe by accident of the
+Release flags. The action is now fixed to `KILL_PROCESS`; tests opt into
+`SCMP_ACT_ERRNO(EPERM)` with `SANDBOX_SECCOMP_ACTION=errno`.
 
 **Whitelist (Firecracker VMM process):**
 

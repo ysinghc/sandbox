@@ -96,6 +96,7 @@ production-oriented):
 | `SANDBOX_FC_SECCOMP` | `0` disables the Firecracker-internal seccomp (lab only). |
 | `SANDBOX_FC_PCI` | Enable PCI (`pci=on`) for the VMM when set. |
 | `SANDBOX_VERIFY_SNAPSHOT` | On restore, verify the memory snapshot against the manifest. |
+| `SANDBOX_SECCOMP_ACTION` | `errno` makes the jailer's seccomp filter return `EPERM` instead of killing the process. For tests and debugging only — never in production. |
 | `NOTIFY_SOCKET` | Set by systemd; enables `sd_notify` readiness/watchdog. |
 
 ## Credential store format

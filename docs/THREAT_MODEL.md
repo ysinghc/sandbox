@@ -59,7 +59,7 @@ Three boundaries matter:
 | T1 | Path traversal out of the jail | `chroot()` + `chdir("/")` (`src/jailer.c:266-267`); kernel resolves `..` inside the new root | tested (`jailer_probe` exit 12, #2) |
 | T2 | Escape via an inherited fd | jailer keeps no host fd beyond the serial fd, opened pre-chroot and dup2'd | `jailer_probe` exit 10 covers the sentinel path |
 | T3 | `/proc/self/root` escape | `/proc` is **not** mounted in the jail (only `/dev/kvm`, `/dev/net/tun`, `/dev/userfaultfd`, `vmlinux`, `rootfs.ext4`, `vmstate`, `memory.snap`) | by construction (§12.2) |
-| T4 | Arbitrary syscalls from a compromised Firecracker | seccomp allow-list; the Release default action is `SCMP_ACT_KILL_PROCESS` (`src/seccomp.c:27`) | tested unprivileged in CI (`tests/test_seccomp.c`, #1) |
+| T4 | Arbitrary syscalls from a compromised Firecracker | seccomp allow-list; the default action is `SCMP_ACT_KILL_PROCESS` in every build type (`src/seccomp.c`) — it used to be chosen by `#ifdef NDEBUG`, so a Debug build silently installed the permissive filter | tested unprivileged in CI (`tests/test_seccomp.c`, #1) |
 | T5 | `CAP_SYS_PTRACE` misuse | the jailer keeps it **only** to create UFFD objects (`unprivileged_userfaultfd=0`), and `ptrace()` itself is *not* in the allow-list | **watch**: if the filter is ever loosened, this cap becomes an escape primitive |
 
 ### 4.2 Guest → network / credentials

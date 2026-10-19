@@ -36,7 +36,9 @@ static void probe_path(char* out, size_t n) {
 }
 
 // Fork+exec the probe directly (no jail): checks pre-filter assertions,
-// loads the real filter, then must die by SIGSYS on the fatal call.
+// loads the real filter, then must be denied on the fatal call. The probe opts
+// into ERRNO mode explicitly so the denial is observable; the filter's default
+// is KILL_PROCESS (see the jailer sequence, which asserts the SIGSYS).
 static int run_probe_bare(const char* mode) {
     char probe[PATH_MAX];
     probe_path(probe, sizeof(probe));
@@ -46,6 +48,7 @@ static int run_probe_bare(const char* mode) {
     pid_t pid = fork();
     if (pid < 0) { perror("fork"); abort(); }
     if (pid == 0) {
+        setenv("SANDBOX_SECCOMP_ACTION", "errno", 1);
         char* const argv[] = { probe, missing, uid, (char*)mode, NULL };
         execv(probe, argv);
         _exit(127);
@@ -55,15 +58,15 @@ static int run_probe_bare(const char* mode) {
     return status;
 }
 
-// Release (KILL_PROCESS): child must die by SIGSYS. Debug (ERRNO): child
-// exits with EPERM from the fatal call. Anything else is a failure.
+// KILL_PROCESS: the child must die by SIGSYS. ERRNO (the explicit opt-in above):
+// the child exits with EPERM from the fatal call. Anything else is a failure.
 static void check_filter_death(int status, const char* what) {
     if (WIFSIGNALED(status) && WTERMSIG(status) == SIGSYS) {
         printf("[test] %s: PASS (SIGSYS)\n", what);
         return;
     }
     if (WIFEXITED(status) && WEXITSTATUS(status) == EPERM) {
-        printf("[test] %s: PASS (EPERM, debug filter mode)\n", what);
+        printf("[test] %s: PASS (EPERM, SANDBOX_SECCOMP_ACTION=errno)\n", what);
         return;
     }
     if (WIFEXITED(status))
@@ -294,6 +297,9 @@ static bool unprivileged_userns_restricted(void) {
 static void test_jailer_sequence(void) {
     printf("[test] jailer_sequence...\n");
     fflush(stdout);
+    // The sequence asserts the *default* filter: a forbidden syscall must kill
+    // the process (SIGSYS). Keep an inherited opt-in from changing that.
+    unsetenv("SANDBOX_SECCOMP_ACTION");
     if (unprivileged_userns_restricted()) {
         printf("[test] jailer_sequence: SKIP (unprivileged user namespaces are "
                "restricted on this host, e.g. AppArmor; run as root for full "

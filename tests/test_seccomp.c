@@ -5,10 +5,10 @@
 //
 //   * every syscall the allow-list claims to permit must actually be callable
 //     — the child reaches the end instead of dying;
-//   * a syscall the policy deliberately omits (getuid) must NOT succeed. In a
-//     Release build (NDEBUG) the default action is SCMP_ACT_KILL_PROCESS, so
-//     the child dies with SIGSYS; in a Debug build it is SCMP_ACT_ERRNO(EPERM),
-//     so the call returns -1/EPERM.
+//   * a syscall the policy deliberately omits (getuid) must NOT succeed. The
+//     filter's default action is SCMP_ACT_KILL_PROCESS (always — it is a policy
+//     decision, not a build flag), so the child dies with SIGSYS; with
+//     SANDBOX_SECCOMP_ACTION=errno it would instead see -1/EPERM.
 //
 // No root is required — installing a seccomp filter is unprivileged — so this
 // runs on the hosted CI as well as the privileged runners.

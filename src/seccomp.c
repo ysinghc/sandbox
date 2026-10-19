@@ -22,15 +22,28 @@
 #include <errno.h>
 #include <sched.h>  // CLONE_VM
 #include <seccomp.h>
+#include <stdlib.h>
+#include <string.h>
 
-#ifdef NDEBUG
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_KILL_PROCESS  // Release
-#else
-  #define JAILER_SECCOMP_DEFAULT SCMP_ACT_ERRNO(EPERM)  // Debug
-#endif
+// The filter's default action is a policy decision, not a build artefact.
+//
+// It used to be `#ifdef NDEBUG`, which meant a build that happened not to define
+// NDEBUG (a Debug build, or any target compiled with -UNDEBUG) silently got the
+// *permissive* filter: forbidden syscalls returned EPERM and the process kept
+// running. That is a security property decided by a compiler flag nobody thinks
+// about, and it bit the test suite the moment the tests were made to assert.
+//
+// Default to killing the process, always; the negative tests that need to
+// observe a denial as an error (instead of a corpse) opt in explicitly.
+static uint32_t jailer_seccomp_default(void) {
+    const char* m = getenv("SANDBOX_SECCOMP_ACTION");
+    if (m && (strcmp(m, "errno") == 0 || strcmp(m, "debug") == 0))
+        return SCMP_ACT_ERRNO(EPERM);
+    return SCMP_ACT_KILL_PROCESS;
+}
 
 int apply_seccomp_filter(void) {
-    scmp_filter_ctx ctx = seccomp_init(JAILER_SECCOMP_DEFAULT);
+    scmp_filter_ctx ctx = seccomp_init(jailer_seccomp_default());
     if (!ctx) return -1;
 
 #define ALLOW(syscall_nr) do { \

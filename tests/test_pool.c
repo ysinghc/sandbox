@@ -6,8 +6,9 @@
 // never breaks, the pool refills to target, and the overflow slow path
 // (timeout + fail-immediate) behaves per §3.1.
 //
-// NOTE: Release builds define NDEBUG, which strips assert() calls entirely.
-// Never put side-effecting calls inside assert — store rc first (CHECK_RC).
+// NOTE: asserts are live in every build type here — tests/CMakeLists.txt adds
+// -UNDEBUG precisely because Release defines NDEBUG and would strip them. Still:
+// never put side-effecting calls inside assert — store rc first (CHECK_RC).
 
 #include <assert.h>
 #include <limits.h>
