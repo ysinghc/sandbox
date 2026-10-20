@@ -62,7 +62,7 @@ jobs:
           # namespaces blocked (e.g. a container's seccomp profile) and
           # userfaultfd denied. Anything else means a test did not execute.
           ctest --test-dir build -V \
-            -E "pool|network|tmpl_setup|vmm|ipc|cgroup" \
+            -E "pool|network|tmpl_setup|vmm|ipc|cgroup|jail_sweep" \
             | tee /tmp/ctest-all.log
           if grep -E 'SKIP' /tmp/ctest-all.log \
                | grep -vE 'userns id-mapping|user namespaces are restricted|uffd|userfaultfd'; then
@@ -83,7 +83,7 @@ jobs:
           set -euo pipefail
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
           $SUDO ctest --test-dir build -V \
-            -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup)$" \
+            -R "^(pool|network|network_cleanup|tmpl_setup|vmm|ipc|cgroup|jail_sweep)$" \
             | tee /tmp/privileged-ctest.log
 
       # A skipped privileged test is a green no-op: it proves nothing. Fail on

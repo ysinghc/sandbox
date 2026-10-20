@@ -2064,6 +2064,21 @@ authoritative.
   unmetered with a log. Verified on the Pi: the restored Firecracker pid appears
   in `<jail>/../active/<vm-id>/cgroup.procs`. New config keys `cgroup_enable`,
   `cgroup_slack_mib`, `cgroup_cpu_max`; new ctest `cgroup`.
+- **Crash recovery of jails (#31).** A daemon killed without `vmm_destroy`
+  leaves its jails behind *with their bind mounts*, and mounts outlive the
+  process: `rm_rf` then fails `EBUSY` forever, so the workspace reaper could
+  never free those volumes and the disk leaked one session per crash. Only the
+  test fixture knew how to repair it. `vmm_jail_sweep()` now runs at daemon
+  startup (the one moment no VM of ours is live): it walks `<jail_root>/vm-*`,
+  detaches the jail's known bind points (`JAIL_BINDS`, shared with
+  `jail_cleanup()` so the lists cannot drift) with `umount2(MNT_DETACH)` and
+  removes the directory. Liveness is read from the kernel rather than a pidfile
+  — the jailer chroots before exec, so a live VMM's `/proc/<pid>/root` *is* the
+  jail — and jails younger than 5 s are skipped so an in-flight jailer is never
+  raced. Each reclaim is logged (`jail_sweep` event + per-jail line) and
+  `docs/RUNBOOK.md` now says that a restart is the whole recovery procedure.
+  New privileged ctest `jail_sweep` (bind mounts + a chrooted stand-in VMM);
+  it is in the privileged job's `-R` list, so it cannot silently skip.
 
 ### 15.15 Phase 13 — Observability, Hardening & Docs (§10.12–§10.15)
 - **Structured logging (§10.12).** New `include/log.h` + `src/log.c`. One JSON

@@ -178,6 +178,14 @@ set_tests_properties(ipc PROPERTIES
     FIXTURES_REQUIRED tmplfix
     ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}${TEST_ASSET_ENV}")
 
+# #31: startup sweep of jails left by a crashed daemon. Needs root: it creates
+# bind mounts and chroots a child to stand in for a live VMM.
+add_executable(test_jail_sweep test_jail_sweep.c)
+target_include_directories(test_jail_sweep PRIVATE ../include)
+target_link_libraries(test_jail_sweep sandbox)
+add_test(NAME jail_sweep COMMAND test_jail_sweep)
+set_tests_properties(jail_sweep PROPERTIES TIMEOUT 60)
+
 # Phase 11: daemon config parser (no root). Parses the packaged engine.conf.
 add_executable(test_config test_config.c)
 target_include_directories(test_config PRIVATE ../include)

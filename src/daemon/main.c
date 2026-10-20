@@ -302,6 +302,21 @@ int main(int argc, char** argv) {
     apply_paths_to_env(&cfg);
     if (do_validate) return validate_config(&cfg, config_file);
 
+    // #31: a daemon that dies without vmm_destroy (SIGKILL, OOM) leaves its
+    // jails behind *with their bind mounts*, and mounts outlive the process.
+    // rm_rf then fails EBUSY forever: the workspace reaper cannot free the
+    // volumes and the disk leaks one session per crash. Startup is the only
+    // moment we know that no VM of ours is live, so sweep here. Live VMMs that
+    // outlived a previous daemon are detected via /proc and left alone.
+    {
+        int swept = 0;
+        if (vmm_jail_sweep(vmm_jail_root(), JAIL_SWEEP_MIN_AGE_SECONDS,
+                           &swept) == 0 &&
+            swept > 0) {
+            LOGF(LOG_INFO, "daemon", "jail_sweep", "\"removed\":%d", swept);
+        }
+    }
+
     if (cfg.pool_size <= 0 || cfg.pool_size > POOL_MAX_SIZE) {
         fprintf(stderr, "[sandboxd] invalid pool_size %d\n", cfg.pool_size);
         return 1;

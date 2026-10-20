@@ -87,6 +87,24 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
 // Form "$parent/<vm_id>" jail paths (parent defaults per env).
 int vmm_jail_path(const char* vm_id, char* out, size_t n);
 
+// #31: reclaim jail directories left behind by a daemon that died without
+// running vmm_destroy (SIGKILL, OOM, crash). Their bind mounts live in the
+// kernel, so they outlive the process and make rm_rf fail EBUSY forever; the
+// next start is the only point where we know no VM of ours is live.
+//
+// Removes only "vm-*" directories under `jail_root`. A jail whose directory
+// mtime is younger than `min_age_seconds` is kept (a jailer may be mid-setup),
+// and so is one that still has a process rooted in it (a VMM that outlived its
+// daemon). Returns 0 on success (including "nothing to do") and -1 with errno
+// on a real failure; `removed_out` receives the number reclaimed.
+#define JAIL_SWEEP_MIN_AGE_SECONDS 5u
+
+// Resolved jail root (SANDBOX_JAIL_ROOT or the packaged default). One
+// definition, so the socket path, the sweep and the VMM cannot disagree.
+const char* vmm_jail_root(void);
+int vmm_jail_sweep(const char* jail_root, unsigned min_age_seconds,
+                   int* removed_out);
+
 // Restore a template into a new jailed VM; net must already exist (tap device
 // by name, retargeted via the load request's network_overrides). UFFD handler
 // is up before vCPU resume.

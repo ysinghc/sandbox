@@ -105,16 +105,38 @@ bounded to 8 MiB. Larger or malformed bodies get `400`. Ask clients to send
 (`CHUNKED_MAX_BODY`).
 
 ### Cleaning up after a hard stop / crash
-A SIGKILL can leave jailed Firecracker processes, taps and mounts behind:
+
+Since #31, restarting the daemon reclaims the jails a previous run could not
+clean up: at startup `vmm_jail_sweep()` walks the jail root, detaches each
+stale jail's bind mounts (with `MNT_DETACH`) and removes the directory. It keeps
+a jail whose directory is younger than `JAIL_SWEEP_MIN_AGE_SECONDS` (5 s, so a
+jailer that is mid-setup is not raced) and one that still has a process rooted
+in it (a VMM that outlived the daemon is still serving its sandbox; killing it
+would be worse than leaking a directory). Each removal is logged as
+`[jail_sweep] reclaimed stale jail vm-N` and counted in the `jail_sweep` daemon
+log event.
+
+So the normal recovery is only:
+
+```sh
+systemctl restart sandboxd.service
+journalctl -u sandboxd | grep jail_sweep      # what it reclaimed
+```
+
+A VMM left alive by the dead daemon keeps its jail and its sandbox; stop it
+explicitly if you want the space back:
 
 ```sh
 sudo pkill -9 -x firecracker
-for m in $(mount | grep -oE '/var/lib/sandbox-engine/jail/[^ ]*' | sort -ru); do
-  sudo umount -l "$m" 2>/dev/null
-done
+systemctl restart sandboxd.service            # the next start sweeps the rest
+```
+
+Manual cleanup is only needed for damage the daemon cannot see (e.g. a jail root
+that was moved or is on a filesystem the daemon cannot access):
+
+```sh
 sudo find /var/lib/sandbox-engine/jail -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 sudo ip -all netns delete 2>/dev/null   # if per-VM netns were used
-systemctl start sandboxd.service
 ```
 
 Cgroup leaves are removed on VM destroy; stale empty ones can be removed with

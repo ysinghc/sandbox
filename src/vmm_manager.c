@@ -21,6 +21,7 @@
 #include "uffd_handler.h"
 #include "workspace.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -67,9 +68,13 @@ static const char* fc_bin(void) {
     return (e && *e) ? e : FC_BIN_DEFAULT;
 }
 
-static const char* jail_parent(void) {
+const char* vmm_jail_root(void) {
     const char* e = getenv("SANDBOX_JAIL_ROOT");
     return (e && *e) ? e : "/var/lib/sandbox-engine/jail";
+}
+
+static const char* jail_parent(void) {
+    return vmm_jail_root();
 }
 
 static const char* snapshot_parent(void) {
@@ -375,21 +380,119 @@ static int wait_for_file(const char* path, int timeout_ms) {
     return -1;
 }
 
+// Every jail-view path spawn_jailed can have bind-mounted. One list, used by
+// both the destroy path and the crash sweep (#31), so they cannot drift: a path
+// added to the jailer but not here would make rm_rf fail EBUSY forever.
+static const char* const JAIL_BINDS[] = {
+    "/dev/kvm", "/dev/net/tun", "/dev/userfaultfd",
+    "/vmlinux", "/rootfs.ext4", "/vmstate", "/memory.snap",
+    "/workspace.ext4",  // #23: live bind, or rm_rf fails
+    "/out",
+};
+static const size_t JAIL_BINDS_N = sizeof(JAIL_BINDS) / sizeof(JAIL_BINDS[0]);
+
+// Detach (lazily) every mount a jail may hold. Safe on paths that are not
+// mounted: umount2 fails EINVAL and that is ignored.
+static void jail_detach(const char* jail_root) {
+    char p[PATH_MAX];
+    for (size_t i = 0; i < JAIL_BINDS_N; i++) {
+        snprintf(p, sizeof(p), "%s%s", jail_root, JAIL_BINDS[i]);
+        umount2(p, MNT_DETACH);
+    }
+}
+
 // Unmount everything spawn_jailed may have bound, then remove the jail.
 static void jail_cleanup(const char* jail_root) {
     if (!jail_root || !*jail_root) return;
-    const char* subs[] = { "/dev/kvm", "/dev/net/tun", "/dev/userfaultfd",
-                           "/vmlinux", "/rootfs.ext4", "/vmstate", "/memory.snap",
-                           "/workspace.ext4",  // #23: live bind, or rm_rf fails
-                           "/out" };
-    char p[PATH_MAX];
-    for (size_t i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
-        snprintf(p, sizeof(p), "%s%s", jail_root, subs[i]);
-        umount2(p, MNT_DETACH);
-    }
+    jail_detach(jail_root);
     // Recursive removal in-process: a shell would interpret metacharacters in
     // jail_root (see the §12.2 audit note).
     sandbox_rm_rf(jail_root);
+}
+
+// Is some process still rooted in this jail? The jailer chroots before exec, so
+// a live VMM's /proc/<pid>/root *is* the jail directory; nothing else in the
+// engine is ever chrooted there. This is deliberately not a pidfile: a pidfile
+// goes stale exactly when it matters (the pid is reused, or the daemon died
+// before writing it), and the kernel already knows the truth.
+static bool jail_in_use(const char* jail_real) {
+    DIR* proc = opendir("/proc");
+    if (!proc) return false;  // cannot tell: caller keeps the jail
+    bool in_use = false;
+    struct dirent* de;
+    while (!in_use && (de = readdir(proc)) != NULL) {
+        char* end = NULL;
+        long pid = strtol(de->d_name, &end, 10);
+        if (!end || *end || pid <= 0) continue;
+        char link[64], target[PATH_MAX], real[PATH_MAX];
+        snprintf(link, sizeof(link), "/proc/%ld/root", pid);
+        ssize_t n = readlink(link, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = '\0';
+        // A removed-but-open directory reads back as "<path> (deleted)".
+        char* del = strstr(target, " (deleted)");
+        if (del) *del = '\0';
+        const char* cmp = realpath(target, real) ? real : target;
+        if (strcmp(cmp, jail_real) == 0) in_use = true;
+    }
+    closedir(proc);
+    return in_use;
+}
+
+int vmm_jail_sweep(const char* jail_root, unsigned min_age_seconds,
+                   int* removed_out) {
+    if (removed_out) *removed_out = 0;
+    if (!jail_root || !*jail_root) {
+        errno = EINVAL;
+        return -1;
+    }
+    // Sweep what opendir() will actually see: a relative root would otherwise
+    // never match the absolute path read back from /proc/<pid>/root.
+    char root_real[PATH_MAX];
+    if (!realpath(jail_root, root_real)) return errno == ENOENT ? 0 : -1;
+
+    DIR* d = opendir(root_real);
+    if (!d) return -1;
+
+    int64_t now = (int64_t)time(NULL);
+    int removed = 0, live = 0, young = 0;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        // Only our own VM jails. Anything else in the directory (lost+found, an
+        // operator's file) is not ours to delete.
+        if (strncmp(de->d_name, "vm-", 3) != 0) continue;
+        char path[PATH_MAX];
+        if (snprintf(path, sizeof(path), "%s/%s", root_real, de->d_name) >=
+            (int)sizeof(path))
+            continue;
+        struct stat st;
+        if (lstat(path, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
+        // A jailer may be mid-setup (mounts done, chroot not yet): it is not
+        // rooted in the jail yet but is seconds away from being a live VM.
+        if (min_age_seconds &&
+            now - (int64_t)st.st_mtime < (int64_t)min_age_seconds) {
+            young++;
+            continue;
+        }
+        if (jail_in_use(path)) {
+            live++;
+            continue;
+        }
+        jail_detach(path);
+        if (sandbox_rm_rf(path) == 0) {
+            removed++;
+            fprintf(stderr, "[jail_sweep] reclaimed stale jail %s\n", de->d_name);
+        } else {
+            fprintf(stderr, "[jail_sweep] could not remove %s: %s\n", path,
+                    strerror(errno));
+        }
+    }
+    closedir(d);
+    if (live || young)
+        fprintf(stderr, "[jail_sweep] kept %d live, %d in-flight jail(s)\n",
+                live, young);
+    if (removed_out) *removed_out = removed;
+    return 0;
 }
 
 int vmm_jail_path(const char* vm_id, char* out, size_t n) {
