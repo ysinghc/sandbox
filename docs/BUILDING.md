@@ -111,6 +111,36 @@ aarch64 assets are built **natively** on `ubuntu-24.04-arm` — there is no
 cross-toolchain, and no qemu emulation. `install.sh` also works offline against
 `file://` (or a mirror), which is how it is smoke-tested.
 
+## Guest images
+
+The host binaries and the guest image are built separately; the engine never
+compiles a guest at runtime. Two images exist, and they share `/init`
+(`scripts/guest-init.sh`) and the static agent on purpose:
+
+| Image | Script | Purpose |
+| --- | --- | --- |
+| busybox (128 MiB) | `scripts/build-custom-rootfs.sh` | Test fixture. Minimal: proves snapshots, vsock, `/workspace` and the agent without a package manager to slow it down. |
+| Debian (`bookworm`, ~450 MiB) | `scripts/build-debian-rootfs.sh` | What a user actually gets: `dpkg`, `apt`, `bash`, coreutils and `python3`, plus the same agent and `/init`. |
+
+Both require root (`debootstrap` for Debian, a loop mount for busybox) and both
+accept `SANDBOX_ROOTFS_OUT` so CI writes into its own work tree:
+
+```sh
+sudo SANDBOX_ROOTFS_OUT=$PWD/guest/rootfs-debian.ext4 \
+     bash scripts/build-debian-rootfs.sh
+```
+
+The Debian script prints the suite, the size and the SHA-256 of the finished
+image, and verifies the *image* (not the source directory): `/etc/debian_version`,
+an executable `/init`, the agent, and the `/workspace` mountpoint. Cross-arch
+builds are refused rather than half-done — the agent is compiled for the guest,
+so build on the architecture you intend to boot.
+
+`/` is mounted read-only in the guest. That is not an oversight: package
+installs at runtime would be lost at the next restore and would break
+determinism. Bake software into a template (#25) or install into the persistent
+`/workspace` (`pip --target`, `npm --prefix`, `GOPATH`).
+
 ## Cross / on-target builds
 
 The engine builds natively on both x86_64 and aarch64. On a small host (e.g. a

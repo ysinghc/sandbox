@@ -42,6 +42,21 @@ jobs:
                 bash scripts/build-custom-rootfs.sh
           ls -l "$SANDBOX_ROOTFS"
 
+      - name: Build the Debian guest image (#32)
+        # The busybox image is the cheap fixture; this is what a user boots. It
+        # is built here, from this checkout, so the suite below cannot pass on an
+        # operator's stale /opt image. debootstrap needs network + root.
+        #
+        # x86_64 only for now: the platform focus is x86_64 (Discussion #29) and
+        # adding debootstrap to the ARM runner is work for the ARM milestone.
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          set -euo pipefail
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO env SANDBOX_ROOTFS_OUT="$PWD/guest/rootfs-debian.ext4" \
+                bash scripts/build-debian-rootfs.sh
+          ls -l "$PWD/guest/rootfs-debian.ext4"
+
       - name: Configure
         # The VM tests need a workspace on a filesystem that permits device
         # nodes: the jail mknod()s /dev/kvm and /dev/net/tun, and opening them
@@ -111,6 +126,24 @@ jobs:
       # The runner may or may not be the root user; use sudo only when needed.
       # `sudo` resets the environment, so the asset overrides have to be handed
       # to it explicitly or the harness silently falls back to /opt.
+      # Same suite, real userland. dpkg/apt/python exist here and not in the
+      # fixture, and the guest is four times larger, so this is also the check
+      # that boot/restore timings hold for an image someone would actually ship.
+      - name: Privileged suite against the Debian guest (#32)
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          set -euo pipefail
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          DEB_IMG="$PWD/guest/rootfs-debian.ext4"
+          $SUDO env SANDBOX_ROOTFS="$DEB_IMG" ctest --test-dir build -V \
+            -R "^(pool|tmpl_setup|vmm|ipc)$" \
+            | tee /tmp/privileged-ctest-debian.log
+          if grep -nE '\*\*\*Skipped|SKIP \(|\*\*\*Not Run' /tmp/privileged-ctest-debian.log; then
+            echo "::error::a privileged test skipped against the Debian image"; exit 1
+          fi
+          grep -F "rootfs=$DEB_IMG" /tmp/privileged-ctest-debian.log \
+            || { echo "::error::the Debian run did not use $DEB_IMG"; exit 1; }
+
       - name: e2e smoke (root)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo

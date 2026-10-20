@@ -89,6 +89,14 @@ and are separate jobs rather than matrix rows, because `matrix` is **not** an
 available context in `jobs.<job_id>.if` (only `github`, `needs`, `vars`,
 `inputs`) — referencing it there invalidates the entire workflow file.
 
+**Platform focus (2026-10-20).** Both legs remain enabled: the aarch64 leg is
+cheap and catches portability regressions early, which is exactly what it did
+for #6. But it is a *signal*, not a gate on the x86_64 feature path — an
+ARM-only failure is recorded and deferred to the ARM milestone (#30) instead of
+being fixed here, and the x86_64 leg is the one that must be green for a release.
+Do not weaken the aarch64 assertions to make the leg pass; that would turn the
+signal into noise.
+
 > **Security.** A self-hosted runner executes workflow code as **root** on the
 > operator's machine. `privileged-e2e.yml` therefore refuses pull requests from
 > forks (`github.event.pull_request.head.repo.full_name == github.repository`)
@@ -202,7 +210,11 @@ Each host needs:
   `/opt/sandbox-assets/rootfs.ext4`, or `${SANDBOX_ROOTFS_OUT}`). The privileged
   workflow builds it into the checkout and points `SANDBOX_ROOTFS` at the result,
   so guest-side changes (`scripts/sandbox-agent.c`, `/init`) are exercised in CI
-  without clobbering the operator's asset;
+  without clobbering the operator's asset. The workflow then builds the **Debian**
+  image (`sudo scripts/build-debian-rootfs.sh`) and runs the same privileged suite
+  against it a second time: the busybox image catches engine regressions cheaply,
+  the Debian image is what a user boots, and a suite that only passes on the
+  fixture would be green in exactly the wrong way;
 - a build toolchain plus `libprotobuf-dev`, `libseccomp-dev`,
   `libcurl4-openssl-dev`, `libnftables-dev`, `libsystemd-dev`;
 - a dev-capable (not `nodev`) working filesystem under `/var/tmp` or `$HOME` —
@@ -248,6 +260,9 @@ sudo rmdir /sys/fs/cgroup/sandboxd/active/* 2>/dev/null
 
 - On hosts where the aarch64 arch timer does not re-arm across snapshot
   restore, a guest `sleep` blocks in WFI; the test heartbeat busy-spins instead.
+  Confirmed not to be a guest-kernel issue (Linux 6.1.155 behaves identically)
+  and reported upstream: [firecracker#6313](https://github.com/firecracker-microvm/firecracker/issues/6313).
+  x86_64 is unaffected.
 - On Ubuntu 24.04, `kernel.apparmor_restrict_unprivileged_userns=1` makes the
   unprivileged `jailer` sequence unable to `chroot`; it SKIPs and the root path
   provides coverage.
