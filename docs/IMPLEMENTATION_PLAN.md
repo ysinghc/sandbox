@@ -209,7 +209,8 @@ asserts the positive direction (`SANDBOX-VSOCK-HOST cid=2` in serial).
 | `scripts/install.sh` + release docs (#19) | ✅ verified offline against a staged tree |
 | vsock peer authentication (#10) | ✅ guest+host code; classifier unit-tested on the host, host CID asserted in-guest |
 | #22 determinism (clock + rootfs pinning) | ✅ verified on the kvm runner: guest skew 0 s vs host with a 16 s-old template |
-| M1 ARM timer (#6) | ⏳ needs an ARM host (no aarch64 runner yet) |
+| M1 ARM timer (#6) | ✅ investigated on real hardware — **not fixed**, documented (§15.7); fix path #30 (modern guest kernel) |
+| M1 aarch64 privileged leg | ✅ live on the Pi 5 (`sandbox-arm64-pi5`), both legs green on `62ae6e5` |
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
 | M2 #24–#28 | ⏳ not started (#24 is next) |
 
@@ -267,8 +268,27 @@ nftables ship silently.
 really boots (2.01 s); `pool`, `network`, `network_cleanup`, `vmm`, `ipc`,
 `cgroup` execute rather than skip.
 
-**Remaining:** the aarch64 leg is written but unrun — no ARM runner yet, so
-`PRIVILEGED_ARM` stays unset. It will expose #6 when one exists.
+**aarch64 (2026-10-20):** _sandbox-arm64-pi5_ is registered (Pi 5, Ubuntu 24.04,
+non-root runner with passwordless sudo, KVM, cgroup v2) and both legs are green
+on `62ae6e5`: 10/10 unprivileged and 7/7 privileged tests, the #23 session
+persistence and renewal checks included, on the guest image that run built
+(warm **2.07 ms**, provisioned **132.33 ms**; the budget check now has ~2.5×
+less headroom than on x86, which is the number that matters).
+
+Two environment bugs had to be fixed to get there, both of which made the leg
+"pass" or die misleadingly: `sudo ctest` on a non-root runner reset the
+environment and dropped `SANDBOX_ROOTFS`, so the suite ran a guest image older
+than the code (fixed by baking the asset paths into the test definition, plus a
+job assertion that the fixture loaded the image the job built); and the sudo'd
+rootfs build left the runner's `guest/` root-owned, which made every later
+checkout fail before its first step (fixed by chowning the output and its dir).
+
+**This exposed #6, which is real and now documented (§15.7):** on aarch64 the
+guest's timer interrupt is never delivered after a restore — a guest snapshotted
+mid-`sleep` never wakes, reproduced with no engine involved. The agent's
+busy-poll heartbeat is therefore load-bearing, and any workload that blocks on a
+timeout in a restored ARM sandbox hangs. #30 (modern guest kernel) is the fix
+path and is now the top M1 item.
 
 ### #8 — SPDX headers + CI gate
 
