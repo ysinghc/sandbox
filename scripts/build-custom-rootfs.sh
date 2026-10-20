@@ -161,6 +161,14 @@ rmdir "$MNTDIR"
 if [ "${SUDO_UID:-0}" != "0" ] && [ -n "${SUDO_UID:-}" ]; then
     log "Chowning $ROOTFS_OUT to $SUDO_UID:$SUDO_GID"
     chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$ROOTFS_OUT"
+    # The *directory* needs it too. Chowning only the file left the runner's
+    # `guest/` owned by root, so the next checkout could not unlink the image
+    # inside it (EACCES) and the job died before its first step. This only ever
+    # touches the output's own parent, which the caller asked us to write into.
+    ROOTFS_DIR=$(dirname "$ROOTFS_OUT")
+    if [ -d "$ROOTFS_DIR" ]; then
+        chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$ROOTFS_DIR"
+    fi
 fi
 
 # ── 7. Verify ────────────────────────────────────────────────────────────────

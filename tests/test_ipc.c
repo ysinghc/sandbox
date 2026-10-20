@@ -327,6 +327,7 @@ int main(void) {
 #if defined(__x86_64__)
         long long skew = guest_now - (long long)time(NULL);
         fprintf(stderr, "[test] guest clock skew vs host: %llds\n", skew);
+        if (skew > 3 || skew < -3) dump_serial(hvm, "clock skew out of range");
         CHECK(skew <= 3 && skew >= -3, "clock: guest tracks host time");
 #else
         // clock_realtime is an x86_64-only Firecracker field, so on aarch64 the
