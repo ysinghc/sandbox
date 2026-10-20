@@ -295,16 +295,18 @@ int main(void) {
     CHECK(rc == SANDBOX_OK, "client connect");
 
     // --- #12: two Creates in flight on one connection ---------------------
-    // A session create clones a volume and takes a dedicated restore (~100 ms);
-    // an ephemeral one is a warm-pool hit (~ms). Both are sent before either
-    // reply is read, and the fast one must come back first: that is exactly what
-    // the old protocol forbade (it serialised a session's Creates so replies
-    // stayed in request order). A reply is matched to its caller only by the
-    // echoed id, so a broken correlation fails here rather than handing a caller
-    // someone else's sandbox.
+    // A session create clones a volume and takes a dedicated restore; an
+    // ephemeral one acquires a warm VM and pays only the env-injection
+    // handshake. Both are sent before either reply is read, and the cheaper one
+    // must come back first: that is exactly what the old protocol forbade (it
+    // serialised a session's Creates so replies stayed in request order). A
+    // reply is matched to its caller only by the echoed id, so a broken
+    // correlation fails here rather than handing a caller someone else's
+    // sandbox.
     {
         // The ordering check is only meaningful if the ephemeral create really
-        // is a pool hit; the replenishment thread fills asynchronously.
+        // does take a warm VM -- a restore would make the two comparable. The
+        // replenishment thread fills the pool asynchronously, so wait for it.
         for (int i = 0; i < 500 && pool_manager_warm_count(&g_pool) < 1; i++)
             usleep(10000);
         CHECK(pool_manager_warm_count(&g_pool) >= 1, "concurrent: pool is warm");

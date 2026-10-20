@@ -302,8 +302,10 @@ static void serve(int cfd) {
 }
 
 int main(void) {
-    // fd 1 is the init's stdout = the kernel console (ttyS0) = the Firecracker
-    // serial backend. Opening /dev/console can block on carrier, so don't.
+    // fd 1 is the init's stdout = the kernel console (ttyS0 on both
+    // architectures; Firecracker's aarch64 UART is 8250-compatible) = the
+    // Firecracker serial backend. Opening /dev/console can block on carrier, so
+    // don't.
     g_console = 1;
 
     // The virtio-vsock device may probe after init starts; retry bind briefly.

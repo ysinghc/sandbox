@@ -1669,10 +1669,23 @@ authoritative.
   must not be "simplified" back to a sleep.
   The guest clock behaves the same way: `clock_realtime` is x86_64-only (§15.16),
   so an aarch64 sandbox also resumes with the template's wall clock.
-  Not fixed: the next step is a modern guest kernel (the 4.14 image also blocks
-  VMGenID, §15.16, and guest-local vsock, §15.11), tracked in #30. If a ≥5.10
-  guest still fails, this is an upstream Firecracker report with the experiment
-  above as the reproduction (no such issue exists upstream as of 2026-10).
+  **Not a guest-kernel bug — verified 2026-10-20.** The same experiment was run
+  with Linux 6.1.155 (`vmlinux-6.1.155` from Firecracker's own CI bucket, the
+  kernel their suite boots): boot and restore succeed, the vCPU runs,
+  `CLOCK_MONOTONIC` advances (busy-loop markers one second apart), the VMGenID
+  interrupt is delivered and the guest reseeds (`random: crng reseeded due to
+  virtual machine fork`), and `sleep(3)` still never returns. A busy-poll probe
+  that never sleeps keeps making progress after the restore, which isolates the
+  fault to *timer interrupt delivery*, not to the vCPU, the counter, or the GIC
+  as a whole (virtio and VMGenID interrupts arrive).
+  The engine itself survives because the guest agent busy-polls its vsock fd and
+  emits `SANDBOX-TICK` from a bounded loop instead of `sleep 1`; that workaround
+  is why the suite passes and must not be "simplified" back to a sleep.
+  Reported upstream: [firecracker#6313](https://github.com/firecracker-microvm/firecracker/issues/6313),
+  with the engine-free reproduction. The former "upgrade the guest kernel" plan
+  (#30) therefore does not fix this half; #30 now only covers VMGenID,
+  guest-local vsock and leaving the EOL 4.14 kernel, and is deferred to the ARM
+  milestone. x86_64 is unaffected.
 - **Docker `FORWARD` conflict**: the test host runs Docker, whose iptables
   `FORWARD` chain has `policy drop` at the same `filter` hook priority as
   `sandbox_policy`. At equal priority a drop in *any* chain wins regardless of

@@ -9,6 +9,22 @@
 
 **Ground truth as of 2026-10-18** — `HEAD = e5a5cc7`.
 
+> **Platform focus (2026-10-20): x86_64 first, aarch64 deferred.**
+> The definition of done for this stretch is concrete: *a Debian guest boots, has a
+> persistent `/workspace`, and a web assistant can run commands and read/write files
+> in it through the control plane.* Until that is true on x86_64, ARM parity work is
+> off the critical path.
+>
+> Why this order is not arbitrary: the aarch64 post-restore timer bug turned out not
+> to be a guest-kernel problem — Linux 6.1.155 (Firecracker's own CI kernel) shows the
+> same behaviour, with the vCPU running, `CLOCK_MONOTONIC` advancing and VMGenID
+> delivered, while `sleep()` never returns. It is a Firecracker defect
+> ([firecracker#6313](https://github.com/firecracker-microvm/firecracker/issues/6313)).
+> It only affects restored aarch64 guests; on x86_64 timers work, so none of the
+> features below are blocked by it. The ARM runner stays online and its leg keeps
+> running as an early-warning signal, but ARM-only defects are recorded and deferred
+> (see #30) rather than fixed in this stretch.
+
 ---
 
 ## 0. Ground-truth corrections
@@ -500,14 +516,20 @@ Done     #31 crash-left jails: startup sweep, liveness via /proc/<pid>/root, pri
          ctest jail_sweep green on x86_64 *and* aarch64
 Done     #12 request correlation: request_id echoed, per-session create serialization
          removed for id-carrying requests, libsandbox reader thread, ctest ipc_codec
-Next     #30 guest kernel off 4.14 — blocks ARM sleep/timers, VMGenID and vsock-local
-         → #24 guest RPC → #7 → #26 → #25 → #27 control-plane API → #28 MCP gateway
-         (#4, #17, #9, #11, #13, #14, #15, #18, #16 follow in the burn-down order)
+Next     #32 Debian guest image + /workspace — the visible milestone; everything below
+         is easier to judge once the guest is a real userland
+         → #24 guest RPC (exec/files) → #7 broker streaming → #26 egress policy
+         → #25 template pipeline → #27 control-plane API → #28 MCP gateway
+         → #4 config layer → #17, #9, #11, #13, #14, #15, #18, #16
+Deferred #30 guest kernel off 4.14 — ARM milestone. The timer half is upstream
+         (firecracker#6313); what remains here is VMGenID, vsock-local and leaving an
+         EOL kernel.
 
 The order is set by *rework*, not by phase: the wire protocol (#12 → #24 → #27), the
 privileged runtime (#31 → #9 → #11), the broker body path (#7 → #26), and the guest
-image (#30 → #25 → #14 → #15) each form a chain where doing the later item first means
-rewriting it. The Project's Sequence field and Discussion #29 carry the same order.
+image (#32 → #24 → #25 → #14 → #15) each form a chain where doing the later item first
+means rewriting it. The Project's Sequence field and Discussion #29 carry the same
+order.
 ```
 
 > **Note on the order.** The privileged host came online on Day 3, and it changed what "done"

@@ -51,6 +51,10 @@
 #define FC_WORKSPACE_JAILVIEW JAIL_WORKSPACE_PATH  // #23 writable session volume
 #define FC_STATE_JAILVIEW "/vmstate"
 #define FC_MEM_JAILVIEW "/memory.snap"
+// ttyS0 on both architectures, deliberately: Firecracker's aarch64 serial is an
+// 8250-compatible MMIO UART (earlycon=uart,mmio,0x40002000), not a PL011. A guest
+// kernel therefore needs CONFIG_SERIAL_8250_CONSOLE even on ARM64 -- believing
+// "aarch64 means ttyAMA0" produces a boot with no console at all.
 #define FC_BOOT_ARGS "console=ttyS0 reboot=k panic=1 init=/init root=/dev/vda ro"
 #define FC_TEMPLATE_IFACE "net1"  // template NIC id; restores retarget its tap
 #define FC_VSOCK_JAILVIEW "/vsock.sock"  // per-VM vsock host backend UDS
