@@ -146,6 +146,17 @@ log "Unmounting..."
 umount "$MNTDIR"
 rmdir "$MNTDIR"
 
+# ── 6b. Ownership ────────────────────────────────────────────────────────────
+# CI runs this under sudo from a non-root runner, so the image would land in the
+# runner's work tree owned by root. The next run's checkout cannot delete a file
+# it does not own (EACCES) and the job fails before it starts. Give the file back
+# to whoever invoked sudo; under a root runner SUDO_UID is unset or 0 and this is
+# a no-op.
+if [ "${SUDO_UID:-0}" != "0" ] && [ -n "${SUDO_UID:-}" ]; then
+    log "Chowning $ROOTFS_OUT to $SUDO_UID:$SUDO_GID"
+    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$ROOTFS_OUT"
+fi
+
 # ── 7. Verify ────────────────────────────────────────────────────────────────
 log ""
 log "=== Rootfs complete ==="
