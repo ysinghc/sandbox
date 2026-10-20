@@ -62,7 +62,7 @@ jobs:
           # namespaces blocked (e.g. a container's seccomp profile) and
           # userfaultfd denied. Anything else means a test did not execute.
           ctest --test-dir build -V \
-            -E "pool|network|tmpl_setup|vmm|ipc|cgroup|jail_sweep" \
+            -E "pool|network|tmpl_setup|vmm|^ipc$|cgroup|jail_sweep" \
             | tee /tmp/ctest-all.log
           if grep -E 'SKIP' /tmp/ctest-all.log \
                | grep -vE 'userns id-mapping|user namespaces are restricted|uffd|userfaultfd'; then

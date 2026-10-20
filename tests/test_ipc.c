@@ -173,6 +173,38 @@ static sandbox_error_t connect_retry(const char* path, int tries) {
     return rc;
 }
 
+// #12: run a create on its own thread, so two can be in flight on the one
+// client connection at the same time. `order` records completion across threads
+// and `ms` how long the call took -- together they show that a fast reply
+// overtook a slow request instead of the protocol serialising everything.
+typedef struct {
+    sandbox_spec_t spec;
+    sandbox_handle_t* h;
+    sandbox_error_t rc;
+    int order;
+    uint64_t ms;
+} conc_arg_t;
+
+static pthread_mutex_t g_conc_lock = PTHREAD_MUTEX_INITIALIZER;
+static int g_conc_done;
+
+static uint64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void* conc_create(void* p) {
+    conc_arg_t* a = p;
+    uint64_t t0 = mono_ms();
+    a->rc = sandbox_create(&a->spec, &a->h);
+    a->ms = mono_ms() - t0;
+    pthread_mutex_lock(&g_conc_lock);
+    a->order = ++g_conc_done;
+    pthread_mutex_unlock(&g_conc_lock);
+    return NULL;
+}
+
 int main(void) {
     const char* snap = getenv("SANDBOX_SNAPSHOT_ROOT");
     if (!snap || !*snap || geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0) {
@@ -261,6 +293,65 @@ int main(void) {
 
     sandbox_error_t rc = connect_retry(g_engine_sock, 250);
     CHECK(rc == SANDBOX_OK, "client connect");
+
+    // --- #12: two Creates in flight on one connection ---------------------
+    // A session create clones a volume and takes a dedicated restore (~100 ms);
+    // an ephemeral one is a warm-pool hit (~ms). Both are sent before either
+    // reply is read, and the fast one must come back first: that is exactly what
+    // the old protocol forbade (it serialised a session's Creates so replies
+    // stayed in request order). A reply is matched to its caller only by the
+    // echoed id, so a broken correlation fails here rather than handing a caller
+    // someone else's sandbox.
+    {
+        // The ordering check is only meaningful if the ephemeral create really
+        // is a pool hit; the replenishment thread fills asynchronously.
+        for (int i = 0; i < 500 && pool_manager_warm_count(&g_pool) < 1; i++)
+            usleep(10000);
+        CHECK(pool_manager_warm_count(&g_pool) >= 1, "concurrent: pool is warm");
+
+        conc_arg_t slow, fast;
+        memset(&slow, 0, sizeof(slow));
+        memset(&fast, 0, sizeof(fast));
+        slow.spec = spec;
+        slow.spec.session_key = "e2e-concurrent-12";
+        slow.spec.ttl_seconds = 3600;
+        fast.spec = spec;
+
+        pthread_t ts, tf;
+        int have_slow = pthread_create(&ts, NULL, conc_create, &slow) == 0;
+        CHECK(have_slow, "concurrent: session create started");
+        if (have_slow) usleep(20000);  // its request reaches the daemon first
+        int have_fast = pthread_create(&tf, NULL, conc_create, &fast) == 0;
+        CHECK(have_fast, "concurrent: ephemeral create started");
+        if (have_slow) pthread_join(ts, NULL);
+        if (have_fast) pthread_join(tf, NULL);
+
+        CHECK(slow.rc == SANDBOX_OK && slow.h != NULL,
+              "concurrent: session create succeeded");
+        CHECK(fast.rc == SANDBOX_OK && fast.h != NULL,
+              "concurrent: ephemeral create succeeded");
+
+        sandbox_status_t sslow, sfast;
+        memset(&sslow, 0, sizeof(sslow));
+        memset(&sfast, 0, sizeof(sfast));
+        CHECK(slow.h && sandbox_inspect(slow.h, &sslow) == SANDBOX_OK &&
+                  sslow.sandbox_id != 0,
+              "concurrent: session handle names its own sandbox");
+        CHECK(fast.h && sandbox_inspect(fast.h, &sfast) == SANDBOX_OK &&
+                  sfast.sandbox_id != 0,
+              "concurrent: ephemeral handle names its own sandbox");
+        CHECK(slow.h && fast.h && sslow.sandbox_id != sfast.sandbox_id,
+              "concurrent: the two replies named different sandboxes");
+        CHECK(fast.order < slow.order,
+              "concurrent: fast reply overtook the slow request (out of order)");
+        printf("[test] concurrent: session=%llu ms ephemeral=%llu ms "
+               "(order %d then %d)\n",
+               (unsigned long long)slow.ms, (unsigned long long)fast.ms,
+               fast.order, slow.order);
+
+        if (slow.h) sandbox_destroy(slow.h);
+        if (fast.h) sandbox_destroy(fast.h);
+    }
 
     sandbox_handle_t* h = NULL;
 

@@ -52,8 +52,12 @@
 
 // §10.8 async Create: the epoll loop must never block on a pool restore.
 // Create requests are copied into a job, handed to a small worker pool, and the
-// loop completes them from the result queue on an eventfd wakeup. Per-session
-// serialization (one dispatched job at a time, FIFO) preserves response order.
+// loop completes them from the result queue on an eventfd wakeup.
+//
+// #12: a Create may carry a correlation id. Ids make response order irrelevant,
+// so such jobs run concurrently (up to the per-session/per-uid limits). A job
+// with no id keeps the original contract -- one at a time, FIFO -- because a
+// client that never sets an id can only match replies by arrival order.
 #define IPC_CREATE_WORKERS 4
 #define IPC_CREATE_QUEUE_MAX 16  // outstanding creates per session
 #define IPC_CREATE_UID_MAX 64    // outstanding creates per peer uid
@@ -67,6 +71,7 @@ typedef struct create_job {
     int session_fd;
     uint64_t session_epoch;
     uid_t uid;
+    uint64_t request_id;  // #12: echoed in the reply; 0 = legacy, in-order
     uint64_t memory_mib;
     uint32_t vcpu_count;
     uint32_t pool_wait_ms;
@@ -95,13 +100,15 @@ typedef struct {
     uint32_t owned[IPC_MAX_OWNED];
     int n_owned;
 
-    // §10.8: per-session Create FIFO. cq_head is only dispatched when the
-    // previous job's result has been consumed (cq_active), so a single session's
-    // responses stay in request order.
+    // §10.8/#12: per-session Create queue. Jobs carrying a correlation id are
+    // dispatched together; a legacy job (id 0) is dispatched alone and nothing
+    // behind it starts until it completes, so a client that matches replies by
+    // order never sees them reordered.
     create_job_t* cq_head;
     create_job_t* cq_tail;
     int n_outstanding;  // queued + active
-    bool cq_active;
+    int n_active;       // dispatched, result not yet consumed
+    int n_serial;       // of n_active, legacy (id 0) jobs
 } session_t;
 
 typedef struct token_entry {
@@ -499,9 +506,11 @@ static void send_response(int fd, const ipc_response_t* resp) {
     }
 }
 
-static void reply_error(int fd, sandbox_error_t code, const char* msg) {
+static void reply_error(int fd, uint64_t rid, sandbox_error_t code,
+                        const char* msg) {
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
     resp.is_error = true;
     resp.error_code = code;
     snprintf(resp.error_message, sizeof(resp.error_message), "%s", msg ? msg : "");
@@ -524,6 +533,7 @@ static create_job_t* build_job(const ipc_request_t* req, session_t* s) {
     j->session_fd = s->fd;
     j->session_epoch = s->epoch;
     j->uid = s->uid;
+    j->request_id = req->request_id;
     j->memory_mib = req->memory_mib ? req->memory_mib : 128;
     j->vcpu_count = req->vcpu_count ? req->vcpu_count : 1;
     j->pool_wait_ms = req->pool_wait_ms ? req->pool_wait_ms
@@ -673,50 +683,68 @@ static void* create_worker_fn(void* arg) {    (void)arg;
     return NULL;
 }
 
-// Hand the head of a session's Create FIFO to the worker pool (loop thread).
-static void dispatch_cq_head(session_t* s) {
-    create_job_t* j = s->cq_head;
-    if (!j) { s->cq_active = false; return; }
-    s->cq_head = j->next;
-    if (!s->cq_head) s->cq_tail = NULL;
-    j->next = NULL;
-    s->cq_active = true;
-    pthread_mutex_lock(&g.q_lock);
-    if (g.q_tail) g.q_tail->next = j;
-    else g.q_head = j;
-    g.q_tail = j;
-    g.q_len++;
-    pthread_cond_signal(&g.q_cond);
-    pthread_mutex_unlock(&g.q_lock);
+// Hand queued Creates to the worker pool (loop thread).
+//
+// #12: jobs with a correlation id may overlap -- the client matches replies
+// itself. Two rules keep the legacy guarantee intact:
+//   - while a legacy job (id 0) is active, nothing else is dispatched, because
+//     its reply must be the next one the session sees;
+//   - a legacy job at the head waits for all active jobs to finish, so it
+//     cannot overtake a request that arrived before it.
+// Concurrency is therefore opt-in per request, and a mixed client is still
+// correct for every id-less request.
+static void dispatch_cq(session_t* s) {
+    while (s->cq_head) {
+        create_job_t* j = s->cq_head;
+        if (s->n_serial > 0) return;
+        if (j->request_id == 0 && s->n_active > 0) return;
+        s->cq_head = j->next;
+        if (!s->cq_head) s->cq_tail = NULL;
+        j->next = NULL;
+        s->n_active++;
+        if (j->request_id == 0) s->n_serial++;
+        pthread_mutex_lock(&g.q_lock);
+        if (g.q_tail) g.q_tail->next = j;
+        else g.q_head = j;
+        g.q_tail = j;
+        g.q_len++;
+        pthread_cond_signal(&g.q_cond);
+        pthread_mutex_unlock(&g.q_lock);
+    }
 }
 
 // Validate and enqueue a Create. Replies immediately only on rejection.
 static void submit_create(int fd, session_t* s, const ipc_request_t* req) {
     if (req->template_name[0] && !valid_name(req->template_name)) {
-        reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "invalid template name");
+        reply_error(fd, req->request_id, SANDBOX_ERR_INVALID_SPEC,
+                    "invalid template name");
         return;
     }
     if (g.template_name[0] && req->template_name[0] &&
         strcmp(req->template_name, g.template_name) != 0) {
-        reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "unknown template");
+        reply_error(fd, req->request_id, SANDBOX_ERR_INVALID_SPEC,
+                    "unknown template");
         return;
     }
     if (!g.pool) {
-        reply_error(fd, SANDBOX_ERR_INTERNAL, "pool not configured");
+        reply_error(fd, req->request_id, SANDBOX_ERR_INTERNAL,
+                    "pool not configured");
         return;
     }
     // §10.8 rate limiting: bound outstanding creates per session and per uid.
     if (s->n_outstanding >= g.per_session_max) {
-        reply_error(fd, SANDBOX_ERR_POOL_EXHAUSTED, "too many concurrent creates");
+        reply_error(fd, req->request_id, SANDBOX_ERR_POOL_EXHAUSTED,
+                    "too many concurrent creates");
         return;
     }
     if (uid_inflight_get(s->uid) >= g.per_uid_max) {
-        reply_error(fd, SANDBOX_ERR_POOL_EXHAUSTED, "uid create limit reached");
+        reply_error(fd, req->request_id, SANDBOX_ERR_POOL_EXHAUSTED,
+                    "uid create limit reached");
         return;
     }
     create_job_t* j = build_job(req, s);
     if (!j) {
-        reply_error(fd, SANDBOX_ERR_INTERNAL, "out of memory");
+        reply_error(fd, req->request_id, SANDBOX_ERR_INTERNAL, "out of memory");
         return;
     }
     if (s->cq_tail) s->cq_tail->next = j;
@@ -724,7 +752,7 @@ static void submit_create(int fd, session_t* s, const ipc_request_t* req) {
     s->cq_tail = j;
     s->n_outstanding++;
     uid_inflight_add(s->uid, +1);
-    if (!s->cq_active) dispatch_cq_head(s);
+    dispatch_cq(s);
 }
 
 // Consume a finished job (loop thread): track + reply + dispatch the next.
@@ -744,12 +772,14 @@ static void complete_result(create_result_t* r) {
         return;
     }
 
-    s->cq_active = false;
+    if (s->n_active > 0) s->n_active--;
+    if (job->request_id == 0 && s->n_serial > 0) s->n_serial--;
     if (s->n_outstanding > 0) s->n_outstanding--;
 
     if (r->code != SANDBOX_OK || !r->vm) {
         if (r->vm) vmm_destroy(r->vm);
-        reply_error(s->fd, r->code != SANDBOX_OK ? r->code : SANDBOX_ERR_INTERNAL,
+        reply_error(s->fd, job->request_id,
+                    r->code != SANDBOX_OK ? r->code : SANDBOX_ERR_INTERNAL,
                     "pool provision failed");
     } else {
         vm_handle_t* vm = r->vm;
@@ -761,6 +791,7 @@ static void complete_result(create_result_t* r) {
         }
         ipc_response_t resp;
         memset(&resp, 0, sizeof(resp));
+        resp.request_id = job->request_id;
         resp.kind = IPC_REQ_CREATE;
         resp.sandbox_id = vm->sandbox_id;
         snprintf(resp.session_token, sizeof(resp.session_token), "%s", r->token);
@@ -769,7 +800,7 @@ static void complete_result(create_result_t* r) {
         send_response(s->fd, &resp);
     }
     free_job(job);
-    if (!g.q_stop && s->cq_head) dispatch_cq_head(s);
+    if (!g.q_stop) dispatch_cq(s);
 }
 
 // Drain the worker result queue (loop thread, on EP_WAKE).
@@ -810,9 +841,10 @@ static void stop_create_workers(void) {
     g.q_stop = false;
 }
 
-static void handle_destroy(int fd, session_t* s, uint32_t id) {
+static void handle_destroy(int fd, uint64_t rid, session_t* s, uint32_t id) {
     if (!session_owns(s, id)) {
-        reply_error(fd, SANDBOX_ERR_PERMISSION_DENIED, "not owned by session");
+        reply_error(fd, rid, SANDBOX_ERR_PERMISSION_DENIED,
+                    "not owned by session");
         return;
     }
     vm_handle_t* vm = lifecycle_get(id);
@@ -823,48 +855,54 @@ static void handle_destroy(int fd, session_t* s, uint32_t id) {
     session_disown(s, id);
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
     resp.kind = IPC_REQ_DESTROY;
     resp.sandbox_id = id;
     send_response(fd, &resp);
 }
 
-static void handle_pause_resume(int fd, session_t* s, uint32_t id, bool pause) {
+static void handle_pause_resume(int fd, uint64_t rid, session_t* s, uint32_t id,
+                                bool pause) {
     if (!session_owns(s, id)) {
-        reply_error(fd, SANDBOX_ERR_PERMISSION_DENIED, "not owned by session");
+        reply_error(fd, rid, SANDBOX_ERR_PERMISSION_DENIED,
+                    "not owned by session");
         return;
     }
     vm_handle_t* vm = lifecycle_get(id);
     if (!vm) {
-        reply_error(fd, SANDBOX_ERR_INTERNAL, "sandbox gone");
+        reply_error(fd, rid, SANDBOX_ERR_INTERNAL, "sandbox gone");
         return;
     }
     int rc = pause ? vmm_pause_vcpus(vm) : vmm_resume_vcpus(vm);
     if (rc != 0) {
-        reply_error(fd, SANDBOX_ERR_INTERNAL,
+        reply_error(fd, rid, SANDBOX_ERR_INTERNAL,
                     pause ? "pause failed" : "resume failed");
         return;
     }
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
     resp.kind = pause ? IPC_REQ_PAUSE : IPC_REQ_RESUME;
     resp.sandbox_id = id;
     send_response(fd, &resp);
 }
 
-static void handle_inspect(int fd, session_t* s, uint32_t id) {
+static void handle_inspect(int fd, uint64_t rid, session_t* s, uint32_t id) {
     if (!session_owns(s, id)) {
-        reply_error(fd, SANDBOX_ERR_PERMISSION_DENIED, "not owned by session");
+        reply_error(fd, rid, SANDBOX_ERR_PERMISSION_DENIED,
+                    "not owned by session");
         return;
     }
     vm_handle_t* vm = lifecycle_get(id);
     if (!vm) {
-        reply_error(fd, SANDBOX_ERR_INTERNAL, "sandbox gone");
+        reply_error(fd, rid, SANDBOX_ERR_INTERNAL, "sandbox gone");
         return;
     }
     char state[32] = {0};
     vmm_state(vm, state, sizeof(state));
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
     resp.kind = IPC_REQ_INSPECT;
     resp.sandbox_id = id;
     resp.is_running = (strcmp(state, "Running") == 0);
@@ -885,33 +923,37 @@ static void handle_inspect(int fd, session_t* s, uint32_t id) {
 // the platform maximum, never shortened); this handler only maps its refusals
 // onto errors the caller can act on.
 static void handle_renew(int fd, const ipc_request_t* req) {
+    uint64_t rid = req->request_id;
     workspace_meta_t m;
     if (workspace_renew(req->session_key, req->extra_seconds, (int64_t)time(NULL),
                         &m) < 0) {
         switch (errno) {
             case ESTALE:
-                reply_error(fd, SANDBOX_ERR_SESSION_EXPIRED,
+                reply_error(fd, rid, SANDBOX_ERR_SESSION_EXPIRED,
                             "session expired; its volume is already gone");
                 break;
             case ERANGE:
-                reply_error(fd, SANDBOX_ERR_SESSION_LIMIT,
+                reply_error(fd, rid, SANDBOX_ERR_SESSION_LIMIT,
                             "session has reached the platform maximum lifetime");
                 break;
             case EINVAL:
-                reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "invalid session key");
+                reply_error(fd, rid, SANDBOX_ERR_INVALID_SPEC,
+                            "invalid session key");
                 break;
             case ENOENT:
-                reply_error(fd, SANDBOX_ERR_SESSION_UNKNOWN,
+                reply_error(fd, rid, SANDBOX_ERR_SESSION_UNKNOWN,
                             "no such session");
                 break;
             default:
-                reply_error(fd, SANDBOX_ERR_INTERNAL, "cannot renew session");
+                reply_error(fd, rid, SANDBOX_ERR_INTERNAL,
+                            "cannot renew session");
                 break;
         }
         return;
     }
     ipc_response_t resp;
     memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
     resp.kind = IPC_REQ_RENEW;
     resp.expires_at = (uint64_t)m.expires_at;
     send_response(fd, &resp);
@@ -921,17 +963,25 @@ static void handle_message(int fd, session_t* s, const uint8_t* payload,
                            size_t len) {
     ipc_request_t req;
     if (ipc_decode_request(payload, len, &req) < 0) {
-        reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "malformed request");
+        // The id lives inside the message that failed to parse, so there is
+        // nothing to echo; a client with outstanding ids must treat a 0 reply as
+        // fatal for the connection rather than as one of its own.
+        reply_error(fd, 0, SANDBOX_ERR_INVALID_SPEC, "malformed request");
         return;
     }
+    uint64_t rid = req.request_id;
     switch (req.kind) {
         case IPC_REQ_CREATE:  submit_create(fd, s, &req); break;
-        case IPC_REQ_DESTROY: handle_destroy(fd, s, req.sandbox_id); break;
-        case IPC_REQ_PAUSE:   handle_pause_resume(fd, s, req.sandbox_id, true); break;
-        case IPC_REQ_RESUME:  handle_pause_resume(fd, s, req.sandbox_id, false); break;
-        case IPC_REQ_INSPECT: handle_inspect(fd, s, req.sandbox_id); break;
+        case IPC_REQ_DESTROY: handle_destroy(fd, rid, s, req.sandbox_id); break;
+        case IPC_REQ_PAUSE:
+            handle_pause_resume(fd, rid, s, req.sandbox_id, true); break;
+        case IPC_REQ_RESUME:
+            handle_pause_resume(fd, rid, s, req.sandbox_id, false); break;
+        case IPC_REQ_INSPECT: handle_inspect(fd, rid, s, req.sandbox_id); break;
         case IPC_REQ_RENEW:   handle_renew(fd, &req); break;
-        default:              reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "unknown op"); break;
+        default:
+            reply_error(fd, rid, SANDBOX_ERR_INVALID_SPEC, "unknown op");
+            break;
     }
     ipc_request_clear(&req);
 }
@@ -960,7 +1010,11 @@ static void drop_session(session_t* s) {
     }
     s->cq_tail = NULL;
     s->n_outstanding = 0;
-    s->cq_active = false;
+    // Jobs already dispatched are owned by the worker/result path; it reclaims
+    // them when session_find misses or the slot's epoch differs. The slot is
+    // memset on reuse, so resetting the counters is enough.
+    s->n_active = 0;
+    s->n_serial = 0;
     if (g.epfd >= 0) {
         epoll_ctl(g.epfd, EPOLL_CTL_DEL, s->fd, NULL);
     }

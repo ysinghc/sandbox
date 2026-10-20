@@ -105,6 +105,14 @@ int pool_manager_init(pool_manager_t* pool, int target_size) {
     return 0;
 }
 
+int pool_manager_warm_count(pool_manager_t* pool) {
+    if (!pool) return 0;
+    pthread_mutex_lock(&pool->lock);
+    int n = pool->warm_count;
+    pthread_mutex_unlock(&pool->lock);
+    return n;
+}
+
 void pool_manager_set_max_queue_depth(pool_manager_t* pool, int depth) {
     if (!pool) return;
     if (depth < 1) depth = 1;

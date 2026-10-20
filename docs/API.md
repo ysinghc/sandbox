@@ -89,8 +89,11 @@ void            sandbox_cleanup(void);
 - `sandbox_cleanup` destroys **every** sandbox owned by the session and closes
   the socket. **A disconnected session reclaims its sandboxes**, so a client
   must stay connected for as long as it wants the VM alive.
-- All functions are thread-safe per handle; a handle must not be used from one
-  thread while destroyed in another.
+- All functions are thread-safe, including on one shared connection: since
+  #12 every request carries a correlation id and `libsandbox` runs a reader
+  thread that matches the reply, so N threads may have N Creates in flight at
+  once and the daemon may complete them in any order.
+- A handle must not be used from one thread while destroyed in another.
 
 ### Example
 
@@ -199,6 +202,25 @@ Unix socket, length-prefixed protobuf messages (see
 
 `Create` is served asynchronously by a worker pool; the `session_token` returned
 in `CreateResponse` is the only credential a guest uses to reach the broker.
+
+### Request correlation (#12)
+
+Every `ClientMessage` may carry `request_id` (field 100, `uint64`); the daemon
+echoes it on the matching `ServerMessage`, including errors.
+
+- **Non-zero**: the client may have several requests in flight on one
+  connection. Replies are *not* ordered — match them by `request_id`. This is
+  what makes several Creates run concurrently on one session: the daemon
+  dispatches all queued id-carrying Creates and replies as each finishes.
+- **Zero** (or absent): legacy mode, byte-identical to the pre-0.15 wire. The
+  daemon keeps that session's replies in request order and runs one Create at a
+  time, because such a client identifies replies only by arrival order. A
+  request with id 0 that is queued behind in-flight Creates waits for them, so
+  it cannot overtake an earlier request.
+
+A malformed frame that cannot be parsed replies with `request_id = 0`; a client
+with outstanding ids must treat that as fatal for the connection, not as one of
+its own replies.
 
 ## Credential broker
 

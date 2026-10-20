@@ -8,7 +8,7 @@ env:
   # Tests that need real root + /dev/kvm + Firecracker + guest assets + the
   # template fixture cannot run on hosted runners, so they are excluded here
   # (they run on the privileged lab host). See docs/TESTING.md.
-  CI_TEST_EXCLUDE: "pool|network|tmpl_setup|vmm|ipc|cgroup"
+  CI_TEST_EXCLUDE: "pool|network|tmpl_setup|vmm|^ipc$|cgroup"
 
 jobs:
   spdx:

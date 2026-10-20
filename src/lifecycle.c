@@ -94,24 +94,142 @@ struct sandbox_handle_t {
     char token[IPC_TOKEN_HEX_LEN + 1];
 };
 
-static int g_client_fd = -1;
+// ---------------------------------------------------------------------------
+// Client transport (#12)
+//
+// One connection per process, usable from several threads at once: every
+// request carries a correlation id, a reader thread matches the reply and wakes
+// the caller. Without this, "create several sandboxes in parallel" would be a
+// polite lie -- the daemon would have to serialise them to keep replies in
+// order, which is exactly what the old protocol forced.
+//
+// A transport failure is latched in `dead` and wakes every waiter, so a broken
+// connection fails calls instead of hanging them.
+// ---------------------------------------------------------------------------
 
-static sandbox_error_t client_roundtrip(const ipc_request_t* req,
+typedef struct c_waiter {
+    uint64_t rid;
+    ipc_response_t resp;
+    bool done;
+    struct c_waiter* next;
+} c_waiter_t;
+
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int fd;
+    pthread_t reader;
+    bool reader_started;
+    int gen;               // bumped per connection; stale readers see it
+    sandbox_error_t dead;  // SANDBOX_OK while the connection is usable
+    uint64_t next_rid;
+    c_waiter_t* waiters;
+} c = { .mu = PTHREAD_MUTEX_INITIALIZER, .cv = PTHREAD_COND_INITIALIZER,
+        .fd = -1, .dead = SANDBOX_OK, .next_rid = 1 };
+
+// Caller holds c.mu.
+static void client_fail(sandbox_error_t why) {
+    if (c.dead == SANDBOX_OK) c.dead = why;
+    pthread_cond_broadcast(&c.cv);
+}
+
+static void* client_reader(void* arg) {
+    int gen = (int)(intptr_t)arg;
+    for (;;) {
+        uint8_t buf[IPC_FRAME_MAX];
+        size_t n = 0;
+        pthread_mutex_lock(&c.mu);
+        if (gen != c.gen || c.fd < 0) {
+            pthread_mutex_unlock(&c.mu);
+            return NULL;
+        }
+        int fd = c.fd;
+        pthread_mutex_unlock(&c.mu);
+
+        if (ipc_recv_frame(fd, buf, sizeof(buf), &n) < 0) {
+            pthread_mutex_lock(&c.mu);
+            if (gen == c.gen) client_fail(SANDBOX_ERR_DAEMON_UNREACHABLE);
+            pthread_mutex_unlock(&c.mu);
+            return NULL;
+        }
+        ipc_response_t resp;
+        if (ipc_decode_response(buf, n, &resp) < 0) {
+            pthread_mutex_lock(&c.mu);
+            if (gen == c.gen) client_fail(SANDBOX_ERR_INTERNAL);
+            pthread_mutex_unlock(&c.mu);
+            return NULL;
+        }
+
+        pthread_mutex_lock(&c.mu);
+        if (gen != c.gen) {  // connection was replaced while we read
+            pthread_mutex_unlock(&c.mu);
+            return NULL;
+        }
+        for (c_waiter_t* w = c.waiters; w; w = w->next) {
+            if (w->rid == resp.request_id) {
+                w->resp = resp;
+                w->done = true;
+                pthread_cond_broadcast(&c.cv);
+                break;
+            }
+        }
+        pthread_mutex_unlock(&c.mu);
+    }
+}
+
+// Send one request and wait for the reply carrying its id.
+static sandbox_error_t client_roundtrip(ipc_request_t* req,
                                         ipc_response_t* resp) {
-    if (g_client_fd < 0) return SANDBOX_ERR_DAEMON_UNREACHABLE;
     uint8_t buf[IPC_FRAME_MAX];
     size_t n = 0;
-    if (ipc_encode_request(req, buf, sizeof(buf), &n) < 0) {
-        return SANDBOX_ERR_INTERNAL;
+
+    pthread_mutex_lock(&c.mu);
+    if (c.dead != SANDBOX_OK || c.fd < 0) {
+        sandbox_error_t rc = c.dead != SANDBOX_OK ? c.dead
+                                                  : SANDBOX_ERR_DAEMON_UNREACHABLE;
+        pthread_mutex_unlock(&c.mu);
+        return rc;
     }
-    if (ipc_send_frame(g_client_fd, buf, n) < 0) {
-        return SANDBOX_ERR_DAEMON_UNREACHABLE;
+    // 0 is reserved for "legacy, in-order" callers; never hand it out.
+    uint64_t rid = c.next_rid++;
+    if (rid == 0) rid = c.next_rid++;
+    req->request_id = rid;
+
+    // Register before sending: a fast daemon may answer before send() returns.
+    c_waiter_t w;
+    memset(&w, 0, sizeof(w));
+    w.rid = rid;
+    w.next = c.waiters;
+    c.waiters = &w;
+
+    if (ipc_encode_request(req, buf, sizeof(buf), &n) < 0 ||
+        ipc_send_frame(c.fd, buf, n) < 0) {
+        c.waiters = w.next;
+        client_fail(SANDBOX_ERR_DAEMON_UNREACHABLE);
+        sandbox_error_t rc = c.dead;
+        pthread_mutex_unlock(&c.mu);
+        return rc;
     }
-    if (ipc_recv_frame(g_client_fd, buf, sizeof(buf), &n) < 0) {
-        return SANDBOX_ERR_DAEMON_UNREACHABLE;
+
+    while (!w.done && c.dead == SANDBOX_OK)
+        pthread_cond_wait(&c.cv, &c.mu);
+
+    sandbox_error_t rc = c.dead;
+    for (c_waiter_t** pp = &c.waiters; *pp; pp = &(*pp)->next) {
+        if (*pp == &w) {
+            *pp = w.next;
+            break;
+        }
     }
-    if (ipc_decode_response(buf, n, resp) < 0) return SANDBOX_ERR_INTERNAL;
-    return SANDBOX_OK;
+    if (rc == SANDBOX_OK) {
+        if (!w.done || w.resp.request_id != rid) {
+            rc = SANDBOX_ERR_INTERNAL;  // protocol invariant broken
+        } else {
+            *resp = w.resp;
+        }
+    }
+    pthread_mutex_unlock(&c.mu);
+    return rc;
 }
 
 // Fill a request with the id of a simple (destroy/pause/resume/inspect) op.
@@ -123,10 +241,7 @@ static void req_by_id(ipc_request_t* req, ipc_req_kind_t kind, uint32_t id) {
 
 sandbox_error_t sandbox_init(const char* socket_path) {
     if (!socket_path || !*socket_path) return SANDBOX_ERR_DAEMON_UNREACHABLE;
-    if (g_client_fd >= 0) {
-        close(g_client_fd);
-        g_client_fd = -1;
-    }
+    sandbox_cleanup();  // drop a previous connection, reader included
     int fd = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (fd < 0) return SANDBOX_ERR_INTERNAL;
 
@@ -142,7 +257,19 @@ sandbox_error_t sandbox_init(const char* socket_path) {
         close(fd);
         return SANDBOX_ERR_DAEMON_UNREACHABLE;
     }
-    g_client_fd = fd;
+
+    pthread_mutex_lock(&c.mu);
+    c.fd = fd;
+    c.dead = SANDBOX_OK;
+    int gen = ++c.gen;
+    if (pthread_create(&c.reader, NULL, client_reader, (void*)(intptr_t)gen) != 0) {
+        close(fd);
+        c.fd = -1;
+        pthread_mutex_unlock(&c.mu);
+        return SANDBOX_ERR_INTERNAL;
+    }
+    c.reader_started = true;
+    pthread_mutex_unlock(&c.mu);
     return SANDBOX_OK;
 }
 
@@ -245,10 +372,23 @@ sandbox_error_t sandbox_session_renew(const char* session_key,
 }
 
 void sandbox_cleanup(void) {
-    if (g_client_fd >= 0) {
-        close(g_client_fd);
-        g_client_fd = -1;
+    pthread_t reader;
+    bool join = false;
+    pthread_mutex_lock(&c.mu);
+    if (c.fd >= 0) {
+        int fd = c.fd;
+        c.fd = -1;
+        c.gen++;  // orphan the reader: anything it still reads is not ours
+        client_fail(SANDBOX_ERR_DAEMON_UNREACHABLE);
+        shutdown(fd, SHUT_RDWR);  // wakes a reader blocked in recv
+        close(fd);
+        join = c.reader_started;
+        reader = c.reader;
+        c.reader_started = false;
     }
+    pthread_mutex_unlock(&c.mu);
+    // Join outside the lock: the reader needs it to finish.
+    if (join) pthread_join(reader, NULL);
 }
 
 const char* sandbox_handle_token(const sandbox_handle_t* handle) {

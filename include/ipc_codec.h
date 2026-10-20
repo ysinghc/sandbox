@@ -34,6 +34,9 @@ typedef enum {
 typedef struct {
     ipc_req_kind_t kind;
 
+    // #12: echoed on the response. 0 = legacy, in-order replies.
+    uint64_t request_id;
+
     // create
     uint64_t memory_mib;
     uint32_t vcpu_count;
@@ -54,6 +57,7 @@ typedef struct {
 
 typedef struct {
     ipc_req_kind_t kind;  // selects which success oneof branch to emit
+    uint64_t request_id;  // #12: echo of the request's id (0 = legacy)
     bool is_error;
     int32_t error_code;
     char error_message[IPC_MAX_ERRMSG];

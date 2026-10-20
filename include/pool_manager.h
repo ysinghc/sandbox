@@ -45,6 +45,12 @@ typedef struct {
 int pool_manager_init(pool_manager_t* pool, int target_size);
 void pool_manager_destroy(pool_manager_t* pool);
 
+// Number of VMs currently warm and ready to hand out without a restore.
+// "Configured" and "warm" are different states: the replenishment thread fills
+// the pool asynchronously, so a caller that must not wait (and a test that
+// wants to distinguish a pool hit from a restore) needs to ask.
+int pool_manager_warm_count(pool_manager_t* pool);
+
 // Phase 11: set the effective overflow-queue depth (clamped to
 // [1, POOL_MAX_QUEUE_DEPTH]). Safe to call after init, before serving.
 void pool_manager_set_max_queue_depth(pool_manager_t* pool, int depth);

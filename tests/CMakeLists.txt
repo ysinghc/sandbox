@@ -178,6 +178,13 @@ set_tests_properties(ipc PROPERTIES
     FIXTURES_REQUIRED tmplfix
     ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}${TEST_ASSET_ENV}")
 
+# #12: correlation-id encoding contract (no root, no VMs, no transport).
+add_executable(test_ipc_codec test_ipc_codec.c)
+target_include_directories(test_ipc_codec PRIVATE ../include ../src)
+target_link_libraries(test_ipc_codec sandbox)
+add_test(NAME ipc_codec COMMAND test_ipc_codec)
+set_tests_properties(ipc_codec PROPERTIES TIMEOUT 30)
+
 # #31: startup sweep of jails left by a crashed daemon. Needs root: it creates
 # bind mounts and chroots a child to stand in for a live VMM.
 add_executable(test_jail_sweep test_jail_sweep.c)

@@ -2021,14 +2021,13 @@ authoritative.
   `token_issue`, posts a `create_result_t` to a mutex-guarded queue, and wakes
   the loop through the existing `eventfd`. The loop consumes results on
   `EP_WAKE` and does all lifecycle mutation (`lifecycle_track`, `session_own`,
-  `pidfd_track`, response send) — those structures stay single-threaded. Per
-  session, only the head of a FIFO is dispatched at a time, so a client's
-  responses remain in request order; a stale result is matched by
-  `(session_fd, epoch)` so a reused fd slot is never misattributed. New config
-  keys `create_workers` (default 4), `max_creates_per_session` (16),
-  `max_creates_per_uid` (64) bound concurrency (over-limit → `POOL_EXHAUSTED`).
-  Note the protocol still has no request-id, hence the per-session
-  serialization; true concurrent creates from one session would need one.
+  `pidfd_track`, response send) — those structures stay single-threaded. A
+  stale result is matched by `(session_fd, epoch)` so a reused fd slot is never
+  misattributed. New config keys `create_workers` (default 4),
+  `max_creates_per_session` (16), `max_creates_per_uid` (64) bound concurrency
+  (over-limit → `POOL_EXHAUSTED`). Originally only the head of a per-session
+  FIFO was dispatched, because the protocol had no request id and replies were
+  matched by arrival order; #12 removed that limit (next bullet).
 - **Env-inject readiness + confirmation (§10.9).** The unconditional 1 s sleep
   before the first vsock `CONNECT` is gone. Instead the daemon polls the
   restored VM's `serial.log` for a post-restore guest marker
@@ -2079,6 +2078,23 @@ authoritative.
   `docs/RUNBOOK.md` now says that a restart is the whole recovery procedure.
   New privileged ctest `jail_sweep` (bind mounts + a chrooted stand-in VMM);
   it is in the privileged job's `-R` list, so it cannot silently skip.
+- **Request correlation (#12).** `ClientMessage`/`ServerMessage` carry
+  `request_id` (field 100, `uint64`), echoed on success *and* error replies, so a
+  client no longer has to infer which request a reply belongs to. That is what
+  removes the per-session serialization: queued Creates with non-zero ids are
+  dispatched together (`dispatch_cq()`), and the worker completing first replies
+  first. The legacy contract is preserved rather than broken: a request with id
+  0 is dispatched alone and nothing behind it starts until it finishes, so an
+  old client still sees in-order replies, and an id-0 message is byte-identical
+  on the wire (the field is absent, not encoded as zero). `libsandbox` gained the
+  other half: a reader thread plus a waiter table keyed by id, so several
+  threads can share one connection and each gets its own reply; a transport
+  failure is latched and wakes every waiter instead of hanging them. A reply
+  whose id does not match is `SANDBOX_ERR_INTERNAL`, never silently accepted.
+  New unprivileged ctest `ipc_codec` (id round trip, out-of-order reply decode,
+  legacy byte compatibility); `test_ipc` adds two Creates in flight on one
+  connection — a session create (dedicated restore) and a warm-pool hit — and
+  asserts the fast reply overtakes the slow request.
 
 ### 15.15 Phase 13 — Observability, Hardening & Docs (§10.12–§10.15)
 - **Structured logging (§10.12).** New `include/log.h` + `src/log.c`. One JSON

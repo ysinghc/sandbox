@@ -82,6 +82,10 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
         default:
             return -1;
     }
+    // #12: one place, every request kind. Zero is the proto default, so a legacy
+    // caller that never sets it produces a byte-identical message.
+    if (req->request_id) msg.set_request_id(req->request_id);
+
     size_t n = msg.ByteSizeLong();
     if (n > cap) return -1;
     if (n && !msg.SerializeToArray(buf, static_cast<int>(n))) return -1;
@@ -94,6 +98,7 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
     ipc_request_init(out);
     sandbox::ClientMessage msg;
     if (!msg.ParseFromArray(buf, static_cast<int>(len))) return -1;
+    out->request_id = msg.request_id();
     switch (msg.payload_case()) {
         case sandbox::ClientMessage::kCreate: {
             const auto& c = msg.create();
@@ -182,6 +187,8 @@ int ipc_encode_response(const ipc_response_t* resp, uint8_t* buf, size_t cap,
                 return -1;
         }
     }
+    if (resp->request_id) msg.set_request_id(resp->request_id);
+
     size_t n = msg.ByteSizeLong();
     if (n > cap) return -1;
     if (n && !msg.SerializeToArray(buf, static_cast<int>(n))) return -1;
@@ -194,6 +201,7 @@ int ipc_decode_response(const uint8_t* buf, size_t len, ipc_response_t* out) {
     memset(out, 0, sizeof(*out));
     sandbox::ServerMessage msg;
     if (!msg.ParseFromArray(buf, static_cast<int>(len))) return -1;
+    out->request_id = msg.request_id();
     switch (msg.payload_case()) {
         case sandbox::ServerMessage::kError: {
             const auto& e = msg.error();

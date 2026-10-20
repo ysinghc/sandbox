@@ -493,10 +493,21 @@ Done     #20 privileged e2e now *runs*: warm 0.18 ms / provisioned 45.33 ms on s
 Done     #10 vsock peer authentication (C12), verified host-side + in-guest
 Done     #22 determinism: clock_realtime on load (guest skew 0 s vs host with a
          16 s-old template) + rootfs digest in the manifest + docs
-Next     #23 session workspace volume + TTL — follow docs/WORKSPACE_DISK.md (D7)
-Next     #6  aarch64 arch timer — needs an ARM host; register one and set PRIVILEGED_ARM
-         → #24 guest RPC → #25/#26 → #27 control-plane API → #28 MCP gateway
-         (#4, #12, #17, #9, #11, #7, #13–#16, #18 follow in the burn-down order)
+Done     #23 session workspace volume + TTL — follow docs/WORKSPACE_DISK.md (D7)
+Done     #6  aarch64 arch timer — reproduced on the Pi, documented in §15.7, not fixed;
+         product consequence recorded; the fix path is #30 (modern guest kernel)
+Done     #31 crash-left jails: startup sweep, liveness via /proc/<pid>/root, privileged
+         ctest jail_sweep green on x86_64 *and* aarch64
+Done     #12 request correlation: request_id echoed, per-session create serialization
+         removed for id-carrying requests, libsandbox reader thread, ctest ipc_codec
+Next     #30 guest kernel off 4.14 — blocks ARM sleep/timers, VMGenID and vsock-local
+         → #24 guest RPC → #7 → #26 → #25 → #27 control-plane API → #28 MCP gateway
+         (#4, #17, #9, #11, #13, #14, #15, #18, #16 follow in the burn-down order)
+
+The order is set by *rework*, not by phase: the wire protocol (#12 → #24 → #27), the
+privileged runtime (#31 → #9 → #11), the broker body path (#7 → #26), and the guest
+image (#30 → #25 → #14 → #15) each form a chain where doing the later item first means
+rewriting it. The Project's Sequence field and Discussion #29 carry the same order.
 ```
 
 > **Note on the order.** The privileged host came online on Day 3, and it changed what "done"

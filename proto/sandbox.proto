@@ -3,6 +3,14 @@ package sandbox;
 
 // Client → Daemon
 message ClientMessage {
+  // #12: client-supplied correlation id, echoed verbatim on the response.
+  //
+  // Non-zero: the client may have several requests in flight on one connection
+  // (including several Creates) and match replies by this id; the daemon does
+  // not promise an answer order. Zero: legacy client — the daemon keeps that
+  // session's replies in request order and runs one Create at a time, because
+  // such a client identifies replies only by arrival order.
+  uint64 request_id = 100;
   oneof payload {
     CreateRequest  create  = 1;
     DestroyRequest destroy = 2;
@@ -53,6 +61,8 @@ message InspectRequest {
 
 // Daemon → Client
 message ServerMessage {
+  // Echo of ClientMessage.request_id (0 if the request had none).
+  uint64 request_id = 100;
   oneof payload {
     CreateResponse  create  = 1;
     DestroyResponse destroy = 2;
