@@ -214,26 +214,21 @@ static int await_synack(int fd, const uint8_t* tap_mac, uint32_t sport_s,
     }
 }
 
-// Returns 0 if *this* SYN (sport_s, dport_s, seq) gets no SYN-ACK within ms.
+// Returns 0 if no reply to *this* SYN (sport_s -> dport_s at server_ip) arrives
+// within ms; -1 as soon as one does, whatever its flags (SYN-ACK or RST).
 //
-// The drop verdict is about one specific connection, so the check must be keyed
-// on that connection's tuple. A retransmitted SYN-ACK from an earlier connection
-// is not a reply to this SYN, and the RST that is supposed to silence those can
-// arrive before the listener's side of the connection exists -- which is a real
-// race this test hit (a correct drop was reported as a failure because a stale
-// retransmission was in the tap when the window opened). await_synack already
-// matches on the tuple, and its timeout is exactly the inverse of what is wanted.
-static int expect_no_synack(int fd, const uint8_t* tap_mac, uint32_t sport_s,
-                            uint32_t dport_s, uint32_t seq, uint32_t server_ip,
-                            int ms) {
-    return await_synack(fd, tap_mac, sport_s, dport_s, seq, server_ip, ms) == 0
-               ? -1
-               : 0;
-}
-
-// Returns 0 if no IPv4 frame arrives within ms (drop verdict).
-// Non-IPv4 noise (ARP, IPv6 MLD on fresh interfaces) is ignored.
-static int expect_silence(int fd, int ms) {
+// A drop verdict is about one connection, so it has to be keyed on that
+// connection's tuple. The tap is shared by every phase of this test, and a
+// retransmitted SYN-ACK from an earlier connection is not a reply to this SYN --
+// counting it was a real race here (a correct drop reported as a failure). The
+// RST that is supposed to silence retransmits can arrive before the listener's
+// side of the connection exists, so widening the window is not a fix.
+// ARP for the guest is still answered, because the path being tested needs it.
+static int expect_no_reply(int fd, const uint8_t* tap_mac, uint32_t sport_s,
+                           uint32_t dport_s, uint32_t seq,
+                           uint32_t server_ip, int ms) {
+    (void)seq;  // the tuple identifies the connection; the ISN need not match
+    uint32_t guest_ip = g_guest_ip;
     struct timespec end;
     clock_gettime(CLOCK_MONOTONIC, &end);
     end.tv_sec += ms / 1000;
@@ -249,7 +244,24 @@ static int expect_silence(int fd, int ms) {
         if (rc == 0) return 0;
         uint8_t f[2048];
         ssize_t n = read(fd, f, sizeof(f));
-        if (n >= 14 && f[12] == 0x08 && f[13] == 0x00) return -1;  // IPv4 leaked
+        if (n < 14) continue;
+        if (is_arp_for_guest(f, n)) {
+            send_arp_reply(fd, tap_mac, f);
+            continue;
+        }
+        if (n < 54 || f[12] != 0x08 || f[13] != 0x00) continue;
+        const uint8_t* ip = f + 14;
+        if ((ip[0] >> 4) != 4 || ip[9] != 6) continue;
+        uint32_t s, d;
+        memcpy(&s, ip + 12, 4);
+        memcpy(&d, ip + 16, 4);
+        const uint8_t* tcp = ip + 20;
+        uint16_t sp, dp;
+        memcpy(&sp, tcp, 2);
+        memcpy(&dp, tcp + 2, 2);
+        if (s == server_ip && d == guest_ip && ntohs(sp) == dport_s &&
+            ntohs(dp) == sport_s)
+            return -1;  // a reply to this SYN
     }
 }
 
@@ -519,7 +531,8 @@ int main(void) {
     inet_pton(AF_INET, OUTER_IP_S, &outer_ip);
     flen = build_syn(frame, tap_mac, 40002, 80, 0x20000001, outer_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject outer SYN");
-    if (expect_silence(net.tap_fd, 1000) < 0) {
+    if (expect_no_reply(net.tap_fd, tap_mac, 40002, 80, 0x20000001, outer_ip,
+                        1000) < 0) {
         fprintf(stderr, "FAIL forward_drop: reply despite drop rule\n");
         abort();
     }
@@ -542,8 +555,8 @@ int main(void) {
     CHECK_RC(run(cmd), "re-add drop rule");
     flen = build_syn(frame, tap_mac, 40004, 80, 0x20000003, outer_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject outer SYN 3");
-    if (expect_no_synack(net.tap_fd, tap_mac, 40004, 80, 0x20000003, outer_ip,
-                         1000) < 0) {
+    if (expect_no_reply(net.tap_fd, tap_mac, 40004, 80, 0x20000003, outer_ip,
+                        1000) < 0) {
         fprintf(stderr, "FAIL forward_drop: reply after rule restore\n");
         abort();
     }
@@ -559,7 +572,8 @@ int main(void) {
     fflush(stdout);
     flen = build_syn(frame, tap_mac, 40005, 9999, 0x30000001, broker_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject local SYN");
-    if (expect_silence(net.tap_fd, 1000) < 0) {
+    if (expect_no_reply(net.tap_fd, tap_mac, 40005, 9999, 0x30000001, broker_ip,
+                        1000) < 0) {
         fprintf(stderr, "FAIL input_drop: reply from closed local port\n");
         abort();
     }
@@ -586,14 +600,16 @@ int main(void) {
     // Guest A -> B-host:8080 (local to host, wrong VM): input drop on tap A.
     flen = build_syn(frame, tap_mac, 40006, 8080, 0x40000001, host2_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject cross SYN");
-    if (expect_silence(net.tap_fd, 1000) < 0) {
+    if (expect_no_reply(net.tap_fd, tap_mac, 40006, 8080, 0x40000001, host2_ip,
+                        1000) < 0) {
         fprintf(stderr, "FAIL two_vm: cross-VM host reply\n");
         abort();
     }
     // Guest A -> B-guest:80 (forwarded): forward drop on tap A.
     flen = build_syn(frame, tap_mac, 40007, 80, 0x40000002, guest2_ip);
     CHECK_SYS(write(net.tap_fd, frame, flen), "inject cross SYN 2");
-    if (expect_silence(net.tap_fd, 1000) < 0) {
+    if (expect_no_reply(net.tap_fd, tap_mac, 40007, 80, 0x40000002, guest2_ip,
+                        1000) < 0) {
         fprintf(stderr, "FAIL two_vm: cross-VM guest reply\n");
         abort();
     }
