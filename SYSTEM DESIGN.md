@@ -1648,12 +1648,31 @@ authoritative.
   there; the original dev host could not build Firecracker and had no usable
   sudo. Firecracker v1.17.0 is built from source
   (`aarch64-unknown-linux-musl`) with assets under `/opt/sandbox-assets/`.
-- **Post-restore arch timer**: after a UFFD restore the guest *does* resume and
-  execute (proven by fresh serial output), but the aarch64 arch timer does not
-  re-arm on this host, so a guest that `sleep`s hangs in WFI. The rootfs
-  heartbeat therefore **busy-spins** (`SANDBOX-TICK` with a bounded loop)
-  instead of `sleep 1`, so a fresh marker is executable proof of the restored
-  vCPU.
+- **Post-restore arch timer: the guest's virtual timer interrupt is never
+  delivered after a restore on aarch64, so a guest that *waits* hangs.** On this
+  host (Pi 5, host kernel `6.8.0-1065-raspi`, Firecracker v1.17.0 for
+  `aarch64-unknown-linux-musl`, guest Linux 4.14.174) the vCPUs resume and
+  execute (fresh serial output proves it), but a timer programmed before the
+  snapshot never fires afterwards. Reproduced without the engine, so it is not
+  an IPC or harness artifact: a guest `/init` prints `SANDBOX-READY`, then
+  `sleep 3`, then a second `sleep 3`, each followed by a marker with
+  `/proc/uptime`; the snapshot is taken ~0.2 s into the first sleep. Before the
+  snapshot the same construct is exact (`PROBE-BEFORE uptime=0.22` →
+  `PROBE-AFTER uptime=3.22`), and after the restore **no marker ever appears**
+  (15 s, both sleeps outstanding). Not a rate or skew problem — the wakeup never
+  happens at all.
+  Consequence for the product: on aarch64, any process that blocks on a timer
+  after a restore (`sleep`, `poll`/`select` with a timeout, `curl` timeouts,
+  `apt`/`pip`) hangs until something else wakes it. The engine itself survives
+  because the guest agent busy-polls its vsock fd and emits `SANDBOX-TICK` from a
+  bounded loop instead of `sleep 1`; that workaround is why the suite passes and
+  must not be "simplified" back to a sleep.
+  The guest clock behaves the same way: `clock_realtime` is x86_64-only (§15.16),
+  so an aarch64 sandbox also resumes with the template's wall clock.
+  Not fixed: the next step is a modern guest kernel (the 4.14 image also blocks
+  VMGenID, §15.16, and guest-local vsock, §15.11), tracked in #30. If a ≥5.10
+  guest still fails, this is an upstream Firecracker report with the experiment
+  above as the reproduction (no such issue exists upstream as of 2026-10).
 - **Docker `FORWARD` conflict**: the test host runs Docker, whose iptables
   `FORWARD` chain has `policy drop` at the same `filter` hook priority as
   `sandbox_policy`. At equal priority a drop in *any* chain wins regardless of

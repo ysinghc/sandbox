@@ -125,6 +125,12 @@ ip link set lo up 2>/dev/null || true
 # One process that both polls the vsock socket and emits the heartbeat keeps
 # working without timer interrupts. `exec` replaces the shell so the captured
 # snapshot has the agent as the only CPU consumer.
+#
+# Do not "simplify" this back to a shell `sleep 1` heartbeat. On aarch64 the
+# guest's timer interrupt is never delivered after a restore (SYSTEM DESIGN.md
+# §15.7 has a minimal, engine-free reproduction: a guest snapshotted mid-sleep
+# never wakes). That is also a product limit, not just a test quirk: any
+# workload that blocks on a timeout in a restored sandbox hangs.
 echo "SANDBOX-AGENT-LAUNCH"
 exec /bin/sandbox-agent
 INIT_SCRIPT

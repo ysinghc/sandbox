@@ -98,9 +98,26 @@ available context in `jobs.<job_id>.if` (only `github`, `needs`, `vars`,
 ### Registering a runner
 
 The harness needs **root** (`chroot`, `setuid`, cgroup writes, `mknod` of
-`/dev/kvm`), and `sudo` normally prompts for a password — so run the runner
-service **as root**. Do not run it as an unprivileged user unless that user has
-passwordless `sudo`.
+`/dev/kvm`). There are two supportable shapes:
+
+- run the runner **service as root** (the x86_64 runner does this), or
+- run it as an unprivileged user with **passwordless `sudo`** (the aarch64
+  runner on a Pi 5 does this). The workflow then prefixes the suite with `sudo`.
+
+The second shape has two traps, both seen in practice and both now handled:
+
+1. **`sudo` resets the environment.** `SANDBOX_ROOTFS` / `SANDBOX_KERNEL` are
+   what point the harness at the guest image this job just built. Lost, the
+   suite runs against the operator's `/opt/sandbox-assets/rootfs.ext4` — older
+   guest, current host — and the failures look like architecture bugs (no clock
+   line, no workspace probe, no vsock peer line) while every test still "runs".
+   The paths are therefore baked into each test's `ENVIRONMENT` property at
+   configure time, and the job fails unless the fixture reports the image the
+   job built.
+2. **Files written under `sudo` belong to root.** The guest image lands in the
+   runner's work tree; the *next* checkout cannot delete it (`EACCES`) and dies
+   before its first step, poisoning every later run. `build-custom-rootfs.sh`
+   chowns its output back to `SUDO_UID`/`SUDO_GID`.
 
 ```sh
 # 1. Fetch the runner and unpack it. Check the version on
@@ -138,6 +155,26 @@ gh variable set PRIVILEGED_RUNNERS --body true
 gh workflow run "Privileged e2e" --ref master
 gh run watch
 ```
+
+For the **aarch64 leg** the same steps with the arm64 tarball, label
+`sandbox-arm64`, and a non-root account:
+
+```sh
+mkdir -p ~/actions-runner && cd ~/actions-runner
+curl -fsSL -o runner.tar.gz \
+  https://github.com/actions/runner/releases/download/v2.338.0/actions-runner-linux-arm64-2.338.0.tar.gz
+tar xzf runner.tar.gz && rm runner.tar.gz
+./config.sh --url https://github.com/ysinghc/sandbox --token "$TOKEN" \
+  --name sandbox-arm64-pi5 --labels sandbox-arm64 --unattended --replace
+sudo ./svc.sh install "$USER" && sudo ./svc.sh start
+gh variable set PRIVILEGED_ARM --body true       # only now: the label exists
+```
+
+The Pi 5 needs the host prerequisites above plus `libprotoc-dev`, `unzip`, and
+passwordless `sudo` for the runner account; `/var/tmp` must be on a dev-capable
+filesystem (`findmnt -T /var/tmp`). Measured there (4 cores, 8 GiB, mmc root):
+warm 2.07 ms, provisioned 132.33 ms — both inside budget, but the provisioned
+figure is ~2.5× the x86_64 runner's, so treat it as the real budget check.
 
 Before wiring up CI, prove the host can do it at all — this is the fastest way
 to surface a missing asset or a `nodev` workspace:
