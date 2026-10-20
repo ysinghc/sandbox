@@ -38,6 +38,9 @@ integrity before starting.
 | — | `SANDBOX_WORKSPACE_ROOT` | `/var/lib/sandbox-engine/workspaces` | Root of the session workspace store (#23). One 0700 directory per session, holding its `workspace.ext4` and `meta.json`. |
 | — | `SANDBOX_WORKSPACE_MAX_TTL` | `2592000` (30 d) | Platform maximum session-workspace lifetime, in seconds. A create asking for more is clamped to it; a renewal can never exceed `created_at + this`. |
 | — | `SANDBOX_REAP_INTERVAL_SECONDS` | `60` | How often the daemon expires session workspaces whose TTL has passed. |
+| — | `SANDBOX_FLUSH_MS` | `5000` | How long a session sandbox's destroy waits for the guest's `sync()` acknowledgement before the VMM is killed. Best effort: an unclearable sandbox is worse than a lost write, but the missing flush is logged. |
+| — | `SANDBOX_VSOCK_SETTLE_MS` | guest-dependent | Max wait for evidence the guest agent resumed after a restore, before the control channel is used. |
+| — | `SANDBOX_VSOCK_CONFIRM_MS` | `2000` | Max wait for the guest to confirm it applied an env injection. |
 | `vsock_settle_ms` | `SANDBOX_VSOCK_SETTLE_MS` | `1000` | Fallback settle time before the first vsock `CONNECT` if the guest readiness marker is not seen (§10.9). |
 | `metrics_port` | `SANDBOX_METRICS_PORT` | `9180` | Metrics/health port. |
 | `metrics_bind` | `SANDBOX_METRICS_BIND` | `0.0.0.0` | Metrics bind address; **empty disables** the listener. |

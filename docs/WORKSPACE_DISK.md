@@ -9,6 +9,82 @@
 
 ---
 
+## 0. Status: what exists, and where it deviates from this design
+
+**Implemented in 0.14.0 (#23).** This section is the ground truth; the sections
+below it are the design as first written, and where they disagree with the code
+they are marked. A design that drifts from the implementation is worse than no
+design, so the deviations and their reasons are recorded here rather than quietly
+edited away.
+
+Where the implementation deviates, and why:
+
+1. **The base image is never mounted or pre-populated (§2.1, §2.3).** The design
+   mounted the base at build time to pre-install content. The code calls
+   `workspace_format_base()` (`src/workspace.c`), which runs `mkfs.ext4` via
+   `exec` (never `system()`) and stops there. Pre-population is a template-recipe
+   feature nobody has needed yet; adding a loop mount to the build path would add
+   a root-and-loop-device requirement for no current benefit. `lazy_itable_init`
+   is left at mke2fs' default.
+
+2. **The guest mounts `/workspace` *after* each restore, not before capture
+   (§4).** This is the single most important deviation, and it was found by a
+   failing test rather than by review. Mounting before the capture bakes the base
+   image's ext4 state and page cache into the snapshot, and every restore then
+   serves a *different* file behind the same device — the guest reads metadata
+   from RAM that does not match the volume, and reports
+   `EXT4-fs error (device vdb): checksumming directory block 0`. The guest agent
+   calls `mount("/dev/vdb", "/workspace", "ext4", 0, NULL)` on first use after a
+   restore (`scripts/sandbox-agent.c`, `ws_ensure_mount()`). Two things follow:
+   "a clone is byte-identical to its base" becomes true by construction rather
+   than by discipline, and ext4 replays the journal of a session whose VM was
+   killed mid-write, so a volume cannot come back torn.
+
+3. **Writes are flushed before the VM is killed (§4).** A page written by the
+   workload belongs to the *guest* until the guest writes it back, and
+   `vmm_destroy()` SIGKILLs the VMM. Without a flush, "the session remembers
+   things" was false for anything the workload had not itself flushed: the e2e
+   test re-created a session and found only its own new line. The engine now asks
+   the guest to `sync()` (a reserved control payload on the existing vsock env
+   channel, answered with `SANDBOX-FLUSH-OK`) and waits for the acknowledgement,
+   bounded by `SANDBOX_FLUSH_MS`. Best effort: a wedged guest is still destroyed,
+   and the missing flush is reported.
+
+4. **The jail-view constant name changed.** `WORKSPACE_JAILVIEW` no longer exists;
+   the jail path is `JAIL_WORKSPACE_PATH` in `include/jailer.h`, and
+   `include/workspace.h` deals only in host paths. The jailer chowns the volume at
+   bind time, so `workspace_chown()` was deleted.
+
+5. **Session identity and layout.** The registry keys a session by
+   `sha256_hex(session_key)` (`session_key` is 1–127 printable bytes without `"`
+   or `\`), stores `<root>/<sha256>/{workspace.ext4,meta.json}`, creates it in a
+   `.tmp-<pid>-<sha256>` directory and `rename()`s it into place. The design
+   predates the key/registry split and stored `.meta` inside the session
+   directory under a session id.
+
+6. **TTL is enforced by the registry reaper, not by unmounting a jail (§5).**
+   `workspace_reap()` runs on a timer in the daemon
+   (`SANDBOX_REAP_INTERVAL_SECONDS`, default 60 s), removes expired sessions and
+   abandoned staging directories, and never touches a session that is in use.
+   `expires_at = created_at + clamp(ttl, 60, platform_max)`: an absolute deadline
+   from creation, never extended automatically. Re-creating a session never
+   extends it; renewal (`workspace_renew()`) never shortens it.
+
+7. **A warm-pool VM cannot use a session volume, and does not (§3.2).** A pool
+   member is restored at provisioning time, before any request exists, so it binds
+   a per-VM *scratch* clone of the base as its volume. A request that names a
+   session key bypasses the pool and restores on purpose
+   (`restore_vm_with_workspace()`); an exclusive-use lease
+   (`workspace_lease()`/`workspace_release()`) prevents two VMs writing one image.
+
+8. **ext4 is supported first-class, not just as a fallback (§6).** The FUSE-free
+   plain-ext4 path must work, so `workspace_clone()` proves it: a real formatted
+   image is cloned and compared byte-for-byte in `tests/test_workspace.c`. The
+   btrfs/xfs reflink path remains the fast path.
+
+
+---
+
 ## 1. Overview
 
 Every sandbox session gets a private, writable ext4 volume mounted at `/workspace`
@@ -259,7 +335,29 @@ today; < 250 ms target).
 
 ## 4. Guest-side configuration
 
-The guest init script (in `scripts/build-custom-rootfs.sh`) must:
+**As built (see §0.2 and §0.3 — the text under "as designed" below was wrong).**
+
+The guest does *not* mount the volume before the template is captured. The init
+script only reports that the device was attached:
+
+```sh
+# scripts/build-custom-rootfs.sh: /workspace exists in the rootfs image (the
+# guest root is read-only, so the mount point is created at build time). The
+# volume is deliberately left unmounted here.
+if [ -b /dev/vdb ]; then echo "SANDBOX-WORKSPACE-DEVICE present"; fi
+```
+
+The guest agent mounts it on first use after a restore, and the engine flushes it
+before the VM is killed:
+
+```c
+/* scripts/sandbox-agent.c */
+if (mount("/dev/vdb", "/workspace", "ext4", 0, NULL) == 0 || errno == EBUSY)
+    g_ws_mounted = 1;   /* once per restore; ext4 replays any journal here */
+```
+
+<details>
+<summary>As designed (superseded — kept to show what was wrong)</summary>
 
 ```sh
 # Mount the second drive as /workspace
@@ -273,6 +371,11 @@ config has the drive registered and the mount point exists in guest memory. On
 restore, the per-session image is bind-mounted over `workspace.ext4` in the jail
 *before* FC starts, so the guest kernel sees the new contents without any guest-side
 remount.
+
+Capturing the mount is what broke: a restored guest resumes a *mounted* ext4 whose
+backing content has been replaced, so its in-memory metadata is for the base image
+while its I/O goes to the session's. It cannot work by construction.
+</details>
 
 ---
 

@@ -85,6 +85,12 @@ private:
     bool initialized_;
 };
 
+// Extend a session volume's deadline (#23/D5). Keyed by session key, not by a
+// Sandbox: the volume outlives every VM, so this works when nothing is running.
+// Returns the resulting deadline in unix seconds; throws SandboxError on refusal
+// (expired, unknown, or already at the platform maximum).
+uint64_t renew_session(const std::string& session_key, uint32_t extra_seconds = 0);
+
 } // namespace sandbox
 
 #endif // LIBSANDBOX_HPP

@@ -108,6 +108,7 @@ may also require restoring the **previous templates**, not just the binaries.
 | ≤ 0.10.x | no header_size / no digests | Rejected by ≥ 0.12.0 |
 | 0.12.0 | `header_size` + SHA-256 | Templates must be rebuilt from ≤ 0.10.x |
 | 0.13.0 | + `rootfs_sha256` / `rootfs_size` | **Rebuild templates.** A 0.12.0 manifest is refused (`header_size` mismatch); the rootfs is now integrity-checked, so the image and the captured memory state cannot drift apart |
+| 0.14.0 | + `workspace_sha256` / `workspace_size` (only for templates built with a workspace) | Templates gain an optional base workspace image. A 0.13.0 template still loads, but it has no workspace: `sandbox_create` with a `session_key` fails with `INVALID_SPEC` ("rebuild the template to use session_key"). Rebuild to use session volumes. `sandbox_spec_t` also grew two fields — **zero-initialise it** (`= {0}`) or the `session_key` pointer is stack garbage |
 
 Environment variables that carry over between versions (all optional):
 `SANDBOX_LOG_LEVEL`, `SANDBOX_VSOCK_SETTLE_MS`, `SANDBOX_VSOCK_CONFIRM_MS`,
@@ -118,3 +119,12 @@ Environment variables that carry over between versions (all optional):
 New in 0.13.0: `SANDBOX_FC_CLOCK_REALTIME=0` suppresses `clock_realtime` on
 `/snapshot/load` (only needed on a host kernel < 5.16, where Firecracker would
 otherwise reject the load request).
+
+New in 0.14.0 (#23): `SANDBOX_WORKSPACE_ROOT`, `SANDBOX_WORKSPACE_MAX_TTL`,
+`SANDBOX_REAP_INTERVAL_SECONDS` (session store), and `SANDBOX_FLUSH_MS` (how long
+a destroy waits for the guest's `sync()` acknowledgement before killing the VMM).
+Session volumes are **not** part of the snapshot and are **not** removed by an
+upgrade or a rebuild; they live under their own root and expire on their own TTL.
+An upgraded engine keeps serving them, but a template rebuilt after the upgrade
+produces a new base image, and existing sessions keep the base they were cloned
+from — that is intentional: a session is the user's data, not the template's.

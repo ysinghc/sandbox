@@ -22,25 +22,33 @@ static void usage(void) {
     printf("usage:\n"
            "  sandbox-cli run --template NAME [--socket PATH] [--memory MIB] "
            "[--vcpus N] [--wait MS]\n"
+           "  sandbox-cli renew --session-key KEY [--extra SECONDS] [--socket PATH]\n"
            "  sandbox-cli verify --template NAME\n");
 }
 
 int main(int argc, char** argv) {
     const char* socket_path = "/var/run/sandbox-engine/engine.sock";
     const char* template_name = NULL;
+    const char* session_key = NULL;
     uint64_t memory_mib = 128;
     uint32_t vcpus = 1;
     uint32_t wait_ms = 500;
+    uint32_t extra_seconds = 0;
     int do_run = 0;
     int do_verify = 0;
+    int do_renew = 0;
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* v = (i + 1 < argc) ? argv[i + 1] : NULL;
         if (strcmp(a, "run") == 0) do_run = 1;
         else if (strcmp(a, "verify") == 0) do_verify = 1;
+        else if (strcmp(a, "renew") == 0) do_renew = 1;
         else if (strcmp(a, "--socket") == 0 && v) socket_path = argv[++i];
         else if (strcmp(a, "--template") == 0 && v) template_name = argv[++i];
+        else if (strcmp(a, "--session-key") == 0 && v) session_key = argv[++i];
+        else if (strcmp(a, "--extra") == 0 && v)
+            extra_seconds = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(a, "--memory") == 0 && v) memory_mib = strtoull(argv[++i], NULL, 10);
         else if (strcmp(a, "--vcpus") == 0 && v) vcpus = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(a, "--wait") == 0 && v) wait_ms = (uint32_t)strtoul(argv[++i], NULL, 10);
@@ -57,6 +65,34 @@ int main(int argc, char** argv) {
             return 2;
         }
         return snapshot_verify(template_name) == 0 ? 0 : 1;
+    }
+
+    // #23/D5: extend a session without holding a sandbox. The volume outlives
+    // every VM, so this is the operation that keeps a quiet conversation's data
+    // alive; it is deliberately not tied to a handle.
+    if (do_renew) {
+        if (!session_key) {
+            usage();
+            return 2;
+        }
+        sandbox_error_t rrc = sandbox_init(socket_path);
+        if (rrc != SANDBOX_OK) {
+            fprintf(stderr, "sandbox_init(%s): %d\n", socket_path, (int)rrc);
+            return 1;
+        }
+        uint64_t expires_at = 0;
+        rrc = sandbox_session_renew(session_key, extra_seconds, &expires_at);
+        if (rrc != SANDBOX_OK) {
+            fprintf(stderr, "sandbox_session_renew: %d (%s)\n", (int)rrc,
+                    sandbox_error_string(rrc));
+            sandbox_cleanup();
+            return 1;
+        }
+        printf("{\"event\":\"renewed\",\"session_key\":\"%s\","
+               "\"expires_at\":%llu}\n",
+               session_key, (unsigned long long)expires_at);
+        sandbox_cleanup();
+        return 0;
     }
 
     if (!do_run || !template_name) {

@@ -877,6 +877,46 @@ static void handle_inspect(int fd, session_t* s, uint32_t id) {
     send_response(fd, &resp);
 }
 
+// #23/D5: extend a session volume's deadline.
+//
+// Keyed by session_key, not by sandbox id, on purpose: the volume outlives every
+// VM, so the caller that wants to keep it may have nothing running to name. The
+// workspace layer owns the policy (absolute deadline from creation, clamped to
+// the platform maximum, never shortened); this handler only maps its refusals
+// onto errors the caller can act on.
+static void handle_renew(int fd, const ipc_request_t* req) {
+    workspace_meta_t m;
+    if (workspace_renew(req->session_key, req->extra_seconds, (int64_t)time(NULL),
+                        &m) < 0) {
+        switch (errno) {
+            case ESTALE:
+                reply_error(fd, SANDBOX_ERR_SESSION_EXPIRED,
+                            "session expired; its volume is already gone");
+                break;
+            case ERANGE:
+                reply_error(fd, SANDBOX_ERR_SESSION_LIMIT,
+                            "session has reached the platform maximum lifetime");
+                break;
+            case EINVAL:
+                reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "invalid session key");
+                break;
+            case ENOENT:
+                reply_error(fd, SANDBOX_ERR_SESSION_UNKNOWN,
+                            "no such session");
+                break;
+            default:
+                reply_error(fd, SANDBOX_ERR_INTERNAL, "cannot renew session");
+                break;
+        }
+        return;
+    }
+    ipc_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.kind = IPC_REQ_RENEW;
+    resp.expires_at = (uint64_t)m.expires_at;
+    send_response(fd, &resp);
+}
+
 static void handle_message(int fd, session_t* s, const uint8_t* payload,
                            size_t len) {
     ipc_request_t req;
@@ -890,6 +930,7 @@ static void handle_message(int fd, session_t* s, const uint8_t* payload,
         case IPC_REQ_PAUSE:   handle_pause_resume(fd, s, req.sandbox_id, true); break;
         case IPC_REQ_RESUME:  handle_pause_resume(fd, s, req.sandbox_id, false); break;
         case IPC_REQ_INSPECT: handle_inspect(fd, s, req.sandbox_id); break;
+        case IPC_REQ_RENEW:   handle_renew(fd, &req); break;
         default:              reply_error(fd, SANDBOX_ERR_INVALID_SPEC, "unknown op"); break;
     }
     ipc_request_clear(&req);

@@ -10,7 +10,7 @@ set(CMAKE_C_FLAGS_RELEASE "-O3 -DNDEBUG")
 
 # Single version string for --version output and packaging (include/version.h
 # carries the same fallback for non-CMake builds).
-set(SANDBOX_VERSION "0.13.0" CACHE STRING "Engine version")
+set(SANDBOX_VERSION "0.14.0" CACHE STRING "Engine version")
 add_compile_definitions(SANDBOX_VERSION="${SANDBOX_VERSION}")
 
 # Phase 1: ThreadSanitizer variant for pool concurrency verification.

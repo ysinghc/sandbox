@@ -1,0 +1,244 @@
+- generic [active] [ref=e1]:
+  - link "Skip to content" [ref=e2] [cursor=pointer]:
+    - /url: "#main"
+  - banner [ref=e3]:
+    - generic [ref=e4]:
+      - link "Sandbox Engine" [ref=e5] [cursor=pointer]:
+        - /url: /
+      - navigation "Primary" [ref=e12]:
+        - list [ref=e13]:
+          - listitem [ref=e14]:
+            - link "Overview" [ref=e15] [cursor=pointer]:
+              - /url: /
+          - listitem [ref=e16]:
+            - link "Download" [ref=e17] [cursor=pointer]:
+              - /url: /download/
+          - listitem [ref=e18]:
+            - link "Docs" [ref=e19] [cursor=pointer]:
+              - /url: /docs/
+          - listitem [ref=e20]:
+            - link "Contribute" [ref=e21] [cursor=pointer]:
+              - /url: /contribute/
+          - listitem [ref=e22]:
+            - link "Security" [ref=e23] [cursor=pointer]:
+              - /url: /security/
+      - link "GitHub" [ref=e24] [cursor=pointer]:
+        - /url: https://github.com/ysinghc/sandbox
+  - main [ref=e28]:
+    - generic [ref=e30]:
+      - heading "Download Sandbox Engine" [level=1] [ref=e31]
+      - paragraph [ref=e32]: Version 0.13.0. Install with one script, or take the archive for your architecture. Both are checksummed.
+      - generic [ref=e33]:
+        - generic [ref=e34]:
+          - strong [ref=e35]: Released
+          - text: 20 October 2026
+        - generic [ref=e36]:
+          - strong [ref=e37]: License
+          - text: GPL-2.0-only
+        - generic [ref=e38]:
+          - strong [ref=e39]: Source
+          - link "github.com/ysinghc/sandbox" [ref=e40] [cursor=pointer]:
+            - /url: https://github.com/ysinghc/sandbox
+    - generic [ref=e42]:
+      - complementary [ref=e43]:
+        - heading "Before you install." [level=2] [ref=e44]
+        - list [ref=e45]:
+          - listitem [ref=e46]:
+            - text: Linux on x86_64 or aarch64, with
+            - code [ref=e47]: /dev/kvm
+            - text: .
+          - listitem [ref=e48]: userfaultfd available to the daemon.
+          - listitem [ref=e49]: Root, for the installer, taps, cgroups, and jails.
+          - listitem [ref=e50]:
+            - code [ref=e51]: curl
+            - text: and
+            - code [ref=e52]: tar
+            - text: for the install script.
+          - listitem [ref=e53]: A Firecracker binary, guest kernel, and rootfs.
+        - paragraph [ref=e54]:
+          - text: Host preparation, install layout, and systemd hardening are covered in the
+          - link "deployment guide" [ref=e55] [cursor=pointer]:
+            - /url: https://github.com/ysinghc/sandbox/blob/master/docs/DEPLOYMENT.md
+          - text: .
+      - generic [ref=e56]:
+        - heading "One-command install" [level=2] [ref=e57]
+        - paragraph [ref=e58]:
+          - code [ref=e59]: scripts/install.sh
+          - text: detects the machine's architecture, downloads the matching release, verifies its SHA-256, and installs the binaries and libraries. Read it first; it is a short shell script.
+        - generic [ref=e60]:
+          - generic [ref=e61]:
+            - generic [ref=e62]: terminal
+            - button "Copy" [ref=e63] [cursor=pointer]
+          - code [ref=e65]: "# inspect, then install the full staged tree over / $ curl -fsSL -o install.sh \\ https://raw.githubusercontent.com/ysinghc/sandbox/v0.13.0/scripts/install.sh $ less install.sh $ sudo bash install.sh --full # or install just the binaries and libraries into /usr/local $ sudo bash install.sh # useful options $ bash install.sh --version v0.13.0 --prefix /opt/sandbox $ bash install.sh --dry-run"
+        - generic [ref=e66]:
+          - heading [level=2] [ref=e67]:
+            - text: What
+            - code [ref=e68]: "--full"
+            - text: adds
+          - paragraph [ref=e69]:
+            - text: The staged tree includes the systemd unit, packaged config, and state directories. Without
+            - code [ref=e70]: "--full"
+            - text: ", only"
+            - code [ref=e71]: sandboxd
+            - text: ","
+            - code [ref=e72]: sandbox-broker
+            - text: ","
+            - code [ref=e73]: sandbox-cli
+            - text: ", and the two client libraries are installed."
+        - heading "Release archives" [level=2] [ref=e74]
+        - paragraph [ref=e75]:
+          - text: Both architectures are built natively from the same tag. Every archive has a matching
+          - code [ref=e76]: .sha256
+          - text: file.
+        - generic [ref=e77]:
+          - article [ref=e78]:
+            - generic [ref=e79]:
+              - heading "x86_64" [level=3] [ref=e80]
+              - generic [ref=e81]: linux
+            - list [ref=e82]:
+              - listitem [ref=e83]:
+                - generic [ref=e84]:
+                  - link "Staged install tree" [ref=e85] [cursor=pointer]:
+                    - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64.tar.gz
+                  - generic [ref=e86]: sandbox-engine-0.13.0-linux-x86_64.tar.gz · 235.6 KiB
+                - link "SHA-256" [ref=e87] [cursor=pointer]:
+                  - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64.tar.gz.sha256
+              - listitem [ref=e88]:
+                - generic [ref=e89]:
+                  - link "Binaries and libraries" [ref=e90] [cursor=pointer]:
+                    - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz
+                  - generic [ref=e91]: sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz · 127.0 KiB
+                - link "SHA-256" [ref=e92] [cursor=pointer]:
+                  - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-x86_64-bin.tar.gz.sha256
+            - group [ref=e93]:
+              - generic "Individual binaries and libraries" [ref=e94] [cursor=pointer]
+          - article [ref=e95]:
+            - generic [ref=e96]:
+              - heading "aarch64" [level=3] [ref=e97]
+              - generic [ref=e98]: linux
+            - list [ref=e99]:
+              - listitem [ref=e100]:
+                - generic [ref=e101]:
+                  - link "Staged install tree" [ref=e102] [cursor=pointer]:
+                    - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64.tar.gz
+                  - generic [ref=e103]: sandbox-engine-0.13.0-linux-aarch64.tar.gz · 239.0 KiB
+                - link "SHA-256" [ref=e104] [cursor=pointer]:
+                  - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64.tar.gz.sha256
+              - listitem [ref=e105]:
+                - generic [ref=e106]:
+                  - link "Binaries and libraries" [ref=e107] [cursor=pointer]:
+                    - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz
+                  - generic [ref=e108]: sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz · 130.8 KiB
+                - link "SHA-256" [ref=e109] [cursor=pointer]:
+                  - /url: https://github.com/ysinghc/sandbox/releases/download/v0.13.0/sandbox-engine-0.13.0-linux-aarch64-bin.tar.gz.sha256
+            - group [ref=e110]:
+              - generic "Individual binaries and libraries" [ref=e111] [cursor=pointer]
+        - heading "Manual install" [level=2] [ref=e112]
+        - generic [ref=e113]:
+          - generic [ref=e114]:
+            - generic [ref=e115]: "01"
+            - generic [ref=e116]:
+              - heading "Download and verify" [level=3] [ref=e117]
+              - paragraph [ref=e118]:
+                - text: Put the tarball and its checksum in the same directory, then run the check. It should end in
+                - code [ref=e119]: OK
+                - text: .
+              - generic [ref=e120]:
+                - generic [ref=e121]:
+                  - generic [ref=e122]: terminal
+                  - button "Copy" [ref=e123] [cursor=pointer]
+                - code [ref=e125]: $ sha256sum -c sandbox-engine-0.13.0-linux-x86_64.tar.gz.sha256
+          - generic [ref=e126]:
+            - generic [ref=e127]: "02"
+            - generic [ref=e128]:
+              - heading "Extract the staged tree" [level=3] [ref=e129]
+              - paragraph [ref=e130]:
+                - text: The archive mirrors the filesystem. Extracting it over
+                - code [ref=e131]: /
+                - text: places binaries in
+                - code [ref=e132]: /usr/local
+                - text: ", config in"
+                - code [ref=e133]: /etc/sandbox-engine
+                - text: ", and state in"
+                - code [ref=e134]: /var/lib/sandbox-engine
+                - text: .
+              - generic [ref=e135]:
+                - generic [ref=e136]:
+                  - generic [ref=e137]: terminal
+                  - button "Copy" [ref=e138] [cursor=pointer]
+                - code [ref=e140]: $ sudo tar -xzf sandbox-engine-0.13.0-linux-x86_64.tar.gz -C /
+          - generic [ref=e141]:
+            - generic [ref=e142]: "03"
+            - generic [ref=e143]:
+              - heading "Stamp a template, then start" [level=3] [ref=e144]
+              - paragraph [ref=e145]: The packaged unit runs the daemon. A template has to be stamped once on the host before the first create; the helper lives in the source tree.
+              - generic [ref=e146]:
+                - generic [ref=e147]:
+                  - generic [ref=e148]: terminal
+                  - button "Copy" [ref=e149] [cursor=pointer]
+                - code [ref=e151]: "# from the source checkout $ sudo -E env SANDBOX_SNAPSHOT_ROOT=/var/lib/sandbox-engine/snapshots \\ SANDBOX_JAIL_ROOT=/var/lib/sandbox-engine/jail \\ build/tests/make_template $ sudo systemctl enable --now sandboxd $ sudo sandbox-cli verify --template e2e"
+        - heading "Build from source" [level=2] [ref=e152]
+        - paragraph [ref=e153]: "The release tarballs are built from the tagged source with the same CMake project. If you need a different install prefix, a sanitizer build, or the fuzzers, build it yourself:"
+        - generic [ref=e154]:
+          - generic [ref=e155]:
+            - generic [ref=e156]: terminal
+            - button "Copy" [ref=e157] [cursor=pointer]
+          - code [ref=e159]: $ git clone https://github.com/ysinghc/sandbox.git $ cd sandbox $ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release $ cmake --build build -j $ sudo cmake --install build
+        - paragraph [ref=e160]:
+          - text: Dependencies, build options, and the sanitizer targets are in the
+          - link "building guide" [ref=e161] [cursor=pointer]:
+            - /url: https://github.com/ysinghc/sandbox/blob/master/docs/BUILDING.md
+          - text: . Older versions are on the
+          - link "releases page" [ref=e162] [cursor=pointer]:
+            - /url: https://github.com/ysinghc/sandbox/releases
+          - text: .
+  - contentinfo [ref=e163]:
+    - generic [ref=e164]:
+      - generic [ref=e165]:
+        - generic [ref=e166]:
+          - link "Sandbox Engine" [ref=e167] [cursor=pointer]:
+            - /url: /
+          - paragraph [ref=e174]: Fast, isolated microVM sandboxes for untrusted code. Pooled, snapped, and ready in a fraction of a second.
+        - generic [ref=e175]:
+          - heading "Project" [level=2] [ref=e176]
+          - list [ref=e177]:
+            - listitem [ref=e178]:
+              - link "Download" [ref=e179] [cursor=pointer]:
+                - /url: /download/
+            - listitem [ref=e180]:
+              - link "Documentation" [ref=e181] [cursor=pointer]:
+                - /url: /docs/
+            - listitem [ref=e182]:
+              - link "Changelog" [ref=e183] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox/blob/master/CHANGELOG.md
+            - listitem [ref=e184]:
+              - link "License" [ref=e185] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox/blob/master/LICENSE
+        - generic [ref=e186]:
+          - heading "Community" [level=2] [ref=e187]
+          - list [ref=e188]:
+            - listitem [ref=e189]:
+              - link "Contribute" [ref=e190] [cursor=pointer]:
+                - /url: /contribute/
+            - listitem [ref=e191]:
+              - link "Issues" [ref=e192] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox/issues
+            - listitem [ref=e193]:
+              - link "Security" [ref=e194] [cursor=pointer]:
+                - /url: /security/
+        - generic [ref=e195]:
+          - heading "Source" [level=2] [ref=e196]
+          - list [ref=e197]:
+            - listitem [ref=e198]:
+              - link "GitHub" [ref=e199] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox
+            - listitem [ref=e200]:
+              - link "Releases" [ref=e201] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox/releases
+            - listitem [ref=e202]:
+              - link "Contributing guide" [ref=e203] [cursor=pointer]:
+                - /url: https://github.com/ysinghc/sandbox/blob/master/CONTRIBUTING.md
+      - generic [ref=e204]:
+        - generic [ref=e205]: © 2026 Sandbox Engine contributors
+        - generic [ref=e206]: GPL-2.0-only
+        - generic [ref=e207]: Built for Linux, KVM, and userfaultfd

@@ -5,6 +5,92 @@ a phase-based development log; the per-phase implementation record (including
 design deviations) lives in [`docs/IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md)
 and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
+## [0.14.0] — 2026-10-20
+
+Session workspaces (#23): a sandbox's `/workspace` can now outlive the VM that
+wrote it, under a strict, creator-controlled TTL. This is the first release in
+which "the assistant remembers things between calls" is a property of the engine
+rather than of the model's context window.
+
+### Added
+
+- **Session volumes** (#23): `sandbox_spec_t.session_key` gives a sandbox a
+  persistent `/workspace`; `ttl_seconds` sets its lifetime. Volumes are a
+  pre-formatted sparse ext4 image built with the template and cloned per session
+  (reflink where the filesystem supports it, sparse extent copy otherwise), keyed
+  by `sha256(session_key)` in `SANDBOX_WORKSPACE_ROOT`, created in a staging
+  directory and `rename()`d into place. A session is exclusive-use: a lease
+  prevents two VMs writing one image, and a `session_key` create bypasses the warm
+  pool because Firecracker cannot swap a block device after restore.
+- **TTL policy (D5)**: `expires_at = created_at + clamp(ttl, 60 s, platform max)`,
+  default 7 days, maximum 30 days (`SANDBOX_WORKSPACE_MAX_TTL`). Absolute from
+  creation, never extended automatically. A reaper thread expires sessions on a
+  timer (`SANDBOX_REAP_INTERVAL_SECONDS`, default 60 s) and also collects
+  abandoned staging directories.
+- **Renewal**: `sandbox_session_renew(key, extra_seconds, &expires_at)` and
+  `sandbox-cli renew --session-key KEY [--extra SECONDS]`, plus
+  `sandbox::renew_session()` in the C++ SDK. Keyed by session, not by sandbox, so
+  a quiet conversation can be kept alive with nothing running. `extra_seconds` is
+  added to *now*, clamped to the platform maximum, never shortened; a past
+  deadline returns `SANDBOX_ERR_SESSION_EXPIRED` (the volume is already gone), an
+  unknown key `SANDBOX_ERR_SESSION_UNKNOWN`, and a session already at the maximum
+  `SANDBOX_ERR_SESSION_LIMIT`.
+- **Durable teardown**: the engine asks the guest to `sync()` before it SIGKILLs
+  the VMM (reserved `SANDBOX_CONTROL=flush` on the vsock control channel,
+  acknowledged with `SANDBOX-FLUSH-OK`, bounded by `SANDBOX_FLUSH_MS`). Without
+  it, a page written by the workload was still in the guest's page cache when the
+  VM died, and the next sandbox of the same session simply did not see the file.
+- **In-guest persistence evidence**: the guest agent appends a checksum of each
+  injection to `/workspace/.sandbox-probe` and reports `mounted=`, `lines=`,
+  `first=` and `last=` on the serial console, so the privileged e2e test proves
+  persistence from inside the guest instead of reading back a file the host wrote.
+- **Workspace metrics** and `docs/WORKSPACE_DISK.md` (including the deviations
+  from the original D7 design and why they were made).
+
+### Fixed
+
+- **ext4 corruption after restore** (`f1a2ba7`): the guest mounted `/workspace`
+  before the template snapshot was captured, so every restore resumed a *mounted*
+  ext4 whose backing file had been replaced — the guest then reported
+  `EXT4-fs error (device vdb): checksumming directory block 0`. The volume is now
+  mounted by the agent on first use *after* each restore, which also makes
+  "a clone is byte-identical to its base" true by construction and lets ext4
+  replay the journal of a sandbox killed mid-write.
+- **Leaked jail bind mount** (`976299b`): `jail_cleanup()` never unmounted
+  `/workspace.ext4`, so removing the jail hit `EBUSY`, the jail survived, and
+  later creates failed at `[jailer] step 6 failed: errno=2`. Unmount added, and
+  bind failures now name the source, the destination and whether the source
+  exists.
+- **Latency probe segfault**: the generated probe in `scripts/benchmark.sh` built
+  its `sandbox_spec_t` on the stack without initialising it; the new pointer field
+  turned that into a wild dereference. Zero-initialised, and the contract is now
+  stated in `docs/API.md`.
+- **Network test flake**: the broker port was hard-coded to 8080 (a genuinely busy
+  port) and the drop verdict failed if *any* frame arrived, including a
+  retransmission from the previous connection. The port is now chosen per run and
+  the verdict is keyed to the connection under test.
+- **Test isolation**: the privileged suite now clears its test root before a run.
+  Re-runs on the same runner were inheriting the previous run's session volumes
+  (durable by design), which surfaced as a "new volume starts empty" failure.
+
+### Changed
+
+- **`SANDBOX_BROKER_PORT`** (default `8080`) is the single source of truth for the
+  port guests may reach on the host: the egress rules and the broker listener both
+  derive from it, so moving the broker off a busy port is now one variable instead
+  of two values that silently disagree.
+- **`sandbox_spec_t` grew two fields.** Callers must zero-initialise it
+  (`sandbox_spec_t spec = {0};`); an uninitialised `session_key` is a crash, not a
+  default. All in-tree callers already did.
+
+### Verified
+
+- Privileged e2e (self-hosted, KVM): all 7 suites pass, including the session
+  persistence test (create → write in guest → destroy → re-create → the file is
+  still there, with the *pre-destroy* line first) and `tests/e2e/smoke.sh`.
+- Restore latency on the reference host: **38.49 ms** cold (provisioned),
+  **55.76 ms** average over five provisioned restores, budget 250 ms.
+
 ## [0.13.0] — 2026-10-20
 
 Security and verification release: the privileged suite now *runs* in CI instead

@@ -9,7 +9,19 @@ message ClientMessage {
     PauseRequest   pause   = 3;
     ResumeRequest  resume  = 4;
     InspectRequest inspect = 5;
+    RenewRequest   renew   = 6;
   }
+}
+
+// #23/D5: extend a session volume's deadline. Keyed by the session key, not by
+// sandbox id: the volume outlives every VM, so the caller that wants to keep it
+// may not have a running sandbox to name.
+message RenewRequest {
+  string session_key = 1;
+  // Seconds to add, counted from now. 0 = the platform default (7 days).
+  // Clamped so the session never exceeds the platform maximum (30 days by
+  // default); it is never shortened.
+  uint32 extra_seconds = 2;
 }
 
 message CreateRequest {
@@ -48,7 +60,12 @@ message ServerMessage {
     InspectResponse inspect = 4;
     PauseResponse   pause   = 5;
     ResumeResponse  resume  = 6;
+    RenewResponse   renew   = 7;
   }
+}
+
+message RenewResponse {
+  uint64 expires_at = 1;  // unix seconds; the deadline after this call
 }
 
 message CreateResponse {

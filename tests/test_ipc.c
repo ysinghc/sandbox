@@ -408,6 +408,22 @@ int main(void) {
             CHECK(got3 && p3.lines == 1,
                   "session: another key gets its own empty volume");
             if (w3) sandbox_destroy(w3);
+
+            // #23/D5 renewal. Keyed by the session key, so it works with no
+            // sandbox alive (that is the point: the volume outlives the VM).
+            uint64_t e1 = 0, e2 = 0;
+            CHECK(sandbox_session_renew("e2e-session-23", 60, &e1) == SANDBOX_OK &&
+                      e1 > 0,
+                  "session: renew by key with no sandbox alive");
+            CHECK(sandbox_session_renew("e2e-session-23", 86400, &e2) == SANDBOX_OK &&
+                      e2 > e1,
+                  "session: renewal extends the deadline");
+            uint64_t e3 = 0;
+            CHECK(sandbox_session_renew("no-such-session-23", 60, &e3) ==
+                      SANDBOX_ERR_SESSION_UNKNOWN,
+                  "session: renewing an unknown key is refused");
+            CHECK(sandbox_session_renew("", 60, &e3) == SANDBOX_ERR_INVALID_SPEC,
+                  "session: renewing an empty key is refused");
         }
 
         CHECK(sandbox_pause(h) == SANDBOX_OK, "sandbox_pause");        CHECK(sandbox_inspect(h, &st) == SANDBOX_OK && !st.is_running,

@@ -11,12 +11,15 @@ const char* SandboxError::error_string(sandbox_error_t code) {
         case SANDBOX_ERR_DAEMON_UNREACHABLE: return "Daemon unreachable";
         case SANDBOX_ERR_PERMISSION_DENIED: return "Permission denied";
         case SANDBOX_ERR_INTERNAL: return "Internal error";
+        case SANDBOX_ERR_SESSION_EXPIRED: return "Session expired";
+        case SANDBOX_ERR_SESSION_LIMIT: return "Session at platform maximum lifetime";
+        case SANDBOX_ERR_SESSION_UNKNOWN: return "Unknown session";
         default: return "Unknown error";
     }
 }
 
 sandbox_spec_t Spec::to_c_struct() const {
-    sandbox_spec_t spec;
+    sandbox_spec_t spec = {};
     spec.memory_mib = memory_mib_;
     spec.vcpu_count = vcpu_count_;
     spec.template_name = template_name_.c_str();
@@ -96,6 +99,14 @@ Engine::~Engine() {
 std::unique_ptr<Sandbox> Engine::create(const Spec& spec) {
     if (!initialized_) throw SandboxError(SANDBOX_ERR_DAEMON_UNREACHABLE);
     return std::unique_ptr<Sandbox>(new Sandbox(spec));
+}
+
+uint64_t renew_session(const std::string& session_key, uint32_t extra_seconds) {
+    uint64_t expires_at = 0;
+    sandbox_error_t rc =
+        sandbox_session_renew(session_key.c_str(), extra_seconds, &expires_at);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
+    return expires_at;
 }
 
 } // namespace sandbox

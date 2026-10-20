@@ -225,6 +225,25 @@ sandbox_error_t sandbox_inspect(sandbox_handle_t* handle,
     return SANDBOX_OK;
 }
 
+sandbox_error_t sandbox_session_renew(const char* session_key,
+                                      uint32_t extra_seconds,
+                                      uint64_t* out_expires_at) {
+    if (!session_key || !*session_key) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.kind = IPC_REQ_RENEW;
+    snprintf(req.session_key, sizeof(req.session_key), "%s", session_key);
+    req.extra_seconds = extra_seconds;
+
+    ipc_response_t resp;
+    sandbox_error_t rc = client_roundtrip(&req, &resp);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    if (resp.is_error) return (sandbox_error_t)resp.error_code;
+    if (out_expires_at) *out_expires_at = resp.expires_at;
+    return SANDBOX_OK;
+}
+
 void sandbox_cleanup(void) {
     if (g_client_fd >= 0) {
         close(g_client_fd);
@@ -234,4 +253,19 @@ void sandbox_cleanup(void) {
 
 const char* sandbox_handle_token(const sandbox_handle_t* handle) {
     return handle ? handle->token : NULL;
+}
+
+const char* sandbox_error_string(sandbox_error_t code) {
+    switch (code) {
+        case SANDBOX_OK: return "ok";
+        case SANDBOX_ERR_POOL_EXHAUSTED: return "pool exhausted";
+        case SANDBOX_ERR_INVALID_SPEC: return "invalid spec";
+        case SANDBOX_ERR_DAEMON_UNREACHABLE: return "daemon unreachable";
+        case SANDBOX_ERR_PERMISSION_DENIED: return "permission denied";
+        case SANDBOX_ERR_INTERNAL: return "internal error";
+        case SANDBOX_ERR_SESSION_EXPIRED: return "session expired";
+        case SANDBOX_ERR_SESSION_LIMIT: return "session at platform maximum lifetime";
+        case SANDBOX_ERR_SESSION_UNKNOWN: return "unknown session";
+        default: return "unknown error";
+    }
 }

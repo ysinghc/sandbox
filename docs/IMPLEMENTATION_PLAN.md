@@ -210,7 +210,8 @@ asserts the positive direction (`SANDBOX-VSOCK-HOST cid=2` in serial).
 | vsock peer authentication (#10) | ✅ guest+host code; classifier unit-tested on the host, host CID asserted in-guest |
 | #22 determinism (clock + rootfs pinning) | ✅ verified on the kvm runner: guest skew 0 s vs host with a 16 s-old template |
 | M1 ARM timer (#6) | ⏳ needs an ARM host (no aarch64 runner yet) |
-| M2 #23–#28 | ⏳ not started (#23 is next) |
+| #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
+| M2 #24–#28 | ⏳ not started (#24 is next) |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -381,12 +382,34 @@ Dependency order:
 - **Docs:** §15.16 and `docs/API.md` state what determinism does and does not
   guarantee; `docs/UPGRADE.md` records that 0.12.0 templates must be rebuilt.
 
-### #23 — Session workspace volumes + TTL
+### #23 — Session workspace volumes + TTL — ✅ delivered in 0.14.0
+
 Follow `docs/WORKSPACE_DISK.md` (D7) — do not re-design. Extend `sandbox_spec_t`
 (`include/libsandbox.h`) with `session_id`, `workspace_mb`, `ttl_seconds`. Add a
 TTL reaper and `sandbox_renew`. New config keys (`workspace_root`,
 `workspace_default_ttl_seconds`, `workspace_max_ttl_seconds`,
 `workspace_default_size_mb`) — none exist in `config/engine.conf` yet.
+
+**As delivered (deviations from the paragraph above, all deliberate):**
+
+| Planned | Delivered | Why |
+|---|---|---|
+| `session_id` | `session_key` | The key is caller-chosen and the registry directory is `sha256(key)`, so it doubles as the isolation boundary and cannot traverse paths. |
+| `workspace_mb` per sandbox | `workspace_size_mb` per **template** | D7: the image is pre-formatted and cloned, so its size is a property of the template, not of a request. One size per template also keeps the clone path simple. |
+| `sandbox_renew(handle, …)` | `sandbox_session_renew(key, …)` | The volume outlives every VM; a handle-based renew could not keep a quiet conversation alive with nothing running. |
+| config keys in `engine.conf` | `SANDBOX_WORKSPACE_ROOT`, `SANDBOX_WORKSPACE_MAX_TTL`, `SANDBOX_REAP_INTERVAL_SECONDS`, `SANDBOX_FLUSH_MS` | Matches how every other runtime knob in this engine is configured; `config/engine.conf` is the systemd unit's environment, not a second parser. |
+
+Also not in the original paragraph, but required by the tests:
+
+- The guest mounts `/workspace` **after** each restore, never before the capture
+  (`docs/WORKSPACE_DISK.md` §0.2). Capturing a mount served every restore an ext4
+  whose in-RAM state belonged to a different file.
+- The engine **flushes** the guest (`sync()`) before destroying a session VM
+  (§0.3). Without it, a workload's write could still be in the guest's page cache
+  when the VMM was SIGKILLed, so a re-created session did not see its own file.
+- Session creates **bypass the warm pool** and take an exclusive lease: a pool VM
+  is restored before a request exists, and Firecracker cannot swap a block device
+  after restore.
 
 ### #24 — Guest RPC: exec + file operations over vsock
 Newline-delimited JSON on a second port (`RPC_PORT 5002`; 5001 stays the env

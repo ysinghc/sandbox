@@ -60,6 +60,9 @@ typedef struct {
 | `SANDBOX_ERR_DAEMON_UNREACHABLE` | `-3` | Could not connect to / talk to the daemon socket. |
 | `SANDBOX_ERR_PERMISSION_DENIED` | `-4` | Rejected by the daemon (e.g. peer-uid allow-list). |
 | `SANDBOX_ERR_INTERNAL` | `-5` | Unexpected daemon-side failure. |
+| `SANDBOX_ERR_SESSION_EXPIRED` | `-6` | The session's TTL has passed; its volume is already gone, so there is nothing to renew. |
+| `SANDBOX_ERR_SESSION_LIMIT` | `-7` | The session is already at the platform maximum lifetime (`SANDBOX_WORKSPACE_MAX_TTL`, 30 days by default). |
+| `SANDBOX_ERR_SESSION_UNKNOWN` | `-8` | No volume exists for that session key. |
 
 ### Functions
 
@@ -70,6 +73,13 @@ sandbox_error_t sandbox_pause(sandbox_handle_t* handle);
 sandbox_error_t sandbox_resume(sandbox_handle_t* handle);
 sandbox_error_t sandbox_destroy(sandbox_handle_t* handle);
 sandbox_error_t sandbox_inspect(sandbox_handle_t* handle, sandbox_status_t* out_status);
+
+// Session volumes (#23). Keyed by session key, not by handle: the volume
+// outlives every VM, so this works with nothing running.
+sandbox_error_t sandbox_session_renew(const char* session_key,
+                                      uint32_t extra_seconds,
+                                      uint64_t* out_expires_at);
+const char* sandbox_error_string(sandbox_error_t code);
 void            sandbox_cleanup(void);
 ```
 

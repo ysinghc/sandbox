@@ -209,7 +209,7 @@ documented in [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
 ## Project status
 
-Current release: **0.13.0**. The engine, jailer, uffd path, snapshot manager,
+Current release: **0.14.0**. The engine, jailer, uffd path, snapshot manager,
 broker, pool, cgroups, snapshot integrity, structured logging, metrics, and CLI
 are implemented and covered by the test suite (see `docs/TESTING.md`). The
 privileged tests (jailer, seccomp, real VM restore, vsock IPC, cgroup, nftables)

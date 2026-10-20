@@ -40,6 +40,13 @@ typedef enum {
     SANDBOX_ERR_DAEMON_UNREACHABLE = -3,
     SANDBOX_ERR_PERMISSION_DENIED  = -4,
     SANDBOX_ERR_INTERNAL           = -5,
+    // #23/D5 renewal. -6: the session's deadline has passed and its volume is
+    // gone; there is nothing left to renew (a new create with the same key starts
+    // an empty volume). -7: the session has already reached the platform maximum
+    // lifetime, so it cannot be extended further.
+    SANDBOX_ERR_SESSION_EXPIRED    = -6,
+    SANDBOX_ERR_SESSION_LIMIT      = -7,
+    SANDBOX_ERR_SESSION_UNKNOWN    = -8,  // no volume for that session key
 } sandbox_error_t;
 
 // Initialize client connection to daemon
@@ -71,6 +78,27 @@ typedef struct {
 } sandbox_status_t;
 
 sandbox_error_t sandbox_inspect(sandbox_handle_t* handle, sandbox_status_t* out_status);
+
+// Extend a session volume's deadline (#23/D5).
+//
+// `session_key` names the volume, not a sandbox: the volume outlives every VM,
+// so the caller that wants to keep its data may have nothing running to name.
+// `extra_seconds` is added to *now* (not to the previous deadline), which is what
+// "this conversation is still active" means; 0 selects the platform default
+// (7 days). The result is clamped so the session never exceeds the platform
+// maximum (30 days by default) and is never shortened. On success
+// `*out_expires_at` (may be NULL) is the resulting deadline in unix seconds.
+//
+// Returns SANDBOX_ERR_SESSION_EXPIRED if the deadline has passed (the volume is
+// already gone), SANDBOX_ERR_SESSION_UNKNOWN if the key has no volume,
+// SANDBOX_ERR_SESSION_LIMIT if it already sits at the platform maximum, and
+// SANDBOX_ERR_INVALID_SPEC for a key the registry cannot accept.
+sandbox_error_t sandbox_session_renew(const char* session_key,
+                                      uint32_t extra_seconds,
+                                      uint64_t* out_expires_at);
+
+// Human-readable form of an error code, for logs and CLI output. Never NULL.
+const char* sandbox_error_string(sandbox_error_t code);
 
 // Disconnect from daemon (destroys all sandboxes owned by this session)
 void sandbox_cleanup(void);

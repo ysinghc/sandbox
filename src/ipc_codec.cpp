@@ -73,6 +73,12 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
         case IPC_REQ_INSPECT:
             msg.mutable_inspect()->set_sandbox_id(req->sandbox_id);
             break;
+        case IPC_REQ_RENEW: {
+            auto* r = msg.mutable_renew();
+            r->set_session_key(req->session_key);
+            if (req->extra_seconds) r->set_extra_seconds(req->extra_seconds);
+            break;
+        }
         default:
             return -1;
     }
@@ -123,6 +129,12 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
             out->kind = IPC_REQ_INSPECT;
             out->sandbox_id = msg.inspect().sandbox_id();
             break;
+        case sandbox::ClientMessage::kRenew:
+            out->kind = IPC_REQ_RENEW;
+            set_str(out->session_key, sizeof(out->session_key),
+                    msg.renew().session_key());
+            out->extra_seconds = msg.renew().extra_seconds();
+            break;
         default:
             return -1;
     }
@@ -163,6 +175,9 @@ int ipc_encode_response(const ipc_response_t* resp, uint8_t* buf, size_t cap,
                 i->set_page_faults(resp->page_faults);
                 break;
             }
+            case IPC_REQ_RENEW:
+                msg.mutable_renew()->set_expires_at(resp->expires_at);
+                break;
             default:
                 return -1;
         }
@@ -218,6 +233,10 @@ int ipc_decode_response(const uint8_t* buf, size_t len, ipc_response_t* out) {
             out->page_faults = i.page_faults();
             return 0;
         }
+        case sandbox::ServerMessage::kRenew:
+            out->kind = IPC_REQ_RENEW;
+            out->expires_at = msg.renew().expires_at();
+            return 0;
         default:
             return -1;
     }

@@ -22,6 +22,7 @@ typedef enum {
     IPC_REQ_PAUSE = 3,
     IPC_REQ_RESUME = 4,
     IPC_REQ_INSPECT = 5,
+    IPC_REQ_RENEW = 6,
 } ipc_req_kind_t;
 
 #define IPC_MAX_ENV 64
@@ -44,6 +45,9 @@ typedef struct {
     char session_key[IPC_MAX_SESSION_KEY];
     uint32_t ttl_seconds;  // 0 = platform default
 
+    // renew (#23/D5): seconds to add to session_key's deadline. 0 = default.
+    uint32_t extra_seconds;
+
     // destroy/pause/resume/inspect
     uint32_t sandbox_id;
 } ipc_request_t;
@@ -62,6 +66,9 @@ typedef struct {
     uint64_t uptime_ms;
     uint64_t memory_rss_mib;
     uint32_t page_faults;
+
+    // renew (#23/D5): the session's deadline after the call, unix seconds.
+    uint64_t expires_at;
 } ipc_response_t;
 
 void ipc_request_init(ipc_request_t* req);
