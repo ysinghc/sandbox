@@ -42,6 +42,12 @@ int main(void) {
         fprintf(stderr, "SKIP template setup: need root + /dev/kvm + assets\n");
         return 0;
     }
+    // Record the guest image this run actually used. The override can be lost by
+    // a launcher that resets the environment (sudo on a non-root runner did), and
+    // the suite would then run happily against the operator's older image -- so
+    // the privileged workflow asserts on this line.
+    printf("[tmpl] assets: kernel=%s rootfs=%s\n", asset_kernel, asset_rootfs);
+    fflush(stdout);
     // Detach bind mounts leaked by killed runs, then clear stale state.
     const char* jail_root = getenv("SANDBOX_JAIL_ROOT");
     char clean[8192];

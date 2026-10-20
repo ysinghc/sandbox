@@ -95,16 +95,33 @@ jobs:
           fi
           echo "all privileged tests executed"
 
+      # A run against the operator's older /opt guest image is indistinguishable
+      # from a real one in the results: same tests, same names, green. It happened
+      # on the non-root aarch64 runner, where `sudo ctest` reset the environment
+      # and dropped SANDBOX_ROOTFS, so the leg exercised a guest built before the
+      # code under test. The fixture prints the image it loaded; require it to be
+      # the one this job built.
+      - name: The guest image under test is the one just built
+        run: |
+          set -euo pipefail
+          grep -F "rootfs=$SANDBOX_ROOTFS" /tmp/privileged-ctest.log \
+            || { echo "::error::the suite did not use SANDBOX_ROOTFS=$SANDBOX_ROOTFS"; exit 1; }
+          echo "guest image under test: $SANDBOX_ROOTFS"
+
       # The runner may or may not be the root user; use sudo only when needed.
+      # `sudo` resets the environment, so the asset overrides have to be handed
+      # to it explicitly or the harness silently falls back to /opt.
       - name: e2e smoke (root)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
-          $SUDO bash tests/e2e/smoke.sh
+          $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
+                bash tests/e2e/smoke.sh
 
       - name: Latency assertions (root)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
-          $SUDO bash tests/e2e/latency.sh
+          $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
+                bash tests/e2e/latency.sh
 
       - name: Upload daemon logs on failure
         if: failure()

@@ -106,6 +106,24 @@ set(SANDBOX_TEST_TMPDIR "/tmp" CACHE PATH
 
 get_filename_component(TEST_BDIR ${CMAKE_CURRENT_BINARY_DIR} NAME)
 set(TEST_TMPROOT "${SANDBOX_TEST_TMPDIR}/sbtest-${TEST_BDIR}")
+
+# Guest assets are part of the test definition, not of the shell that launched
+# ctest. The override exists so CI can build and test its own guest image
+# (SANDBOX_ROOTFS) instead of the operator's /opt/sandbox-assets copy -- and if
+# the override is silently lost, every test still *runs*, against an image that
+# predates the code under test. That is exactly what happened on the aarch64
+# runner: its user is not root, so the workflow's `sudo ctest` reset the
+# environment, the override vanished, and the leg "ran" a three-day-old guest
+# with none of the markers the new agent prints (no workspace probe, no clock
+# line, no vsock peer line) while the host side was current. Baking the paths
+# into ENVIRONMENT makes them survive any launcher, sudo included.
+set(TEST_ASSET_ENV "")
+if(DEFINED ENV{SANDBOX_ROOTFS} AND NOT "$ENV{SANDBOX_ROOTFS}" STREQUAL "")
+    string(APPEND TEST_ASSET_ENV ";SANDBOX_ROOTFS=$ENV{SANDBOX_ROOTFS}")
+endif()
+if(DEFINED ENV{SANDBOX_KERNEL} AND NOT "$ENV{SANDBOX_KERNEL}" STREQUAL "")
+    string(APPEND TEST_ASSET_ENV ";SANDBOX_KERNEL=$ENV{SANDBOX_KERNEL}")
+endif()
 set(TEST_SNAPROOT "${TEST_TMPROOT}/snapshots")
 set(TEST_JAILROOT "${TEST_TMPROOT}/jails")
 set(TEST_WSROOT "${TEST_TMPROOT}/workspaces")
@@ -116,7 +134,7 @@ add_test(NAME tmpl_setup COMMAND ${CMAKE_BINARY_DIR}/tests/make_template)
 set_tests_properties(tmpl_setup PROPERTIES
     TIMEOUT 300
     FIXTURES_SETUP tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT};SANDBOX_TEST_ROOT=${TEST_TMPROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT};SANDBOX_TEST_ROOT=${TEST_TMPROOT}${TEST_ASSET_ENV}")
 
 add_executable(test_vmm test_vmm.c)
 target_include_directories(test_vmm PRIVATE ../include)
@@ -125,13 +143,13 @@ add_test(NAME vmm COMMAND ${CMAKE_BINARY_DIR}/tests/test_vmm)
 set_tests_properties(vmm PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}${TEST_ASSET_ENV}")
 
 # Pool now restores real VMs: same fixture + env (longer timeout for boots).
 set_tests_properties(pool PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}${TEST_ASSET_ENV}")
 
 # Phase 5: uffd lazy-restore tests (SKIPs where userfaultfd is denied).
 add_executable(test_uffd test_uffd.c)
@@ -158,7 +176,7 @@ add_test(NAME ipc COMMAND ${CMAKE_BINARY_DIR}/tests/test_ipc)
 set_tests_properties(ipc PROPERTIES
     TIMEOUT 300
     FIXTURES_REQUIRED tmplfix
-    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}")
+    ENVIRONMENT "SANDBOX_SNAPSHOT_ROOT=${TEST_SNAPROOT};SANDBOX_JAIL_ROOT=${TEST_JAILROOT};SANDBOX_WORKSPACE_ROOT=${TEST_WSROOT}${TEST_ASSET_ENV}")
 
 # Phase 11: daemon config parser (no root). Parses the packaged engine.conf.
 add_executable(test_config test_config.c)
