@@ -29,11 +29,20 @@ jobs:
     env:
       # Build the guest image from this checkout instead of using the operator's
       # /opt/sandbox-assets/rootfs.ext4, so guest-side changes (scripts/
-      # sandbox-agent.c, /init) are actually exercised. The kernel is not
-      # rebuildable here and stays a host prerequisite.
+      # sandbox-agent.c, /init) are actually exercised.
       SANDBOX_ROOTFS: ${{ github.workspace }}/guest/rootfs.ext4
+      # The guest kernel is fetched from Firecracker's CI bucket at the version
+      # and digests pinned in scripts/fetch-guest-kernel.sh. It used to be
+      # whatever the runner had in /opt (4.14), which meant CI tested a kernel
+      # nobody ships.
+      SANDBOX_KERNEL: ${{ github.workspace }}/guest/vmlinux
     steps:
       - uses: actions/checkout@v5
+
+      - name: Fetch the pinned guest kernel
+        run: |
+          bash scripts/fetch-guest-kernel.sh --arch "${{ inputs.arch }}" \
+               --out "$SANDBOX_KERNEL"
 
       - name: Build the guest image
         run: |
@@ -116,12 +125,15 @@ jobs:
       # and dropped SANDBOX_ROOTFS, so the leg exercised a guest built before the
       # code under test. The fixture prints the image it loaded; require it to be
       # the one this job built.
-      - name: The guest image under test is the one just built
+      - name: The guest image and kernel under test are the ones just built
         run: |
           set -euo pipefail
           grep -F "rootfs=$SANDBOX_ROOTFS" /tmp/privileged-ctest.log \
             || { echo "::error::the suite did not use SANDBOX_ROOTFS=$SANDBOX_ROOTFS"; exit 1; }
+          grep -F "kernel=$SANDBOX_KERNEL" /tmp/privileged-ctest.log \
+            || { echo "::error::the suite did not use SANDBOX_KERNEL=$SANDBOX_KERNEL"; exit 1; }
           echo "guest image under test: $SANDBOX_ROOTFS"
+          echo "guest kernel under test: $SANDBOX_KERNEL"
 
       # The runner may or may not be the root user; use sudo only when needed.
       # `sudo` resets the environment, so the asset overrides have to be handed
@@ -143,6 +155,8 @@ jobs:
           fi
           grep -F "rootfs=$DEB_IMG" /tmp/privileged-ctest-debian.log \
             || { echo "::error::the Debian run did not use $DEB_IMG"; exit 1; }
+          grep -F "kernel=$SANDBOX_KERNEL" /tmp/privileged-ctest-debian.log \
+            || { echo "::error::the Debian run did not use $SANDBOX_KERNEL"; exit 1; }
 
       - name: e2e smoke (root)
         run: |

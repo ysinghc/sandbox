@@ -174,10 +174,11 @@ static void workspace_probe(const char* payload, size_t n) {
 //
 // The classifier lives in include/vsock_peer.h (+ src/vsock_peer.c) so it can be
 // unit tested on the host, where a real non-host vsock peer can be produced.
-// In-guest that is impossible: this guest kernel is 4.14, and guest-local vsock
-// (VMADDR_CID_LOCAL) only exists from Linux 5.6, so a self-test connection into
-// our own listener would block in connect() rather than complete. The positive
-// direction is still observable here via the logged peer CID below.
+// In-guest that is impossible: the pinned 6.18 kernel supports
+// VMADDR_CID_LOCAL, but Firecracker's CI config disables
+// CONFIG_VSOCKETS_LOOPBACK, so a self-test connection into our own listener has
+// no local transport to complete on. The positive direction is still observable
+// here via the logged peer CID below.
 static void log_peer(int cfd, const char* tag) {
     struct sockaddr_vm peer;
     socklen_t len = sizeof(peer);

@@ -1651,7 +1651,8 @@ authoritative.
 - **Post-restore arch timer: the guest's virtual timer interrupt is never
   delivered after a restore on aarch64, so a guest that *waits* hangs.** On this
   host (Pi 5, host kernel `6.8.0-1065-raspi`, Firecracker v1.17.0 for
-  `aarch64-unknown-linux-musl`, guest Linux 4.14.174) the vCPUs resume and
+  `aarch64-unknown-linux-musl`, guest Linux 4.14.174 — then the only image
+  available; the product now pins 6.18.54, see `docs/BUILDING.md`) the vCPUs resume and
   execute (fresh serial output proves it), but a timer programmed before the
   snapshot never fires afterwards. Reproduced without the engine, so it is not
   an IPC or harness artifact: a guest `/init` prints `SANDBOX-READY`, then
@@ -1683,9 +1684,16 @@ authoritative.
   is why the suite passes and must not be "simplified" back to a sleep.
   Reported upstream: [firecracker#6313](https://github.com/firecracker-microvm/firecracker/issues/6313),
   with the engine-free reproduction. The former "upgrade the guest kernel" plan
-  (#30) therefore does not fix this half; #30 now only covers VMGenID,
-  guest-local vsock and leaving the EOL 4.14 kernel, and is deferred to the ARM
-  milestone. x86_64 is unaffected.
+  (#30) therefore does not fix this half. x86_64 is unaffected.
+  The product has since moved to a pinned 6.18.54 guest (x86_64 first,
+  `scripts/fetch-guest-kernel.sh`). The aarch64 reproduction has **not** been
+  re-run on 6.18: the Pi was offline when the pin landed, and a green claim
+  without that run would be guesswork. The first ARM-milestone task is to run
+  the same engine-free reproduction against the pin; the defect is version-
+  independent across 4.14 and 6.1, so it is expected — not assumed — to persist.
+  #30 now covers only guest-local vsock (Firecracker's CI config sets
+  `# CONFIG_VSOCKETS_LOOPBACK is not set`, so `VMADDR_CID_LOCAL` is unavailable
+  even on 6.18) and that ARM re-check.
 - **Docker `FORWARD` conflict**: the test host runs Docker, whose iptables
   `FORWARD` chain has `policy drop` at the same `filter` hook priority as
   `sandbox_policy`. At equal priority a drop in *any* chain wins regardless of
@@ -2173,14 +2181,16 @@ Two capture-time behaviours had to be handled explicitly.
 
 **Not guaranteed (by design, and not to be claimed):**
 
-- *Entropy.* Restoring one snapshot into N microVMs duplicates the guest kernel
-  CRNG state and any randomness cached in user space. Linux ≥ 5.18 reseeds its
-  in-kernel CRNG from the VMGenID device on resume; the reference guest kernel
-  here is **4.14.174**, which has no VMGenID. Consequences: cryptographic keys,
-  session IDs or UUIDs *generated before the snapshot* repeat across sandboxes.
-  Sandboxes must generate per-session secrets after resume (or the template must
-  carry no secrets), and a 5.18+ guest image plus VMGenID is the fix. Tracked,
-  not solved.
+- *Entropy captured in the template.* The guest kernel CRNG is reseeded on
+  resume, so bytes drawn *after* a sandbox starts differ between sandboxes: the
+  pinned guest is **6.18.54** with `CONFIG_VMGENID=y`, and a restored guest
+  prints `random: crng reseeded due to virtual machine fork` (verified on
+  x86_64 with Firecracker v1.17.0 and the busybox image, 2026-10-21).
+  What does **not** differ is anything written before the snapshot: the CRNG
+  state does not repeat, but files, `/etc/machine-id`, SSH host keys and secrets
+  baked into the template do. Sandboxes still generate per-session secrets after
+  resume and templates still carry no secrets. This bullet used to say a 5.18+
+  image was the fix; the kernel pin (#33) delivered it.
 - *Bit-exact execution.* Scheduler interleaving, device timing and memory
   layout after restore are not reproducible in the strict sense.
 - *Host fingerprint.* A restored guest sees the host CPU model and kernel

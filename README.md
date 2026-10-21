@@ -96,8 +96,11 @@ Trust boundaries and the full component/behavior model live in
   - `libsystemd-dev` (optional; enables sd_notify watchdog support)
 - Runtime assets:
   - a `firecracker` binary (`FIRECRACKER_BIN`, default `/usr/local/bin/firecracker`)
-  - a guest kernel and rootfs, or the prebuilt assets used by the test rig
-    (`/opt/sandbox-assets/vmlinux`, `/opt/sandbox-assets/rootfs.ext4`)
+  - a guest kernel and rootfs. Fetch the pinned kernel with
+    `scripts/fetch-guest-kernel.sh` and build the rootfs with
+    `scripts/build-custom-rootfs.sh` (or `scripts/build-debian-rootfs.sh`);
+    the test rig keeps them at `/opt/sandbox-assets/vmlinux` and
+    `/opt/sandbox-assets/rootfs.ext4`
 
 See [`docs/BUILDING.md`](docs/BUILDING.md) for exact commands and
 [`docs/DEPLOYMENT.md`](docs/DEPLOYMENT.md) for host preparation.

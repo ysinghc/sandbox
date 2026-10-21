@@ -26,6 +26,9 @@ CTestTestfile.cmake
 # Local runtime dirs (created at install/run time per LLD §10.2)
 run/
 
+# Built guest assets (CI writes rootfs images and the fetched kernel here)
+guest/
+
 # wrangler files
 .wrangler
 .dev.vars*

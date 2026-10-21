@@ -387,11 +387,12 @@ int main(void) {
         // real (and is the host's, 2) rather than "every peer is accepted".
         //
         // The negative direction -- a non-CID_HOST peer is refused -- cannot be
-        // produced inside this guest: the guest kernel is 4.14 and guest-local
-        // vsock (VMADDR_CID_LOCAL) only exists from Linux 5.6, so an in-guest
-        // connection to our own listener blocks in connect() instead of
-        // completing. It is covered by tests/test_vsock_peer.c, which runs the
-        // same classifier against a real non-host AF_VSOCK peer on the host.
+        // produced inside this guest: the pinned 6.18 kernel knows
+        // VMADDR_CID_LOCAL, but Firecracker's CI config disables
+        // CONFIG_VSOCKETS_LOOPBACK, so an in-guest connection to our own
+        // listener has no local transport to complete on. It is covered by
+        // tests/test_vsock_peer.c, which runs the same classifier against a real
+        // non-host AF_VSOCK peer on the host.
         int host_seen = 0;
         for (int i = 0; i < 100; i++) {
             if (serial_has(hvm, "SANDBOX-VSOCK-HOST cid=2")) {

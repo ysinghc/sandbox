@@ -141,6 +141,53 @@ installs at runtime would be lost at the next restore and would break
 determinism. Bake software into a template (#25) or install into the persistent
 `/workspace` (`pip --target`, `npm --prefix`, `GOPATH`).
 
+## Guest kernels
+
+The guest kernel is pinned, downloaded and digest-checked by
+[`scripts/fetch-guest-kernel.sh`](../scripts/fetch-guest-kernel.sh). The pin is
+the single source of truth; the script refuses a version, snapshot or checksum
+that is not compiled into it.
+
+| field | value |
+| --- | --- |
+| version | `6.18.54` |
+| source | `s3.amazonaws.com/spec.ccfc.min/firecracker-ci/20261021-1e5fcc27b59f-0/<arch>/vmlinux-6.18.54` |
+| x86_64 sha256 | `f697969a2f005d296e8c5e2fcd0f6a4f305eb3a06b085d3930d10f1eab3a0883` |
+| aarch64 sha256 | `92f2569ccb456f62c2c7618b9d9ce40020effbd173783633da051d1d9816b9ba` |
+| config | published next to the image as `vmlinux-6.18.54.config`; the fetch script stores it as `<out>.config` |
+
+```sh
+# Install the operator default:
+sudo scripts/fetch-guest-kernel.sh --arch x86_64 --out /opt/sandbox-assets/vmlinux
+# Or into a work tree (what CI does):
+scripts/fetch-guest-kernel.sh --arch x86_64 --out guest/vmlinux
+SANDBOX_KERNEL=$PWD/guest/vmlinux sudo -E ctest --test-dir build -R '^(tmpl_setup|vmm|ipc)$'
+```
+
+These are the kernels Firecracker's own CI builds and tests against this release
+line, so the guest/host interface is the one upstream exercises. We previously
+used the 4.14 quickstart kernel; it is end-of-life, predates modern ext4
+metadata and the vsock local transport (Linux 5.6), and is not something to put
+inside an isolation boundary. `scripts/fetch-guest-kernel.sh` is also how a
+self-built kernel would be introduced later: change the pin and the digests in
+one reviewed place.
+
+Verified locally on x86_64 with Firecracker v1.17.0 and the busybox guest:
+cold boot to `SANDBOX-READY` in ~1.2 s, `/dev/vdb` mounted at `/workspace`,
+`SANDBOX-VSOCK-HOST cid=2`, and `sleep`/`nanosleep`/`poll` timing exact
+(`2001/1000/501 ms`). Templates must be rebuilt after a kernel change — the
+kernel path is part of the template configuration, not of the snapshot.
+
+Two facts worth knowing before changing the pin:
+
+- The Firecracker CI config sets `# CONFIG_VSOCKETS_LOOPBACK is not set`, so
+  `VMADDR_CID_LOCAL` still does not exist in these guests. That keeps the
+  guest-local half of #30 open even on 6.18.
+- The aarch64 timer-interrupt defect after snapshot restore is a Firecracker
+  issue, not a kernel one: it reproduces on 4.14, 6.1 and (per the same
+  reproduction) on current kernels. See `SYSTEM DESIGN.md` §15.7 and
+  https://github.com/firecracker-microvm/firecracker/issues/6313.
+
 ## Cross / on-target builds
 
 The engine builds natively on both x86_64 and aarch64. On a small host (e.g. a

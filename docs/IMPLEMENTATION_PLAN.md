@@ -176,13 +176,15 @@ proxy presents `VMADDR_CID_HOST` (2), and a guest process cannot forge it:
 `connect()` to CID 2 from inside the guest is routed out to the host, never back
 into the guest's own listener.
 
-Second correction: the guest kernel here is **4.14.174**, and guest-local vsock
-(`VMADDR_CID_LOCAL`) only exists from Linux **5.6**. An in-guest self-test that
-connects to its own listener therefore *blocks in `connect()`* — the first
-attempt at this test wedged the agent's serve loop. The negative direction
-cannot be produced inside this guest at all, so it is verified on the host
-(`tests/test_vsock_peer.c` against a real loopback peer, cid 1) and the guest
-asserts the positive direction (`SANDBOX-VSOCK-HOST cid=2` in serial).
+Second correction: the pinned guest kernel is **6.18.54** (#33), so it knows
+`VMADDR_CID_LOCAL` (Linux 5.6+), but Firecracker's own CI kernel config sets
+`# CONFIG_VSOCKETS_LOOPBACK is not set`. An in-guest self-test that connects to
+its own listener therefore still has no local transport to complete on — the
+first attempt (on 4.14, where the address did not exist at all) wedged the
+agent's serve loop. The negative direction cannot be produced inside this guest,
+so it is verified on the host (`tests/test_vsock_peer.c` against a real loopback
+peer, cid 1) and the guest asserts the positive direction
+(`SANDBOX-VSOCK-HOST cid=2` in serial).
 
 ### Sharper alternatives adopted
 
@@ -405,11 +407,14 @@ Dependency order:
   a rejected load fails loudly rather than silently keeping a stale clock.
   aarch64: not sent at all (unknown field); the guest-side time sync is still
   open, and `tests/test_ipc.c` says so rather than pretending.
-- **Duplicate entropy:** the reference guest kernel is **4.14.174**, so there is
-  no VMGenID (5.18+) and no way to reseed the guest CRNG from the host on
-  resume. Recorded as a guarantee the product does *not* make (§15.16): a
-  template must carry no secrets, and per-session secrets are generated after
-  the sandbox starts. The fix is a newer guest image, tracked, not faked.
+- **Duplicate entropy:** *closed by the kernel pin (#33).* On the old 4.14.174
+  image there was no VMGenID (5.18+), so a restored guest kept the template's
+  CRNG state. The pinned 6.18.54 has `CONFIG_VMGENID=y`: a restore delivers the
+  VMGenID notification, the kernel reseeds, and the console shows
+  `random: crng reseeded due to virtual machine fork` (verified on x86_64,
+  Firecracker v1.17.0, 2026-10-21). Files captured in the template still repeat,
+  so §15.16 and `docs/API.md` still require per-session secrets to be generated
+  after resume and forbid secrets in templates.
 - **Pinned images:** the gap was **not** kernel identity (C8 was wrong: a
   restore never loads the kernel). It was `rootfs.ext4`, which was not bound at
   all while the guest resumed with that image's page cache and inode state. It
@@ -521,13 +526,15 @@ Next     #32 Debian guest image + /workspace — the visible milestone; everythi
          → #24 guest RPC (exec/files) → #7 broker streaming → #26 egress policy
          → #25 template pipeline → #27 control-plane API → #28 MCP gateway
          → #4 config layer → #17, #9, #11, #13, #14, #15, #18, #16
-Deferred #30 guest kernel off 4.14 — ARM milestone. The timer half is upstream
-         (firecracker#6313); what remains here is VMGenID, vsock-local and leaving an
-         EOL kernel.
+Done     #33 pin a current guest kernel (6.18.54, digest-checked): CI fetches it per
+         run instead of using the runner's 4.14; VMGenID reseed verified on restore
+Deferred #30 ARM milestone: guest-local vsock (CONFIG_VSOCKETS_LOOPBACK is off in
+         Firecracker's CI kernel) and re-running the timer reproduction on the 6.18
+         pin. The timer half is upstream (firecracker#6313).
 
 The order is set by *rework*, not by phase: the wire protocol (#12 → #24 → #27), the
 privileged runtime (#31 → #9 → #11), the broker body path (#7 → #26), and the guest
-image (#32 → #24 → #25 → #14 → #15) each form a chain where doing the later item first
+image (#32 → #33 → #24 → #25 → #14 → #15) each form a chain where doing the later item first
 means rewriting it. The Project's Sequence field and Discussion #29 carry the same
 order.
 ```

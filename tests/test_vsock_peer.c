@@ -5,10 +5,11 @@
 // refuse anything that is not the host. The *positive* direction ("the host's
 // connection is accepted and classified as CID_HOST") is observed in-guest by
 // tests/test_ipc.c. The *negative* direction cannot be produced inside the
-// sandbox guest at all -- the guest kernel is 4.14, and a guest-internal vsock
-// loopback (VMADDR_CID_LOCAL) only exists from Linux 5.6, so an in-guest
-// connection there blocks in connect() instead of completing. It is therefore
-// checked here, on the host, against a real non-host AF_VSOCK peer.
+// sandbox guest at all: the pinned 6.18 kernel is new enough for
+// VMADDR_CID_LOCAL (Linux 5.6), but Firecracker's CI config ships
+// `# CONFIG_VSOCKETS_LOOPBACK is not set`, so an in-guest connection to our own
+// listener has no local transport to complete on. It is therefore checked here,
+// on the host, against a real non-host AF_VSOCK peer.
 //
 // The integration half needs a host with vsock loopback and SKIPs loudly
 // without one; the decision table always runs.

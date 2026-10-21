@@ -117,12 +117,20 @@ set(TEST_TMPROOT "${SANDBOX_TEST_TMPDIR}/sbtest-${TEST_BDIR}")
 # with none of the markers the new agent prints (no workspace probe, no clock
 # line, no vsock peer line) while the host side was current. Baking the paths
 # into ENVIRONMENT makes them survive any launcher, sudo included.
+#
+# They are baked as <NAME>_DEFAULT, not <NAME>. ctest applies ENVIRONMENT on
+# top of the environment it inherited, so a baked SANDBOX_ROOTFS would override
+# a later `sudo env SANDBOX_ROOTFS=... ctest` -- which is exactly how the Debian
+# suite asks for a different guest. That failed as a green no-op: the Debian run
+# booted the busybox fixture, all four tests passed, and only the workflow's
+# image assertion noticed. A _DEFAULT is consulted only when the runtime
+# environment carries no explicit value, so both launchers work.
 set(TEST_ASSET_ENV "")
 if(DEFINED ENV{SANDBOX_ROOTFS} AND NOT "$ENV{SANDBOX_ROOTFS}" STREQUAL "")
-    string(APPEND TEST_ASSET_ENV ";SANDBOX_ROOTFS=$ENV{SANDBOX_ROOTFS}")
+    string(APPEND TEST_ASSET_ENV ";SANDBOX_ROOTFS_DEFAULT=$ENV{SANDBOX_ROOTFS}")
 endif()
 if(DEFINED ENV{SANDBOX_KERNEL} AND NOT "$ENV{SANDBOX_KERNEL}" STREQUAL "")
-    string(APPEND TEST_ASSET_ENV ";SANDBOX_KERNEL=$ENV{SANDBOX_KERNEL}")
+    string(APPEND TEST_ASSET_ENV ";SANDBOX_KERNEL_DEFAULT=$ENV{SANDBOX_KERNEL}")
 endif()
 set(TEST_SNAPROOT "${TEST_TMPROOT}/snapshots")
 set(TEST_JAILROOT "${TEST_TMPROOT}/jails")

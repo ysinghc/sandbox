@@ -19,8 +19,15 @@
 
 // Same overrides as scripts/benchmark.sh, so CI can build and use its own guest
 // image (scripts/build-custom-rootfs.sh) instead of the operator's asset.
-static const char* asset_path(const char* env, const char* fallback) {
+//
+// <env>_DEFAULT is what ctest bakes in at configure time (tests/CMakeLists.txt).
+// It is a *fallback*: an explicit runtime value must win, because the Debian
+// suite runs the same build dir with `sudo env SANDBOX_ROOTFS=...`.
+static const char* asset_path(const char* env, const char* def_env,
+                              const char* fallback) {
     const char* v = getenv(env);
+    if (v && *v) return v;
+    v = getenv(def_env);
     return (v && *v) ? v : fallback;
 }
 
@@ -35,8 +42,10 @@ int main(void) {
         fprintf(stderr, "SKIP template setup: no SANDBOX_SNAPSHOT_ROOT\n");
         return 0;
     }
-    const char* asset_kernel = asset_path("SANDBOX_KERNEL", ASSET_KERNEL);
-    const char* asset_rootfs = asset_path("SANDBOX_ROOTFS", ASSET_ROOTFS);
+    const char* asset_kernel =
+        asset_path("SANDBOX_KERNEL", "SANDBOX_KERNEL_DEFAULT", ASSET_KERNEL);
+    const char* asset_rootfs =
+        asset_path("SANDBOX_ROOTFS", "SANDBOX_ROOTFS_DEFAULT", ASSET_ROOTFS);
     if (geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0 ||
         !have_file(asset_kernel) || !have_file(asset_rootfs)) {
         fprintf(stderr, "SKIP template setup: need root + /dev/kvm + assets\n");

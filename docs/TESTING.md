@@ -119,9 +119,14 @@ The second shape has two traps, both seen in practice and both now handled:
    suite runs against the operator's `/opt/sandbox-assets/rootfs.ext4` — older
    guest, current host — and the failures look like architecture bugs (no clock
    line, no workspace probe, no vsock peer line) while every test still "runs".
-   The paths are therefore baked into each test's `ENVIRONMENT` property at
-   configure time, and the job fails unless the fixture reports the image the
-   job built.
+   The configure-time values are therefore baked into each test's `ENVIRONMENT`
+   property as `<NAME>_DEFAULT`, and the job fails unless the fixture reports the
+   image and kernel the job built. They are deliberately *not* baked as
+   `<NAME>`: ctest applies `ENVIRONMENT` over the inherited environment, so a
+   baked `SANDBOX_ROOTFS` would itself silently defeat
+   `sudo env SANDBOX_ROOTFS=... ctest` — which is how the Debian suite selects
+   its image. That exact mix-up made a whole Debian run boot the busybox fixture
+   and pass 4/4 before the image assertion caught it.
 2. **Files written under `sudo` belong to root.** The guest image lands in the
    runner's work tree; the *next* checkout cannot delete it (`EACCES`) and dies
    before its first step, poisoning every later run. `build-custom-rootfs.sh`
@@ -204,13 +209,17 @@ Each host needs:
 - `/dev/kvm` and `/dev/net/tun`, and `nftables` on the host;
 - Firecracker at `${FIRECRACKER_BIN:-/usr/local/bin/firecracker}`;
 - guest assets at `${SANDBOX_KERNEL:-/opt/sandbox-assets/vmlinux}` and
-  `${SANDBOX_ROOTFS:-/opt/sandbox-assets/rootfs.ext4}`;
-  the kernel is only obtainable from the host, but the rootfs is rebuildable
-  from this tree with `sudo scripts/build-custom-rootfs.sh` (writes
-  `/opt/sandbox-assets/rootfs.ext4`, or `${SANDBOX_ROOTFS_OUT}`). The privileged
-  workflow builds it into the checkout and points `SANDBOX_ROOTFS` at the result,
-  so guest-side changes (`scripts/sandbox-agent.c`, `/init`) are exercised in CI
-  without clobbering the operator's asset. The workflow then builds the **Debian**
+  `${SANDBOX_ROOTFS:-/opt/sandbox-assets/rootfs.ext4}`.
+  The kernel is **fetched, pinned and digest-checked**, not rebuilt:
+  `scripts/fetch-guest-kernel.sh --arch x86_64 --out guest/vmlinux` (see
+  [`BUILDING.md`](BUILDING.md#guest-kernels)). The privileged workflow does this
+  for every run and points `SANDBOX_KERNEL` at the result, so CI never tests the
+  runner's stale `/opt` kernel. The rootfs is rebuildable from this tree with
+  `sudo scripts/build-custom-rootfs.sh` (writes `/opt/sandbox-assets/rootfs.ext4`,
+  or `${SANDBOX_ROOTFS_OUT}`). The workflow builds it into the checkout and
+  points `SANDBOX_ROOTFS` at the result, so guest-side changes
+  (`scripts/sandbox-agent.c`, `/init`) are exercised in CI without clobbering the
+  operator's asset. The workflow then builds the **Debian**
   image (`sudo scripts/build-debian-rootfs.sh`) and runs the same privileged suite
   against it a second time: the busybox image catches engine regressions cheaply,
   the Debian image is what a user boots, and a suite that only passes on the

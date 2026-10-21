@@ -176,11 +176,15 @@ starts from the same state:
 
 What is **not** guaranteed:
 
-- **Entropy and unique IDs.** Firecracker restores memory, so a template's
-  kernel CRNG state (and any random bytes read before capture) repeat across
-  sandboxes. Generate per-session secrets *after* the sandbox starts, and never
-  bake secrets into a template. This is fixed only by a guest kernel ≥ 5.18
-  (VMGenID reseeding); the reference image (4.14) predates it.
+- **Entropy and unique IDs.** Firecracker restores memory, so anything the
+  template wrote before capture repeats across sandboxes. The pinned 6.18 guest
+  kernel has `CONFIG_VMGENID=y`, so Firecracker's VMGenID notification makes the
+  kernel reseed its CRNG on restore (visible in the restored guest's console as
+  `crng reseeded due to virtual machine fork`): random bytes generated *after*
+  the sandbox starts differ between sandboxes. Bytes captured *in* the template
+  do not, including `/etc/machine-id`, SSH host keys, and any secret a build
+  wrote. Generate per-session secrets after the sandbox starts, and never bake
+  secrets into a template.
 - **Timing/interleaving**: scheduler and device timing after resume are not
   reproducible, so lock-free races that a test wins on one run may lose on the
   next. That is a property of the workload, not of the sandbox.
