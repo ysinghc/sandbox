@@ -230,7 +230,8 @@ peer, cid 1) and the guest asserts the positive direction
 | M1 ARM timer (#6) | ✅ investigated on real hardware — **not fixed**, documented (§15.7); fix path #30 (modern guest kernel) |
 | M1 aarch64 privileged leg | ✅ live on the Pi 5 (`sandbox-arm64-pi5`), both legs green on `62ae6e5` |
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
-| M2 #24–#28 | ⏳ not started (#24 is next) |
+| #24 guest RPC | 🔶 guest + host client + tests done; IPC/libsandbox/CLI exposure and the CI boot check outstanding |
+| M2 #7, #25–#28 | ⏳ not started |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -453,10 +454,44 @@ Also not in the original paragraph, but required by the tests:
   after restore.
 
 ### #24 — Guest RPC: exec + file operations over vsock
-Newline-delimited JSON on a second port (`RPC_PORT 5002`; 5001 stays the env
-port). Agent gains `exec`/`read_file`/`write_file`/`list_dir`; `libsandbox.h`
-gains `sandbox_exec`/`sandbox_read_file`/`sandbox_write_file`/`sandbox_list_dir`.
-Path validation: writes confined to `/workspace/`, `..` rejected. Auth via #10.
+**Built as designed-then-corrected.** The plan said newline-delimited JSON; the
+implementation is a length-prefixed binary frame protocol (`include/guest_rpc.h`)
+because the agent is a static C binary with no JSON or protobuf library, and exec
+streams raw bytes that JSON would have to escape. Port **5002** (5001 stays the
+env port), one request per connection, concurrency = more connections.
+
+Status:
+
+| Piece | State |
+|---|---|
+| Wire format, byte codec, path policy (`include/guest_rpc.h`, `src/guest_rpc_wire.c`) | ✅ |
+| Guest server: exec (streaming, timeout, output cap, process-group kill, cancel on disconnect) and read/write/list/stat/mkdir/remove (`src/guest_rpc_server.c`, linked into the agent) | ✅ |
+| Host client (`src/guest_rpc_client.c`, in `libsandbox`) | ✅ |
+| Unprivileged test: the real server against the real client over socketpairs — 82 checks, clean under ASan/UBSan (`tests/test_guest_rpc.c`) | ✅ |
+| Booted-guest check after a snapshot restore (`tests/test_ipc.c`, privileged) | ⏳ written; awaiting the first CI run |
+| Exposure through the daemon IPC (`ClientMessage`), `libsandbox.h`, CLI | ⏳ next |
+
+**Auth is the #10 rule, and that is a decision, not an omission.** The issue asked
+for a per-VM key with replay protection. #10 established that a token cannot be
+delivered to the guest over the channel it would authenticate (the template is
+built once and restored per session), so the gate is the vsock peer CID: a guest
+process cannot present CID 2. Replay is not a separate threat here: there are no
+signed messages to replay — each request is a fresh connection, and the only way
+to open one is the per-VM UDS in a 0700 jail. Malformed or hostile frames from a
+peer that passed the gate are tested (bad reserved byte, 2 GiB length, wrong
+frame type, unknown version/op, truncated header, half-sent requests, NUL in a
+path); none is acted on and the server keeps serving.
+
+Path policy: absolute, no `.`/`..` components, under `/workspace`; the parent is
+`realpath`'d and must stay inside (a symlink planted in the workspace cannot lead
+out); the final component is never followed for write/stat/remove. A request may
+opt out per call with `GRPC_F_ALLOW_OUTSIDE` — that is the host's choice, not the
+guest's. `/` and the workspace root are never removable.
+
+Known limits (v1): a file is one frame, so ≤ 4 MiB (`GRPC_MAX_FILE`); chunked
+transfer is a later addition, not a wire change. stdin is ≤ 64 KiB then EOF.
+The agent is PID 1 and reaps every orphan; background daemons started by `exec`
+survive the call (only the timeout/cancel path kills the group).
 
 ### #25 — Template pipeline
 `scripts/build-template.sh`, `publish-template.sh`, `gc-templates.sh`;

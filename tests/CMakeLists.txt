@@ -58,6 +58,16 @@ target_include_directories(test_vsock_peer PRIVATE ../include)
 add_test(NAME vsock_peer COMMAND test_vsock_peer)
 set_tests_properties(vsock_peer PROPERTIES TIMEOUT 60)
 
+# #24: guest exec / file RPC. The real guest server (the code the agent links)
+# runs against the real host client over socketpairs, so processes are forked and
+# files written for real, with no VM, root or KVM -- it runs on the hosted CI too.
+add_executable(test_guest_rpc test_guest_rpc.c
+               ../src/guest_rpc_server.c ../src/guest_rpc_wire.c)
+target_include_directories(test_guest_rpc PRIVATE ../include)
+target_link_libraries(test_guest_rpc sandbox pthread)
+add_test(NAME guest_rpc COMMAND test_guest_rpc)
+set_tests_properties(guest_rpc PROPERTIES TIMEOUT 180)
+
 # Phase 3: network manager test (root only: tap + nftables; SKIPs otherwise).
 # The cleanup fixture runs even if the test aborts, so leaked netns/routes/
 # nft rules can never poison later runs.

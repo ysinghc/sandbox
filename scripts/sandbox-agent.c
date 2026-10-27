@@ -36,6 +36,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "guest_rpc.h"
 #include "vsock_peer.h"
 
 #define ENV_PORT 5001
@@ -196,14 +197,14 @@ static void log_peer(int cfd, const char* tag) {
 // classified and its CID logged (see log_peer usage below). The negative
 // direction cannot be produced here at all -- see include/vsock_peer.h.
 
-static int bind_listen(void) {
+static int bind_listen(unsigned port) {
     int fd = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
     if (fd < 0) return -1;
     struct sockaddr_vm sa;
     memset(&sa, 0, sizeof(sa));
     sa.svm_family = AF_VSOCK;
     sa.svm_cid = VMADDR_CID_ANY;
-    sa.svm_port = ENV_PORT;
+    sa.svm_port = port;
     if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) == 0 && listen(fd, 4) == 0)
         return fd;
     close(fd);
@@ -312,13 +313,22 @@ int main(void) {
     // The virtio-vsock device may probe after init starts; retry bind briefly.
     int lfd = -1;
     for (int i = 0; i < 200 && lfd < 0; i++) {
-        lfd = bind_listen();
+        lfd = bind_listen(ENV_PORT);
         if (lfd < 0) usleep(50000);
     }
     if (lfd < 0) {
         say("SANDBOX-AGENT-FAIL\n");
         return 1;
     }
+
+    // #24: the exec / file RPC. Same authentication as the env channel (only the
+    // host CID is served), its own port, and file ops confined to the workspace
+    // volume, which is mounted on first use exactly as for the env probe.
+    int rfd = bind_listen(GRPC_PORT);
+    grpc_server_t* rpc = grpc_server_new(WS_DIR, ws_ensure_mount);
+    if (rfd < 0 || !rpc) say("SANDBOX-RPC-FAIL\n");
+    int rpc_live = 0;
+    unsigned long rpc_idle = 0;
 
     // Signal host readiness; the snapshot is taken after this marker.
     say("SANDBOX-READY\n");
@@ -375,6 +385,26 @@ int main(void) {
                 continue;
             }
         }
+        // #24: serve the RPC listener the same way (zero-timeout, never blocking).
+        // An idle server is only stepped now and then, to reap orphaned children
+        // (this process is PID 1); a busy one is stepped every iteration.
+        if (rfd >= 0 && rpc) {
+            struct pollfd rp = { .fd = rfd, .events = POLLIN };
+            if (poll(&rp, 1, 0) > 0 && (rp.revents & POLLIN)) {
+                int cfd = accept(rfd, NULL, NULL);
+                if (cfd >= 0) {
+                    if (vsock_peer_is_host(cfd)) {
+                        grpc_server_adopt(rpc, cfd);
+                        rpc_live = 1;
+                    } else {
+                        log_peer(cfd, "SANDBOX-VSOCK-REJECT");
+                        close(cfd);
+                    }
+                }
+            }
+            if (rpc_live > 0 || ++rpc_idle % 4096 == 0)
+                rpc_live = grpc_server_step(rpc);
+        }
         // Re-announce rarely (~5 s): each rebind closes the listener and drops
         // any in-flight host connection, so back-to-back rebinds would
         // guillotine every injection attempt. A long quiet window lets one
@@ -386,7 +416,13 @@ int main(void) {
             if (lfd >= 0) close(lfd);
             lfd = -1;
             for (int bi = 0; bi < 1000 && lfd < 0; bi++)
-                lfd = bind_listen();
+                lfd = bind_listen(ENV_PORT);
+            // The RPC listener is re-announced with it; the host only connects
+            // after the env has landed, so there is nothing in flight to drop.
+            if (rfd >= 0) close(rfd);
+            rfd = -1;
+            for (int bi = 0; bi < 1000 && rfd < 0; bi++)
+                rfd = bind_listen(GRPC_PORT);
             if (lfd >= 0) {
                 announced = 0;
                 say("SANDBOX-VSOCK-RELISTEN\n");

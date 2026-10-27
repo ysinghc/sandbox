@@ -4,6 +4,7 @@
 // template fixture and root). SKIPs where root/KVM/template are unavailable.
 
 #include "broker.h"
+#include "guest_rpc.h"
 #include "ipc_server.h"
 #include "lifecycle.h"
 #include "libsandbox.h"
@@ -21,6 +22,16 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+
+// #24: collect streamed exec stdout for the RPC checks below.
+struct rpc_cap { char* b; size_t* n; size_t cap; };
+static void rpc_on_chunk(int is_stderr, const uint8_t* d, size_t n, void* ud) {
+    struct rpc_cap* c = ud;
+    if (is_stderr || *c->n + n >= c->cap) return;
+    memcpy(c->b + *c->n, d, n);
+    *c->n += n;
+    c->b[*c->n] = '\0';
+}
 
 static int g_fail = 0;
 #define CHECK(cond, msg)                              \
@@ -431,6 +442,49 @@ int main(void) {
                         "guest clock is not reset on load\n");
         CHECK(guest_now > 1600000000LL, "clock: guest clock is plausible");
 #endif
+
+        // --- #24: exec and file RPC against the *restored* guest. This is the
+        // part tests/test_guest_rpc.c cannot show: the real vsock transport
+        // through Firecracker's UDS, the host-CID gate in the agent, and a
+        // listener that must have been re-announced after the snapshot restore.
+        {
+            char out[512] = {0};
+            size_t on = 0;
+            struct rpc_cap cap = { out, &on, sizeof(out) };
+            char msg[160];
+            grpc_exec_res_t xr;
+            const char* script[] = { "echo rpc-hello; pwd; echo oops >&2; exit 5" };
+            grpc_exec_req_t rq = { .argv = script, .argc = 1, .flags = GRPC_F_SHELL,
+                                   .timeout_ms = 10000 };
+            int fd = grpc_connect_uds(hvm->vsock_uds, GRPC_PORT, 10000);
+            int rc = fd < 0 ? -1 : grpc_exec(fd, &rq, rpc_on_chunk, &cap, 20000, &xr, msg, sizeof(msg));
+            if (rc != 0 || xr.exit_code != 5) dump_serial(hvm, "rpc exec failed");
+            CHECK(rc == 0 && xr.exit_code == 5 && strstr(out, "rpc-hello\n/workspace\n"),
+                  "rpc: exec in the restored guest (stdout, cwd, exit code)");
+
+            const char* body = "written over vsock\n";
+            rc = grpc_write_file(grpc_connect_uds(hvm->vsock_uds, GRPC_PORT, 10000),
+                                 "/workspace/rpc.txt", (const uint8_t*)body, strlen(body),
+                                 0644, 0, 10000, msg, sizeof(msg));
+            uint8_t* rd = NULL; size_t rl = 0; int tr = 0;
+            int rc2 = grpc_read_file(grpc_connect_uds(hvm->vsock_uds, GRPC_PORT, 10000),
+                                     "/workspace/rpc.txt", 0, 0, 10000, &rd, &rl, &tr,
+                                     msg, sizeof(msg));
+            CHECK(rc == 0 && rc2 == 0 && rl == strlen(body) && !memcmp(rd, body, rl),
+                  "rpc: file written and read back through the guest");
+            free(rd);
+
+            rc = grpc_read_file(grpc_connect_uds(hvm->vsock_uds, GRPC_PORT, 10000),
+                                "/etc/passwd", 0, 0, 10000, &rd, &rl, &tr, msg, sizeof(msg));
+            CHECK(rc == GRPC_E_DENIED, "rpc: a path outside /workspace is refused");
+
+            const char* slow[] = { "sleep 60" };
+            grpc_exec_req_t sq = { .argv = slow, .argc = 1, .flags = GRPC_F_SHELL,
+                                   .timeout_ms = 700 };
+            rc = grpc_exec(grpc_connect_uds(hvm->vsock_uds, GRPC_PORT, 10000), &sq, NULL,
+                           NULL, 20000, &xr, msg, sizeof(msg));
+            CHECK(rc == 0 && (xr.flags & GRPC_X_TIMED_OUT), "rpc: guest-side timeout kills the command");
+        }
 
         // --- #23: session workspaces. A sandbox created with a session key gets
         // a *persistent* /workspace: its files survive the sandbox being

@@ -70,7 +70,8 @@ log "  base: $(cat "$ROOTDIR/etc/debian_version" 2>/dev/null || echo unknown) ($
 log "Building the guest agent (static, $ARCH)"
 gcc -static -O2 -Wall -Wextra -I"$REPO_ROOT/include" \
     -o "$ROOTDIR/bin/sandbox-agent" \
-    "$REPO_ROOT/scripts/sandbox-agent.c" "$REPO_ROOT/src/vsock_peer.c"
+    "$REPO_ROOT/scripts/sandbox-agent.c" "$REPO_ROOT/src/vsock_peer.c" \
+    "$REPO_ROOT/src/guest_rpc_server.c" "$REPO_ROOT/src/guest_rpc_wire.c"
 chmod 0755 "$ROOTDIR/bin/sandbox-agent"
 
 log "Installing /init (shared with the busybox image)"

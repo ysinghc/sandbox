@@ -78,7 +78,8 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 AGENT_SRC="$REPO_ROOT/scripts/sandbox-agent.c"
 gcc -static -O2 -Wall -Wextra -I"$REPO_ROOT/include" \
     -o "$MNTDIR/bin/sandbox-agent" \
-    "$AGENT_SRC" "$REPO_ROOT/src/vsock_peer.c"
+    "$AGENT_SRC" "$REPO_ROOT/src/vsock_peer.c" \
+    "$REPO_ROOT/src/guest_rpc_server.c" "$REPO_ROOT/src/guest_rpc_wire.c"
 chmod +x "$MNTDIR/bin/sandbox-agent"
 log "  agent: $(file -b "$MNTDIR/bin/sandbox-agent")"
 

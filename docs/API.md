@@ -226,6 +226,36 @@ A malformed frame that cannot be parsed replies with `request_id = 0`; a client
 with outstanding ids must treat that as fatal for the connection, not as one of
 its own replies.
 
+## Guest RPC (#24)
+
+Exec and file operations against a running sandbox. This is the *guest-facing*
+protocol between the engine and the agent inside the VM; the client-facing
+surface (`ClientMessage`, `libsandbox.h`, CLI) is wired separately.
+
+Transport: vsock port 5002, reached through the VM's Firecracker UDS
+(`CONNECT 5002\n`). One request per connection. Frame:
+`u32le payload_len | u8 type | u8 0 | payload`; requests are
+`u8 version(1) | u8 op | u32 flags | body`. Replies stream `STDOUT`/`STDERR`
+frames (exec only) and end with one `RESULT`: `u8 status | i32 errno | body`
+(a human message string when `status != 0`).
+
+| Op | Body | Notes |
+|---|---|---|
+| `exec` | cwd, argv[], env[], timeout_ms, max_output, stdin | `GRPC_F_SHELL`: argv[0] is a script for `/bin/sh -c`. Own process group; killed on timeout, output cap, or host disconnect. Result: exit code, signal, flags (`TIMED_OUT`, `TRUNCATED`). Defaults: cwd `/workspace`, 1 h cap, 4 MiB output. |
+| `read_file` | path, offset, max_bytes | ≤ 4 MiB; reports truncation. |
+| `write_file` | path, mode, data | ≤ 4 MiB; overwrite is atomic (temp + rename); flags `APPEND`, `EXCL`, `PARENTS`. |
+| `list_dir` | path | name, type, size, mtime. |
+| `stat` | path | Does not follow a final symlink. |
+| `mkdir` | path, mode | `PARENTS` = `mkdir -p`. |
+| `remove` | path | `RECURSIVE` for directories; never `/` or the workspace root. |
+
+Statuses: `0` ok, `1` bad request, `2` denied (outside `/workspace`, not
+absolute, `..`, symlink escape), `3` not found, `4` I/O, `5` too large, `6` bad
+version, `7` busy (16 connections max), `8` exists, `9` workspace not mounted.
+
+A host-side deadline expiring closes the connection; the guest treats that as
+cancellation and kills the exec's process group.
+
 ## Credential broker
 
 The broker is an HTTP proxy. A guest sends a request with:
