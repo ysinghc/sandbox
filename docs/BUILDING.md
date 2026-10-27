@@ -120,7 +120,7 @@ compiles a guest at runtime. Two images exist, and they share `/init`
 | Image | Script | Purpose |
 | --- | --- | --- |
 | busybox (128 MiB) | `scripts/build-custom-rootfs.sh` | Test fixture. Minimal: proves snapshots, vsock, `/workspace` and the agent without a package manager to slow it down. |
-| Debian (`bookworm`, ~450 MiB) | `scripts/build-debian-rootfs.sh` | What a user actually gets: `dpkg`, `apt`, `bash`, coreutils and `python3`, plus the same agent and `/init`. |
+| Debian (`bookworm` 12.15, 308 MiB apparent / ~199 MiB on disk) | `scripts/build-debian-rootfs.sh` | What a user actually gets: `dpkg`, `apt`, `bash`, coreutils and `python3`, plus the same agent and `/init`. |
 
 Both require root (`debootstrap` for Debian, a loop mount for busybox) and both
 accept `SANDBOX_ROOTFS_OUT` so CI writes into its own work tree:
@@ -135,6 +135,11 @@ image, and verifies the *image* (not the source directory): `/etc/debian_version
 an executable `/init`, the agent, and the `/workspace` mountpoint. Cross-arch
 builds are refused rather than half-done — the agent is compiled for the guest,
 so build on the architecture you intend to boot.
+
+CI build of 45c7828..f5bcee5 (x86_64, bookworm 12.15): 181 MiB of content in a
+308 MiB sparse ext4, sha256 `02b8408beb474c9820498110149f1e047648ca442bc3a1630976964ae630f90a`
+(debootstrap output is not byte-reproducible across runs; treat the digest as a
+record, not a pin).
 
 `/` is mounted read-only in the guest. That is not an oversight: package
 installs at runtime would be lost at the next restore and would break
@@ -187,6 +192,14 @@ Two facts worth knowing before changing the pin:
   issue, not a kernel one: it reproduces on 4.14, 6.1 and (per the same
   reproduction) on current kernels. See `SYSTEM DESIGN.md` §15.7 and
   https://github.com/firecracker-microvm/firecracker/issues/6313.
+
+### Clocksource (6.x guests)
+
+A 6.18 x86_64 guest boots on kvm-clock and then switches to `tsc`. After a
+snapshot restore the TSC resumes from its snapshot value, so the realtime jump
+that `clock_realtime` requests never reaches the guest: CI measured a -18 s skew.
+`FC_BOOT_ARGS` therefore carries `clocksource=kvm-clock`; skew is 0 s on both
+the busybox and Debian suites.
 
 ## Cross / on-target builds
 
