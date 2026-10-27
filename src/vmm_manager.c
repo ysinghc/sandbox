@@ -55,7 +55,13 @@
 // 8250-compatible MMIO UART (earlycon=uart,mmio,0x40002000), not a PL011. A guest
 // kernel therefore needs CONFIG_SERIAL_8250_CONSOLE even on ARM64 -- believing
 // "aarch64 means ttyAMA0" produces a boot with no console at all.
-#define FC_BOOT_ARGS "console=ttyS0 reboot=k panic=1 init=/init root=/dev/vda ro"
+//
+// clocksource=kvm-clock: a 6.x x86_64 guest boots on kvm-clock, then switches to
+// tsc (invariant TSC). After a restore the TSC resumes from its snapshot value,
+// so the KVM_SET_CLOCK realtime jump that clock_realtime requests never reaches
+// the guest (skew == time since the snapshot, -18 s in CI). kvm-clock honours it.
+// Without the argument 6.18.54 logs "Switched to clocksource tsc".
+#define FC_BOOT_ARGS "console=ttyS0 reboot=k panic=1 clocksource=kvm-clock init=/init root=/dev/vda ro"
 #define FC_TEMPLATE_IFACE "net1"  // template NIC id; restores retarget its tap
 #define FC_VSOCK_JAILVIEW "/vsock.sock"  // per-VM vsock host backend UDS
 #define FC_VSOCK_GUEST_CID 3
