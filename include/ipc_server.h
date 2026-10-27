@@ -21,6 +21,11 @@ void ipc_server_request_stop(void);
 // may name. allowed_services is a comma-separated host allowlist copied into
 // each issued token (NULL/empty denies everything).
 void ipc_server_set_pool(pool_manager_t* pool);
+
+// Test seam (#24): the next session that connects is treated as the owner of
+// `sandbox_id`, as if it had created it. One-shot, so a second connection can
+// show that ownership is enforced. Never called by the daemon.
+void ipc_server_test_grant_next_session(uint32_t sandbox_id);
 void ipc_server_set_template(const char* template_name);
 void ipc_server_set_allowed_services(const char* csv);
 

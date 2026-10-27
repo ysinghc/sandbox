@@ -12,6 +12,7 @@
 //     daemon reading a new client) sees exactly the bytes it used to.
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "ipc_codec.h"
@@ -125,6 +126,128 @@ int main(void) {
     CHECK(ipc_decode_response(b_legacy, n_legacy_reply, &got_legacy) == 0 &&
               got_legacy.request_id == 0,
           "legacy reply decodes with id 0");
+
+    // --- #24 guest ops ------------------------------------------------------
+    {
+        ipc_request_t gq;
+        ipc_request_init(&gq);
+        gq.kind = IPC_REQ_GUEST;
+        gq.request_id = 77;
+        gq.sandbox_id = 12;
+        gq.guest_op = 3;
+        snprintf(gq.path, sizeof(gq.path), "/workspace/a b/ü.txt");
+        gq.argv[0] = strdup("sh"); gq.argv[1] = strdup("-c"); gq.n_argv = 2;
+        gq.env_vars[0] = strdup("K=V"); gq.n_env = 1;
+        // Binary payload with NULs and every byte value: protobuf `bytes`, not a string.
+        gq.data_len = 256;
+        gq.data = malloc(gq.data_len);
+        for (int i = 0; i < 256; i++) gq.data[i] = (uint8_t)i;
+        gq.timeout_ms = 1500; gq.max_output = 9; gq.offset = 1ull << 40;
+        gq.max_bytes = 4096; gq.mode = 0640;
+        gq.guest_flags = IPC_GF_SHELL | IPC_GF_APPEND | IPC_GF_RECURSIVE;
+
+        uint8_t gb[IPC_FRAME_MAX];
+        size_t gn = 0;
+        CHECK(ipc_encode_request(&gq, gb, sizeof(gb), &gn) == 0, "guest: encode request");
+        ipc_request_t gr;
+        CHECK(ipc_decode_request(gb, gn, &gr) == 0 && gr.kind == IPC_REQ_GUEST &&
+                  gr.request_id == 77 && gr.sandbox_id == 12 && gr.guest_op == 3,
+              "guest: request decodes with kind, id, target and op");
+        CHECK(strcmp(gr.path, gq.path) == 0 && gr.n_argv == 2 && !strcmp(gr.argv[1], "-c") &&
+                  gr.n_env == 1 && !strcmp(gr.env_vars[0], "K=V"),
+              "guest: path, argv and env survive");
+        CHECK(gr.data_len == 256 && gr.data && !memcmp(gr.data, gq.data, 256),
+              "guest: binary data (NULs included) survives");
+        CHECK(gr.timeout_ms == 1500 && gr.max_output == 9 && gr.offset == (1ull << 40) &&
+                  gr.max_bytes == 4096 && gr.mode == 0640 &&
+                  gr.guest_flags == (IPC_GF_SHELL | IPC_GF_APPEND | IPC_GF_RECURSIVE),
+              "guest: numeric fields and flag bits survive");
+        ipc_request_clear(&gr);
+
+        // A path that does not fit is refused, never silently clipped: a clipped
+        // path names a different file. The C struct cannot even hold one, so the
+        // message is built by hand: ClientMessage.guest (field 7) wrapping
+        // GuestRequest.path (field 3) with IPC_MAX_PATH + 10 bytes.
+        {
+            size_t plen = IPC_MAX_PATH + 10;
+            uint8_t raw[IPC_MAX_PATH + 64];
+            size_t o = 0, inner_hdr;
+            uint8_t inner[IPC_MAX_PATH + 32];
+            size_t io = 0;
+            inner[io++] = 0x1a;  // field 3, length-delimited
+            for (size_t v = plen; ; ) {  // varint length
+                uint8_t byte = v & 0x7f;
+                v >>= 7;
+                inner[io++] = byte | (v ? 0x80 : 0);
+                if (!v) break;
+            }
+            inner_hdr = io;
+            memset(inner + io, 'p', plen);
+            io += plen;
+            raw[o++] = 0x3a;     // field 7, length-delimited
+            for (size_t v = io; ; ) {
+                uint8_t byte = v & 0x7f;
+                v >>= 7;
+                raw[o++] = byte | (v ? 0x80 : 0);
+                if (!v) break;
+            }
+            memcpy(raw + o, inner, io);
+            o += io;
+            (void)inner_hdr;
+            ipc_request_t lr;
+            CHECK(ipc_decode_request(raw, o, &lr) < 0,
+                  "guest: a path longer than the buffer is rejected, not truncated");
+        }
+        ipc_request_clear(&gq);
+
+        // Response: entries, bytes and the exec counters.
+        ipc_response_t gp;
+        memset(&gp, 0, sizeof(gp));
+        gp.kind = IPC_REQ_GUEST; gp.request_id = 77; gp.sandbox_id = 12;
+        gp.exit_code = -1; gp.term_signal = 9; gp.timed_out = true; gp.output_truncated = true;
+        gp.out = malloc(4); memcpy(gp.out, "a\0b\n", 4); gp.out_len = 4;
+        gp.out_total = 9999999999ull; gp.err_total = 5;
+        gp.entries = calloc(2, sizeof(ipc_dirent_t)); gp.n_entries = 2;
+        snprintf(gp.entries[0].name, sizeof(gp.entries[0].name), "one"); gp.entries[0].type = 1; gp.entries[0].size = 7;
+        snprintf(gp.entries[1].name, sizeof(gp.entries[1].name), "two"); gp.entries[1].type = 2; gp.entries[1].mtime = -5;
+        gp.truncated = true; gp.ftype = 2; gp.fmode = 0755; gp.size = 1ull << 33;
+        size_t pn = 0;
+        CHECK(ipc_encode_response(&gp, gb, sizeof(gb), &pn) == 0, "guest: encode response");
+        ipc_response_t gpr;
+        CHECK(ipc_decode_response(gb, pn, &gpr) == 0 && gpr.kind == IPC_REQ_GUEST &&
+                  gpr.request_id == 77 && gpr.exit_code == -1 && gpr.term_signal == 9 &&
+                  gpr.timed_out && gpr.output_truncated,
+              "guest: response flags and signed exit code survive");
+        CHECK(gpr.out_len == 4 && !memcmp(gpr.out, "a\0b\n", 4) && gpr.out_total == 9999999999ull &&
+                  gpr.err_total == 5 && gpr.err == NULL,
+              "guest: output bytes and 64-bit totals survive");
+        CHECK(gpr.n_entries == 2 && !strcmp(gpr.entries[0].name, "one") && gpr.entries[0].size == 7 &&
+                  gpr.entries[1].type == 2 && gpr.entries[1].mtime == -5 && gpr.truncated &&
+                  gpr.ftype == 2 && gpr.fmode == 0755 && gpr.size == (1ull << 33),
+              "guest: directory entries and stat fields survive");
+        ipc_response_clear(&gpr);
+        ipc_response_clear(&gp);
+
+        // The worst case the daemon can produce must still fit one frame.
+        ipc_response_t big;
+        memset(&big, 0, sizeof(big));
+        big.kind = IPC_REQ_GUEST; big.request_id = UINT64_MAX; big.sandbox_id = UINT32_MAX;
+        big.out = malloc(IPC_EXEC_OUT_KEEP); memset(big.out, 0xff, IPC_EXEC_OUT_KEEP); big.out_len = IPC_EXEC_OUT_KEEP;
+        big.err = malloc(IPC_EXEC_ERR_KEEP); memset(big.err, 0xff, IPC_EXEC_ERR_KEEP); big.err_len = IPC_EXEC_ERR_KEEP;
+        big.out_total = big.err_total = UINT64_MAX;
+        size_t bn = 0;
+        CHECK(ipc_encode_response(&big, gb, sizeof(gb), &bn) == 0 && bn + 4 <= IPC_FRAME_MAX,
+              "guest: a full exec reply (32 KiB + 16 KiB) fits one IPC frame");
+        ipc_response_clear(&big);
+        ipc_response_t ch;
+        memset(&ch, 0, sizeof(ch));
+        ch.kind = IPC_REQ_GUEST; ch.request_id = UINT64_MAX;
+        ch.out = malloc(IPC_GUEST_CHUNK); memset(ch.out, 0xff, IPC_GUEST_CHUNK); ch.out_len = IPC_GUEST_CHUNK;
+        ch.size = UINT64_MAX; ch.truncated = true;
+        CHECK(ipc_encode_response(&ch, gb, sizeof(gb), &bn) == 0 && bn + 4 <= IPC_FRAME_MAX,
+              "guest: a full 48 KiB read chunk fits one IPC frame");
+        ipc_response_clear(&ch);
+    }
 
     ipc_request_clear(&req);
     ipc_request_clear(&back);

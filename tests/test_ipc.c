@@ -486,6 +486,51 @@ int main(void) {
             CHECK(rc == 0 && (xr.flags & GRPC_X_TIMED_OUT), "rpc: guest-side timeout kills the command");
         }
 
+        // --- #24 through the daemon: the same operations by way of libsandbox,
+        // which is what a client actually calls (ownership check, worker pool,
+        // chunked transfer, reply framing). ---
+        {
+            const char* av[] = { "echo via-daemon; echo e >&2; exit 3", NULL };
+            sandbox_exec_spec_t es = { .argv = av, .shell = true, .timeout_ms = 10000 };
+            sandbox_exec_result_t er;
+            sandbox_error_t ec = sandbox_exec(h, &es, &er);
+            CHECK(ec == SANDBOX_OK && er.exit_code == 3 && er.out_len == 11 &&
+                      !memcmp(er.out, "via-daemon\n", 11) && er.err_len == 2,
+                  "daemon rpc: sandbox_exec returns output and exit code");
+            sandbox_exec_result_free(&er);
+
+            // 100 KiB: more than one IPC frame each way.
+            size_t n = 100 * 1024;
+            uint8_t* blob = malloc(n);
+            for (size_t i = 0; i < n; i++) blob[i] = (uint8_t)(i * 31 + 7);
+            ec = sandbox_write_file(h, "/workspace/blob.bin", blob, n, 0, 0);
+            uint8_t* back = NULL; size_t bn = 0;
+            sandbox_error_t ec2 = sandbox_read_file(h, "/workspace/blob.bin", &back, &bn);
+            CHECK(ec == SANDBOX_OK && ec2 == SANDBOX_OK && bn == n && !memcmp(back, blob, n),
+                  "daemon rpc: 100 KiB file round-trips in the guest, byte for byte");
+            free(back);
+            // The guest's own view of it, not the library's: a guest process
+            // (ls) reports the size. Only applets both images have: the busybox
+            // fixture links just sh, echo, cat, ls, mkdir, touch, sleep, ps.
+            const char* ck[] = { "set -- $(ls -l /workspace/blob.bin); echo $5", NULL };
+            sandbox_exec_spec_t cs = { .argv = ck, .shell = true, .timeout_ms = 10000 };
+            ec = sandbox_exec(h, &cs, &er);
+            CHECK(ec == SANDBOX_OK && er.exit_code == 0 && atol((const char*)er.out) == (long)n,
+                  "daemon rpc: a guest process sees the full 100 KiB");
+            sandbox_exec_result_free(&er);
+            free(blob);
+
+            CHECK(sandbox_read_file(h, "/etc/passwd", &back, &bn) == SANDBOX_ERR_PATH_DENIED,
+                  "daemon rpc: a path outside /workspace is refused");
+            sandbox_dirent_t* ents = NULL; size_t ne = 0; bool tr = false;
+            ec = sandbox_list_dir(h, "/workspace", &ents, &ne, &tr);
+            int seen = 0;
+            for (size_t i = 0; ec == SANDBOX_OK && i < ne; i++)
+                if (!strcmp(ents[i].name, "blob.bin") && ents[i].size == n) seen = 1;
+            CHECK(ec == SANDBOX_OK && seen, "daemon rpc: list_dir sees the file with its size");
+            free(ents);
+        }
+
         // --- #23: session workspaces. A sandbox created with a session key gets
         // a *persistent* /workspace: its files survive the sandbox being
         // destroyed, because the volume belongs to the session, not the VM. The
@@ -518,6 +563,17 @@ int main(void) {
             char first_before[9];
             memcpy(first_before, p1.first, sizeof(first_before));
 
+            // #24: what an assistant does -- a *command* writes into /workspace,
+            // and the next sandbox for the same session reads it back over the
+            // API. The destroy below flushes the volume before the VM is killed.
+            const char* wr[] = { "echo remembered-across-sandboxes > /workspace/note.txt", NULL };
+            sandbox_exec_spec_t wes = { .argv = wr, .shell = true, .timeout_ms = 10000 };
+            sandbox_exec_result_t wer;
+            sandbox_error_t wec = w1 ? sandbox_exec(w1, &wes, &wer) : SANDBOX_ERR_INVALID_SPEC;
+            CHECK(wec == SANDBOX_OK && wer.exit_code == 0,
+                  "session rpc: a command in sandbox 1 writes a file into /workspace");
+            if (wec == SANDBOX_OK) sandbox_exec_result_free(&wer);
+
             // Destroy the sandbox: the volume is the session's and must stay.
             CHECK(sandbox_destroy(w1) == SANDBOX_OK, "session: destroy the sandbox");
 
@@ -539,6 +595,12 @@ int main(void) {
                   "session: the pre-destroy line is still the first line");
             CHECK(got2 && strcmp(p2.last, first_before) != 0,
                   "session: the second injection appended its own line");
+            uint8_t* note = NULL; size_t nn = 0;
+            sandbox_error_t nrc = w2 ? sandbox_read_file(w2, "/workspace/note.txt", &note, &nn)
+                                     : SANDBOX_ERR_INVALID_SPEC;
+            CHECK(nrc == SANDBOX_OK && nn == 28 && !memcmp(note, "remembered-across-sandboxes\n", 28),
+                  "session rpc: sandbox 2 reads the file sandbox 1's command wrote");
+            free(note);
             if (w2) sandbox_destroy(w2);
 
             // A different key must not see any of that: one volume per session.

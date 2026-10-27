@@ -63,6 +63,13 @@ typedef struct {
 | `SANDBOX_ERR_SESSION_EXPIRED` | `-6` | The session's TTL has passed; its volume is already gone, so there is nothing to renew. |
 | `SANDBOX_ERR_SESSION_LIMIT` | `-7` | The session is already at the platform maximum lifetime (`SANDBOX_WORKSPACE_MAX_TTL`, 30 days by default). |
 | `SANDBOX_ERR_SESSION_UNKNOWN` | `-8` | No volume exists for that session key. |
+| `SANDBOX_ERR_GUEST_UNAVAILABLE` | `-9` | The guest agent could not be reached or is not ready, or the per-session cap on concurrent guest operations was hit. Retryable. |
+| `SANDBOX_ERR_PATH_DENIED` | `-10` | A file path was not absolute, contained `.`/`..`, or resolved outside `/workspace` (including through a symlink). |
+| `SANDBOX_ERR_NOT_FOUND` | `-11` | The path does not exist. |
+| `SANDBOX_ERR_EXISTS` | `-12` | The path exists and the call asked for exclusivity (`SANDBOX_WRITE_EXCL`, or `mkdir` without `parents`). |
+| `SANDBOX_ERR_TOO_LARGE` | `-13` | A file, chunk or stdin is over its limit (4 MiB / 48 KiB / 64 KiB). |
+| `SANDBOX_ERR_GUEST_IO` | `-14` | The guest's filesystem failed the operation (full disk, a directory where a file was expected, …). |
+| `SANDBOX_ERR_TIMEOUT` | `-15` | The host-side deadline expired before the guest answered. |
 
 ### Functions
 
@@ -81,6 +88,18 @@ sandbox_error_t sandbox_session_renew(const char* session_key,
                                       uint64_t* out_expires_at);
 const char* sandbox_error_string(sandbox_error_t code);
 void            sandbox_cleanup(void);
+
+// Guest operations (#24): run commands and touch files in a running sandbox.
+sandbox_error_t sandbox_exec(sandbox_handle_t*, const sandbox_exec_spec_t*, sandbox_exec_result_t*);
+void            sandbox_exec_result_free(sandbox_exec_result_t*);
+sandbox_error_t sandbox_read_file(sandbox_handle_t*, const char* path, uint8_t** data, size_t* len);
+sandbox_error_t sandbox_write_file(sandbox_handle_t*, const char* path, const uint8_t* data,
+                                   size_t len, uint32_t mode, uint32_t flags);
+sandbox_error_t sandbox_list_dir(sandbox_handle_t*, const char* path, sandbox_dirent_t** entries,
+                                 size_t* count, bool* truncated);
+sandbox_error_t sandbox_stat(sandbox_handle_t*, const char* path, sandbox_fstat_t*);
+sandbox_error_t sandbox_mkdir(sandbox_handle_t*, const char* path, uint32_t mode, bool parents);
+sandbox_error_t sandbox_remove(sandbox_handle_t*, const char* path, bool recursive);
 ```
 
 - `sandbox_init` opens the session socket. One process may hold several handles
@@ -94,6 +113,26 @@ void            sandbox_cleanup(void);
   thread that matches the reply, so N threads may have N Creates in flight at
   once and the daemon may complete them in any order.
 - A handle must not be used from one thread while destroyed in another.
+- **Guest operations** (`sandbox_exec`, `sandbox_*_file`, …) run on a daemon
+  worker pool, concurrently, and may take as long as the command does. They
+  require the session to own the sandbox (`SANDBOX_ERR_PERMISSION_DENIED`
+  otherwise) and, on the wire, a non-zero `request_id` (`libsandbox` always sets
+  one). At most 16 may be in flight per session; the rest get the retryable
+  `SANDBOX_ERR_GUEST_UNAVAILABLE`.
+  - `sandbox_exec` returns `SANDBOX_OK` for any command that ran — a non-zero
+    exit, a timeout (`timed_out`) and a kill by the output cap
+    (`output_truncated`) are results, not errors.
+  - A reply is one 64 KiB IPC frame, so exec returns the **head** of each stream
+    (32 KiB stdout, 16 KiB stderr) plus `out_total`/`err_total`, the bytes the
+    command really wrote. For more, redirect to a file in `/workspace` and read
+    it back. Input is bounded too: stdin ≤ 64 KiB.
+  - `sandbox_read_file`/`sandbox_write_file` move whole files up to 4 MiB,
+    chunked at 48 KiB per message internally. A write that fits one chunk replaces
+    the file atomically; a larger one is sent as replace-then-append, so a failure
+    partway can leave a partial file.
+  - File paths are confined to `/workspace`; exec is not (a command can read
+    whatever the guest can). The wire protocol has no "allow outside" switch;
+    that exists only on the host↔guest leg for the engine's own use.
 
 ### Example
 
@@ -149,6 +188,7 @@ sb->pause();
 
 ```
 sandbox-cli run    --template NAME [--socket PATH] [--memory MiB] [--vcpus N] [--wait MS]
+                   [--session-key KEY] [--exec SCRIPT]...
 sandbox-cli verify --template NAME
 ```
 
@@ -156,6 +196,12 @@ sandbox-cli verify --template NAME
   (`{"event":"created","sandbox_id":N,...}`), and **holds the session open**
   until `SIGINT`/`SIGTERM` (so the sandbox is not reclaimed), then destroys it.
   Exit code `1` on failure, `2` on usage error.
+- `run --exec SCRIPT` (repeatable, up to 16) instead runs each script with
+  `sh -c` in the new sandbox, prints its stdout/stderr and one
+  `{"event":"exec",...,"exit_code":N}` line per script, destroys the sandbox and
+  exits with the first non-zero exit status (`1` for an API error). A sandbox
+  dies with its session, so commands for a given sandbox must come from the
+  process that created it; use `--session-key` to carry `/workspace` across runs.
 - `verify` runs the snapshot integrity check (`§10.10`) for a template and
   returns `0` if the manifest and files match, `1` otherwise.
 
@@ -231,6 +277,11 @@ its own replies.
 Exec and file operations against a running sandbox. This is the *guest-facing*
 protocol between the engine and the agent inside the VM; the client-facing
 surface (`ClientMessage`, `libsandbox.h`, CLI) is wired separately.
+
+Clients do not speak this directly: the daemon relays it (`GuestRequest` /
+`GuestResponse` in `proto/sandbox.proto`, see the C library section above). The
+daemon-to-guest limits below are larger than what one IPC reply can carry, and
+`libsandbox` closes that gap by chunking.
 
 Transport: vsock port 5002, reached through the VM's Firecracker UDS
 (`CONNECT 5002\n`). One request per connection. Frame:

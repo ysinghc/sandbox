@@ -68,6 +68,15 @@ target_link_libraries(test_guest_rpc sandbox pthread)
 add_test(NAME guest_rpc COMMAND test_guest_rpc)
 set_tests_properties(guest_rpc PROPERTIES TIMEOUT 180)
 
+# #24: the same guest server, reached through the whole IPC stack (libsandbox ->
+# daemon -> worker pool -> a hybrid-vsock-style UDS). Only the VM is faked.
+add_executable(test_ipc_guest test_ipc_guest.c
+               ../src/guest_rpc_server.c ../src/guest_rpc_wire.c)
+target_include_directories(test_ipc_guest PRIVATE ../include ../src)
+target_link_libraries(test_ipc_guest sandbox pthread)
+add_test(NAME ipc_guest COMMAND test_ipc_guest)
+set_tests_properties(ipc_guest PROPERTIES TIMEOUT 240)
+
 # Phase 3: network manager test (root only: tap + nftables; SKIPs otherwise).
 # The cleanup fixture runs even if the test aborts, so leaked netns/routes/
 # nft rules can never poison later runs.

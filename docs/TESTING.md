@@ -46,7 +46,9 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `vmm` | yes | yes | Restore, env inject, readiness/confirm, cgroup placement; the `/snapshot/load` body (clock/tap/vsock) is asserted even without root. |
 | `uffd` | no | no | Lazy-restore page-fault handling (SKIPs if userfaultfd denied). |
 | `broker` | no | no | Request pipeline against an in-process mock engine + upstream. |
-| `ipc` | yes | yes | Daemon IPC, async `Create`, client API, broker-control. |
+| `ipc` | yes | yes | Daemon IPC, async `Create`, client API, broker-control; #24 exec/file ops against a *restored* guest, and a session workspace that carries a command's file from one sandbox to the next. |
+| `guest_rpc` | no | no | #24 guest server against the host client over socketpairs: exec (streaming, timeout, output cap, process-group kill, cancel on disconnect), file ops, path-escape and malformed-frame cases, concurrency. 82 checks. |
+| `ipc_guest` | no | no | #24 through the whole IPC stack (libsandbox → daemon → worker pool → a hybrid-vsock-style UDS → the real guest server); only the VM is faked. Ownership, per-session cap, chunked 4 MiB transfers, reply-frame budgets, error mapping. 40 checks. |
 | `config` | no | no | Config parser against the packaged `engine.conf`. |
 | `cgroup` | yes | no | cgroup v2 hierarchy + limits (SKIPs if not writable). |
 | `metrics` | no | no | `/health`, `/ready`, `/metrics`. |

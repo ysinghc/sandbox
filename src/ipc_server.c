@@ -17,6 +17,7 @@
 
 #include "broker.h"       // broker-control wire constants (§5.8)
 #include "ipc_codec.h"
+#include "ipc_guest.h"
 #include "ipc_internal.h"
 #include "lifecycle.h"
 #include "log.h"
@@ -62,6 +63,13 @@
 #define IPC_CREATE_QUEUE_MAX 16  // outstanding creates per session
 #define IPC_CREATE_UID_MAX 64    // outstanding creates per peer uid
 
+// #24 guest operations (exec / file ops). They run on their own pool: an exec can
+// legitimately take minutes and must never occupy a Create worker. Replies are
+// posted back to the loop thread exactly like Create results.
+#define IPC_GUEST_WORKERS 8
+#define IPC_GUEST_PER_SESSION 16   // in-flight guest ops per session
+#define IPC_GUEST_QUEUE_MAX 256    // queued + running, daemon-wide
+
 // epoll data.u64 tag: low byte = kind, upper bits = payload (fd or table index).
 enum { EP_LISTEN = 1, EP_WAKE = 2, EP_CLIENT = 3, EP_PIDFD = 4 };
 
@@ -93,6 +101,24 @@ typedef struct create_result {
     struct create_result* next;
 } create_result_t;
 
+// One in-flight guest op. The request is moved in whole (its heap buffers go
+// with it), and the VM is named by its UDS *path*: the VM can be destroyed on
+// the loop thread while this runs, and a path cannot dangle.
+typedef struct gop_job {
+    int session_fd;
+    uint64_t session_epoch;
+    ipc_request_t req;
+    char uds[PATH_MAX];
+    struct gop_job* next;
+} gop_job_t;
+
+typedef struct gop_result {
+    int session_fd;
+    uint64_t session_epoch;
+    ipc_response_t resp;
+    struct gop_result* next;
+} gop_result_t;
+
 typedef struct {
     int fd;
     uid_t uid;  // peer uid from SO_PEERCRED (Phase 10.1); for logging/quotas
@@ -109,6 +135,7 @@ typedef struct {
     int n_outstanding;  // queued + active
     int n_active;       // dispatched, result not yet consumed
     int n_serial;       // of n_active, legacy (id 0) jobs
+    int n_gop;          // #24: guest ops in flight for this session
 } session_t;
 
 typedef struct token_entry {
@@ -173,13 +200,30 @@ static struct {
     int create_workers_cfg;   // desired worker count (default IPC_CREATE_WORKERS)
     int per_session_max;      // default IPC_CREATE_QUEUE_MAX
     int per_uid_max;          // default IPC_CREATE_UID_MAX
+    // #24 guest-op pool.
+    pthread_mutex_t gq_lock;
+    pthread_cond_t gq_cond;
+    gop_job_t* gq_head;
+    gop_job_t* gq_tail;
+    int gq_len;               // queued
+    int g_running;            // dequeued, not yet posted
+    bool gq_stop;
+    pthread_mutex_t gr_lock;
+    gop_result_t* gr_head;
+    gop_result_t* gr_tail;
+    pthread_t gworkers[IPC_GUEST_WORKERS];
+    int n_gworkers;
     uint64_t session_epoch;   // bumped per accepted connection
+    uint32_t test_grant;      // see ipc_server_test_grant_next_session
     struct { uid_t uid; int n; } uid_inflight[IPC_MAX_ALLOWED_UIDS];
 } g = { .listen_fd = -1, .epfd = -1, .wake_fd = -1, .bc_listen_fd = -1,
         .bc_wake_fd = -1, .tok_lock = PTHREAD_MUTEX_INITIALIZER,
         .q_lock = PTHREAD_MUTEX_INITIALIZER,
         .q_cond = PTHREAD_COND_INITIALIZER,
         .r_lock = PTHREAD_MUTEX_INITIALIZER,
+        .gq_lock = PTHREAD_MUTEX_INITIALIZER,
+        .gq_cond = PTHREAD_COND_INITIALIZER,
+        .gr_lock = PTHREAD_MUTEX_INITIALIZER,
         .create_workers_cfg = IPC_CREATE_WORKERS,
         .per_session_max = IPC_CREATE_QUEUE_MAX,
         .per_uid_max = IPC_CREATE_UID_MAX };
@@ -482,8 +526,10 @@ static void pidfd_handle(int idx) {
 
     vm_handle_t* vm = lifecycle_get(id);
     if (vm) {
-        vmm_destroy(vm);
+        // Unregister first: vmm_destroy() frees the handle, and lifecycle_remove()
+        // reads it to find the entry.
         lifecycle_remove(id);
+        vmm_destroy(vm);
     }
     token_revoke(id);
     session_t* s = session_find(sfd);
@@ -494,11 +540,20 @@ static void pidfd_handle(int idx) {
 // message handling
 // ---------------------------------------------------------------------------
 
+static void reply_error(int fd, uint64_t rid, sandbox_error_t code,
+                        const char* msg);
+
 static void send_response(int fd, const ipc_response_t* resp) {
     uint8_t buf[IPC_FRAME_MAX];
     size_t n = 0;
     if (ipc_encode_response(resp, buf, sizeof(buf), &n) < 0) {
         fprintf(stderr, "[ipc] failed to encode response\n");
+        // Never leave the client waiting on a reply that cannot be sent: it has
+        // an id to match and no other way to learn the request was lost.
+        if (!resp->is_error) {
+            reply_error(fd, resp->request_id, SANDBOX_ERR_INTERNAL,
+                        "reply too large to send");
+        }
         return;
     }
     if (ipc_send_frame(fd, buf, n) < 0) {
@@ -841,6 +896,167 @@ static void stop_create_workers(void) {
     g.q_stop = false;
 }
 
+// ---------------------------------------------------------------------------
+// #24 guest operations
+// ---------------------------------------------------------------------------
+
+static void* guest_worker_fn(void* arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&g.gq_lock);
+        while (!g.gq_stop && !g.gq_head) pthread_cond_wait(&g.gq_cond, &g.gq_lock);
+        if (g.gq_stop && !g.gq_head) {
+            pthread_mutex_unlock(&g.gq_lock);
+            break;
+        }
+        gop_job_t* job = g.gq_head;
+        g.gq_head = job->next;
+        if (!g.gq_head) g.gq_tail = NULL;
+        g.gq_len--;
+        g.g_running++;
+        pthread_mutex_unlock(&g.gq_lock);
+
+        gop_result_t* r = calloc(1, sizeof(*r));
+        if (r) {
+            r->session_fd = job->session_fd;
+            r->session_epoch = job->session_epoch;
+            // May block for as long as the command runs: that is why this is
+            // not the loop thread.
+            ipc_guest_execute(job->uds, &job->req, &r->resp);
+        }
+        ipc_request_clear(&job->req);
+        free(job);
+
+        pthread_mutex_lock(&g.gq_lock);
+        g.g_running--;
+        pthread_mutex_unlock(&g.gq_lock);
+        if (!r) continue;  // OOM: the client's own deadline is the backstop
+
+        pthread_mutex_lock(&g.gr_lock);
+        if (g.gr_tail) g.gr_tail->next = r;
+        else g.gr_head = r;
+        g.gr_tail = r;
+        pthread_mutex_unlock(&g.gr_lock);
+        uint64_t one = 1;
+        ssize_t w = write(g.wake_fd, &one, sizeof(one));
+        (void)w;
+    }
+    return NULL;
+}
+
+// Loop thread: deliver finished guest ops.
+static void drain_guest_results(void) {
+    pthread_mutex_lock(&g.gr_lock);
+    gop_result_t* r = g.gr_head;
+    g.gr_head = g.gr_tail = NULL;
+    pthread_mutex_unlock(&g.gr_lock);
+    while (r) {
+        gop_result_t* next = r->next;
+        session_t* s = session_find(r->session_fd);
+        if (s && s->epoch == r->session_epoch) {
+            if (s->n_gop > 0) s->n_gop--;
+            send_response(s->fd, &r->resp);
+        }  // else: the client left while it ran; nobody to tell
+        ipc_response_clear(&r->resp);
+        free(r);
+        r = next;
+    }
+}
+
+static int start_guest_workers(void) {
+    for (int i = 0; i < IPC_GUEST_WORKERS; i++) {
+        if (pthread_create(&g.gworkers[i], NULL, guest_worker_fn, NULL) != 0) {
+            fprintf(stderr, "[ipc] failed to start guest worker %d\n", i);
+            break;
+        }
+        g.n_gworkers++;
+    }
+    return g.n_gworkers > 0 ? 0 : -1;
+}
+
+// Call after the sessions (and so their VMs) are gone: killing a VM closes the
+// vsock connection a worker is blocked on, so the join cannot wait on a command.
+static void stop_guest_workers(void) {
+    pthread_mutex_lock(&g.gq_lock);
+    g.gq_stop = true;
+    pthread_cond_broadcast(&g.gq_cond);
+    pthread_mutex_unlock(&g.gq_lock);
+    for (int i = 0; i < g.n_gworkers; i++) pthread_join(g.gworkers[i], NULL);
+    g.n_gworkers = 0;
+    // Free anything queued but never run, and any result nobody collected.
+    gop_job_t* j = g.gq_head;
+    while (j) {
+        gop_job_t* nx = j->next;
+        ipc_request_clear(&j->req);
+        free(j);
+        j = nx;
+    }
+    g.gq_head = g.gq_tail = NULL;
+    g.gq_len = 0;
+    gop_result_t* r = g.gr_head;
+    while (r) {
+        gop_result_t* nx = r->next;
+        ipc_response_clear(&r->resp);
+        free(r);
+        r = nx;
+    }
+    g.gr_head = g.gr_tail = NULL;
+    g.gq_stop = false;
+}
+
+// Validate and enqueue a guest op (loop thread). Takes the request's heap buffers
+// with it, leaving `req` empty.
+static void handle_guest(int fd, session_t* s, ipc_request_t* req) {
+    uint64_t rid = req->request_id;
+    // These run concurrently and may take minutes, so a reply can only be matched
+    // by id. A legacy (id 0) client could not tell which answer is which.
+    if (rid == 0) {
+        reply_error(fd, 0, SANDBOX_ERR_INVALID_SPEC,
+                    "guest operations require a request_id");
+        return;
+    }
+    if (!session_owns(s, req->sandbox_id)) {
+        reply_error(fd, rid, SANDBOX_ERR_PERMISSION_DENIED, "not owned by session");
+        return;
+    }
+    vm_handle_t* vm = lifecycle_get(req->sandbox_id);
+    if (!vm || !vm->vsock_uds[0]) {
+        reply_error(fd, rid, SANDBOX_ERR_GUEST_UNAVAILABLE, "sandbox has no guest channel");
+        return;
+    }
+    if (s->n_gop >= IPC_GUEST_PER_SESSION) {
+        reply_error(fd, rid, SANDBOX_ERR_GUEST_UNAVAILABLE,
+                    "too many concurrent guest operations");
+        return;
+    }
+    gop_job_t* j = calloc(1, sizeof(*j));
+    if (!j) {
+        reply_error(fd, rid, SANDBOX_ERR_INTERNAL, "out of memory");
+        return;
+    }
+    j->session_fd = fd;
+    j->session_epoch = s->epoch;
+    snprintf(j->uds, sizeof(j->uds), "%s", vm->vsock_uds);
+    memcpy(&j->req, req, sizeof(*req));
+    memset(req, 0, sizeof(*req));
+
+    pthread_mutex_lock(&g.gq_lock);
+    if (g.gq_len + g.g_running >= IPC_GUEST_QUEUE_MAX || g.gq_stop) {
+        pthread_mutex_unlock(&g.gq_lock);
+        ipc_request_clear(&j->req);
+        free(j);
+        reply_error(fd, rid, SANDBOX_ERR_GUEST_UNAVAILABLE, "guest operation queue full");
+        return;
+    }
+    if (g.gq_tail) g.gq_tail->next = j;
+    else g.gq_head = j;
+    g.gq_tail = j;
+    g.gq_len++;
+    s->n_gop++;
+    pthread_cond_signal(&g.gq_cond);
+    pthread_mutex_unlock(&g.gq_lock);
+}
+
 static void handle_destroy(int fd, uint64_t rid, session_t* s, uint32_t id) {
     if (!session_owns(s, id)) {
         reply_error(fd, rid, SANDBOX_ERR_PERMISSION_DENIED,
@@ -848,9 +1064,11 @@ static void handle_destroy(int fd, uint64_t rid, session_t* s, uint32_t id) {
         return;
     }
     vm_handle_t* vm = lifecycle_get(id);
+    // Unregister before destroying: vmm_destroy() frees the handle and
+    // lifecycle_remove() dereferences it to find the entry.
+    lifecycle_remove(id);
     if (vm) vmm_destroy(vm);
     pidfd_untrack(id);
-    lifecycle_remove(id);
     token_revoke(id);
     session_disown(s, id);
     ipc_response_t resp;
@@ -979,6 +1197,7 @@ static void handle_message(int fd, session_t* s, const uint8_t* payload,
             handle_pause_resume(fd, rid, s, req.sandbox_id, false); break;
         case IPC_REQ_INSPECT: handle_inspect(fd, rid, s, req.sandbox_id); break;
         case IPC_REQ_RENEW:   handle_renew(fd, &req); break;
+        case IPC_REQ_GUEST:   handle_guest(fd, s, &req); break;
         default:
             reply_error(fd, rid, SANDBOX_ERR_INVALID_SPEC, "unknown op");
             break;
@@ -993,8 +1212,8 @@ static void drop_session(session_t* s) {
         uint32_t id = s->owned[i];
         vm_handle_t* vm = lifecycle_get(id);
         if (vm) {
+            lifecycle_remove(id);  // before vmm_destroy() frees the handle it reads
             vmm_destroy(vm);
-            lifecycle_remove(id);
         }
         pidfd_untrack(id);
         token_revoke(id);
@@ -1080,6 +1299,10 @@ static void accept_clients(int lfd) {
             continue;
         }
         s->uid = cred.uid;
+        if (g.test_grant) {
+            session_own(s, g.test_grant);
+            g.test_grant = 0;
+        }
         struct epoll_event ev;
         memset(&ev, 0, sizeof(ev));
         ev.events = EPOLLIN;
@@ -1154,6 +1377,18 @@ int ipc_server_run(const char* socket_path) {
         return -1;
     }
 
+    if (start_guest_workers() < 0) {
+        fprintf(stderr, "[ipc] no guest workers; refusing to serve\n");
+        stop_create_workers();
+        free(payload);
+        close(g.listen_fd);
+        close(g.wake_fd);
+        close(g.epfd);
+        g.listen_fd = g.wake_fd = g.epfd = -1;
+        unlink(socket_path);
+        return -1;
+    }
+
     g.running = 1;
     struct epoll_event evs[64];
     while (g.running) {
@@ -1169,6 +1404,7 @@ int ipc_server_run(const char* socket_path) {
                 uint64_t v;
                 if (read(g.wake_fd, &v, sizeof(v)) < 0) { /* drained */ }
                 drain_results();  // §10.8: completed Creates
+                drain_guest_results();  // #24: finished exec / file ops
                 continue;
             }
             if (kind == EP_LISTEN) {
@@ -1198,6 +1434,8 @@ int ipc_server_run(const char* socket_path) {
     drain_results();
     // Reclaim all sessions.
     for (int i = 0; i < IPC_MAX_SESSIONS; i++) drop_session(&g.sessions[i]);
+    // #24: only now -- with the VMs gone, a worker blocked on one has failed out.
+    stop_guest_workers();
     close(g.listen_fd);
     close(g.wake_fd);
     close(g.epfd);
@@ -1222,6 +1460,10 @@ void ipc_server_request_stop(void) {
 }
 
 void ipc_server_set_pool(pool_manager_t* pool) { g.pool = pool; }
+
+void ipc_server_test_grant_next_session(uint32_t sandbox_id) {
+    g.test_grant = sandbox_id;
+}
 
 void ipc_server_set_template(const char* template_name) {
     snprintf(g.template_name, sizeof(g.template_name), "%s",

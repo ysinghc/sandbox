@@ -165,15 +165,18 @@ static void* client_reader(void* arg) {
             pthread_mutex_unlock(&c.mu);
             return NULL;
         }
+        bool matched = false;
         for (c_waiter_t* w = c.waiters; w; w = w->next) {
             if (w->rid == resp.request_id) {
-                w->resp = resp;
+                w->resp = resp;  // ownership of any buffers moves with it
                 w->done = true;
+                matched = true;
                 pthread_cond_broadcast(&c.cv);
                 break;
             }
         }
         pthread_mutex_unlock(&c.mu);
+        if (!matched) ipc_response_clear(&resp);  // nobody is waiting: do not leak
     }
 }
 
@@ -195,6 +198,13 @@ static sandbox_error_t client_roundtrip(ipc_request_t* req,
     if (rid == 0) rid = c.next_rid++;
     req->request_id = rid;
 
+    // A request that does not fit one frame is the caller's mistake, not a
+    // transport failure: refuse it without poisoning the shared connection.
+    if (ipc_encode_request(req, buf, sizeof(buf), &n) < 0) {
+        pthread_mutex_unlock(&c.mu);
+        return SANDBOX_ERR_INVALID_SPEC;
+    }
+
     // Register before sending: a fast daemon may answer before send() returns.
     c_waiter_t w;
     memset(&w, 0, sizeof(w));
@@ -202,8 +212,7 @@ static sandbox_error_t client_roundtrip(ipc_request_t* req,
     w.next = c.waiters;
     c.waiters = &w;
 
-    if (ipc_encode_request(req, buf, sizeof(buf), &n) < 0 ||
-        ipc_send_frame(c.fd, buf, n) < 0) {
+    if (ipc_send_frame(c.fd, buf, n) < 0) {
         c.waiters = w.next;
         client_fail(SANDBOX_ERR_DAEMON_UNREACHABLE);
         sandbox_error_t rc = c.dead;
@@ -371,6 +380,239 @@ sandbox_error_t sandbox_session_renew(const char* session_key,
     return SANDBOX_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Guest operations (#24)
+// ---------------------------------------------------------------------------
+
+// Run one guest request. On SANDBOX_OK `*resp` owns its buffers (the caller
+// clears it); on any error it owns nothing.
+static sandbox_error_t guest_call(sandbox_handle_t* handle, ipc_request_t* req,
+                                  ipc_response_t* resp) {
+    if (!handle) return SANDBOX_ERR_INVALID_SPEC;
+    req->kind = IPC_REQ_GUEST;
+    req->sandbox_id = handle->sandbox_id;
+    sandbox_error_t rc = client_roundtrip(req, resp);
+    if (rc != SANDBOX_OK) return rc;
+    if (resp->is_error) {
+        sandbox_error_t e = (sandbox_error_t)resp->error_code;
+        ipc_response_clear(resp);
+        return e;
+    }
+    return SANDBOX_OK;
+}
+
+static bool set_path(ipc_request_t* req, const char* path) {
+    if (!path || strlen(path) >= sizeof(req->path)) return false;
+    snprintf(req->path, sizeof(req->path), "%s", path);
+    return true;
+}
+
+sandbox_error_t sandbox_exec(sandbox_handle_t* handle, const sandbox_exec_spec_t* spec,
+                             sandbox_exec_result_t* out) {
+    if (!out) return SANDBOX_ERR_INVALID_SPEC;
+    memset(out, 0, sizeof(*out));
+    if (!handle || !spec || !spec->argv || !spec->argv[0]) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.guest_op = 1;  // GRPC_OP_EXEC
+    if (spec->cwd && !set_path(&req, spec->cwd)) return SANDBOX_ERR_INVALID_SPEC;
+    for (int i = 0; spec->argv[i]; i++) {
+        if (req.n_argv >= IPC_MAX_ARGV) { ipc_request_clear(&req); return SANDBOX_ERR_INVALID_SPEC; }
+        req.argv[req.n_argv] = strdup(spec->argv[i]);
+        if (!req.argv[req.n_argv]) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
+        req.n_argv++;
+    }
+    for (int i = 0; spec->env && spec->env[i]; i++) {
+        if (req.n_env >= IPC_MAX_ENV) { ipc_request_clear(&req); return SANDBOX_ERR_INVALID_SPEC; }
+        req.env_vars[req.n_env] = strdup(spec->env[i]);
+        if (!req.env_vars[req.n_env]) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
+        req.n_env++;
+    }
+    if (spec->stdin_len) {
+        req.data = malloc(spec->stdin_len);
+        if (!req.data) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
+        memcpy(req.data, spec->stdin_data, spec->stdin_len);
+        req.data_len = spec->stdin_len;
+    }
+    req.timeout_ms = spec->timeout_ms;
+    req.max_output = spec->max_output;
+    req.guest_flags = spec->shell ? IPC_GF_SHELL : 0;
+
+    ipc_response_t resp;
+    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    out->exit_code = resp.exit_code;
+    out->term_signal = resp.term_signal;
+    out->timed_out = resp.timed_out;
+    out->output_truncated = resp.output_truncated;
+    out->out = resp.out; out->out_len = resp.out_len; out->out_total = resp.out_total;
+    out->err = resp.err; out->err_len = resp.err_len; out->err_total = resp.err_total;
+    resp.out = resp.err = NULL;  // moved into `out`
+    ipc_response_clear(&resp);
+    return SANDBOX_OK;
+}
+
+void sandbox_exec_result_free(sandbox_exec_result_t* r) {
+    if (!r) return;
+    free(r->out);
+    free(r->err);
+    memset(r, 0, sizeof(*r));
+}
+
+sandbox_error_t sandbox_read_file(sandbox_handle_t* handle, const char* path,
+                                  uint8_t** out_data, size_t* out_len) {
+    if (out_data) *out_data = NULL;
+    if (out_len) *out_len = 0;
+    if (!handle || !path || !out_data || !out_len) return SANDBOX_ERR_INVALID_SPEC;
+    uint8_t* buf = NULL;
+    size_t have = 0;
+    for (;;) {
+        ipc_request_t req;
+        ipc_request_init(&req);
+        req.guest_op = 2;  // GRPC_OP_READ_FILE
+        if (!set_path(&req, path)) { free(buf); return SANDBOX_ERR_INVALID_SPEC; }
+        req.offset = have;
+        req.max_bytes = IPC_GUEST_CHUNK;
+        ipc_response_t resp;
+        sandbox_error_t rc = guest_call(handle, &req, &resp);
+        ipc_request_clear(&req);
+        if (rc != SANDBOX_OK) { free(buf); return rc; }
+        if (have + resp.out_len > SANDBOX_MAX_FILE) {
+            ipc_response_clear(&resp);
+            free(buf);
+            return SANDBOX_ERR_TOO_LARGE;
+        }
+        uint8_t* nb = realloc(buf, have + resp.out_len + 1);
+        if (!nb) { ipc_response_clear(&resp); free(buf); return SANDBOX_ERR_INTERNAL; }
+        buf = nb;
+        if (resp.out_len) memcpy(buf + have, resp.out, resp.out_len);
+        have += resp.out_len;
+        bool more = resp.truncated && resp.out_len > 0;
+        ipc_response_clear(&resp);
+        if (!more) break;
+    }
+    *out_data = buf;
+    *out_len = have;
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_write_file(sandbox_handle_t* handle, const char* path,
+                                   const uint8_t* data, size_t len, uint32_t mode,
+                                   uint32_t flags) {
+    if (!handle || !path || (len && !data)) return SANDBOX_ERR_INVALID_SPEC;
+    if (len > SANDBOX_MAX_FILE) return SANDBOX_ERR_TOO_LARGE;
+    size_t off = 0;
+    bool first = true;
+    do {
+        size_t n = len - off < IPC_GUEST_CHUNK ? len - off : IPC_GUEST_CHUNK;
+        ipc_request_t req;
+        ipc_request_init(&req);
+        req.guest_op = 3;  // GRPC_OP_WRITE_FILE
+        if (!set_path(&req, path)) return SANDBOX_ERR_INVALID_SPEC;
+        req.mode = mode;
+        if (n) {
+            req.data = malloc(n);
+            if (!req.data) return SANDBOX_ERR_INTERNAL;
+            memcpy(req.data, data + off, n);
+            req.data_len = n;
+        }
+        // Later chunks append; EXCL only guards the first, which creates it.
+        bool append = (flags & SANDBOX_WRITE_APPEND) || !first;
+        req.guest_flags = (append ? IPC_GF_APPEND : 0) |
+                          ((flags & SANDBOX_WRITE_EXCL) && first ? IPC_GF_EXCL : 0) |
+                          ((flags & SANDBOX_WRITE_PARENTS) ? IPC_GF_PARENTS : 0);
+        ipc_response_t resp;
+        sandbox_error_t rc = guest_call(handle, &req, &resp);
+        ipc_request_clear(&req);
+        if (rc != SANDBOX_OK) return rc;
+        ipc_response_clear(&resp);
+        off += n;
+        first = false;
+    } while (off < len);
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_list_dir(sandbox_handle_t* handle, const char* path,
+                                 sandbox_dirent_t** out_entries, size_t* out_count,
+                                 bool* out_truncated) {
+    if (out_entries) *out_entries = NULL;
+    if (out_count) *out_count = 0;
+    if (out_truncated) *out_truncated = false;
+    if (!handle || !path || !out_entries || !out_count) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.guest_op = 4;  // GRPC_OP_LIST_DIR
+    if (!set_path(&req, path)) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_response_t resp;
+    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    sandbox_dirent_t* e = calloc(resp.n_entries ? resp.n_entries : 1, sizeof(*e));
+    if (!e) { ipc_response_clear(&resp); return SANDBOX_ERR_INTERNAL; }
+    for (size_t i = 0; i < resp.n_entries; i++) {
+        memcpy(e[i].name, resp.entries[i].name, sizeof(e[i].name));
+        e[i].type = resp.entries[i].type;
+        e[i].size = resp.entries[i].size;
+        e[i].mtime = resp.entries[i].mtime;
+    }
+    *out_entries = e;
+    *out_count = resp.n_entries;
+    if (out_truncated) *out_truncated = resp.truncated;
+    ipc_response_clear(&resp);
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_stat(sandbox_handle_t* handle, const char* path,
+                             sandbox_fstat_t* out) {
+    if (!handle || !path || !out) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.guest_op = 5;  // GRPC_OP_STAT
+    if (!set_path(&req, path)) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_response_t resp;
+    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    out->type = (uint8_t)resp.ftype;
+    out->size = resp.size;
+    out->mode = resp.fmode;
+    out->mtime = resp.mtime;
+    ipc_response_clear(&resp);
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_mkdir(sandbox_handle_t* handle, const char* path,
+                              uint32_t mode, bool parents) {
+    if (!handle || !path) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.guest_op = 6;  // GRPC_OP_MKDIR
+    if (!set_path(&req, path)) return SANDBOX_ERR_INVALID_SPEC;
+    req.mode = mode;
+    req.guest_flags = parents ? IPC_GF_PARENTS : 0;
+    ipc_response_t resp;
+    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    ipc_request_clear(&req);
+    if (rc == SANDBOX_OK) ipc_response_clear(&resp);
+    return rc;
+}
+
+sandbox_error_t sandbox_remove(sandbox_handle_t* handle, const char* path,
+                               bool recursive) {
+    if (!handle || !path) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.guest_op = 7;  // GRPC_OP_REMOVE
+    if (!set_path(&req, path)) return SANDBOX_ERR_INVALID_SPEC;
+    req.guest_flags = recursive ? IPC_GF_RECURSIVE : 0;
+    ipc_response_t resp;
+    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    ipc_request_clear(&req);
+    if (rc == SANDBOX_OK) ipc_response_clear(&resp);
+    return rc;
+}
+
 void sandbox_cleanup(void) {
     pthread_t reader;
     bool join = false;
@@ -391,6 +633,12 @@ void sandbox_cleanup(void) {
     if (join) pthread_join(reader, NULL);
 }
 
+sandbox_handle_t* lifecycle_test_handle(uint32_t sandbox_id) {
+    sandbox_handle_t* h = calloc(1, sizeof(*h));
+    if (h) h->sandbox_id = sandbox_id;
+    return h;
+}
+
 const char* sandbox_handle_token(const sandbox_handle_t* handle) {
     return handle ? handle->token : NULL;
 }
@@ -406,6 +654,13 @@ const char* sandbox_error_string(sandbox_error_t code) {
         case SANDBOX_ERR_SESSION_EXPIRED: return "session expired";
         case SANDBOX_ERR_SESSION_LIMIT: return "session at platform maximum lifetime";
         case SANDBOX_ERR_SESSION_UNKNOWN: return "unknown session";
+        case SANDBOX_ERR_GUEST_UNAVAILABLE: return "guest agent unavailable";
+        case SANDBOX_ERR_PATH_DENIED: return "path denied";
+        case SANDBOX_ERR_NOT_FOUND: return "not found";
+        case SANDBOX_ERR_EXISTS: return "already exists";
+        case SANDBOX_ERR_TOO_LARGE: return "too large";
+        case SANDBOX_ERR_GUEST_IO: return "guest I/O error";
+        case SANDBOX_ERR_TIMEOUT: return "timed out";
         default: return "unknown error";
     }
 }

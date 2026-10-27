@@ -42,7 +42,7 @@ static void check(int cond, const char* msg) {
 
 static grpc_server_t* g_srv;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
-static volatile int g_stop;
+static int g_stop;  // atomic: read by helper threads, set by main
 static int g_ready = 1;
 static char g_root[128];
 
@@ -50,7 +50,7 @@ static int pre_op(void) { return g_ready ? 0 : -1; }
 
 static void* server_thread(void* a) {
     (void)a;
-    while (!g_stop) {
+    while (!__atomic_load_n(&g_stop, __ATOMIC_ACQUIRE)) {
         pthread_mutex_lock(&g_mu);
         grpc_server_step(g_srv);
         pthread_mutex_unlock(&g_mu);
@@ -573,7 +573,7 @@ int main(void) {
     test_limits_and_state();
     test_concurrency();
 
-    g_stop = 1;
+    __atomic_store_n(&g_stop, 1, __ATOMIC_RELEASE);
     pthread_join(th, NULL);
     grpc_server_free(g_srv);
     char cmd[512];

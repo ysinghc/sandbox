@@ -53,6 +53,39 @@ private:
     mutable std::vector<const char*> env_ptrs_;
 };
 
+// #24 guest operations. Plain value types so callers never touch the C buffers.
+struct ExecOptions {
+    bool shell = false;                // argv[0] is a script for /bin/sh -c
+    std::string cwd;                   // empty: /workspace
+    std::vector<std::string> env;      // "KEY=VALUE"
+    uint32_t timeout_ms = 0;           // 0: 1 hour (the maximum)
+    uint32_t max_output = 0;           // agent-side cap, 0: 4 MiB
+    std::string stdin_data;            // up to 64 KiB
+};
+
+struct ExecResult {
+    int exit_code = 0;                 // -1 if killed by a signal
+    int term_signal = 0;
+    bool timed_out = false;
+    bool output_truncated = false;     // the max_output cap killed it
+    std::string out, err;              // the *head* of each stream (32 / 16 KiB)
+    uint64_t out_total = 0, err_total = 0;  // what the command really wrote
+};
+
+struct DirEntry {
+    std::string name;
+    uint8_t type = 0;                  // 0 other, 1 file, 2 dir, 3 symlink
+    uint64_t size = 0;
+    int64_t mtime = 0;
+};
+
+struct FileStat {
+    uint8_t type = 0;
+    uint64_t size = 0;
+    uint32_t mode = 0;
+    int64_t mtime = 0;
+};
+
 class Sandbox {
 public:
     explicit Sandbox(const Spec& spec);
@@ -67,7 +100,20 @@ public:
     void pause();
     void resume();
     sandbox_status_t inspect() const;
-    
+
+    // #24. Every call throws SandboxError on failure. exec() returns normally for
+    // any command that ran, even with a non-zero exit or a timeout. Paths must be
+    // absolute and under /workspace (see libsandbox.h).
+    ExecResult exec(const std::vector<std::string>& argv, const ExecOptions& opt = {});
+    ExecResult shell(const std::string& script, ExecOptions opt = {});
+    std::string read_file(const std::string& path);
+    void write_file(const std::string& path, const std::string& data,
+                    uint32_t mode = 0, uint32_t flags = 0);
+    std::vector<DirEntry> list_dir(const std::string& path, bool* truncated = nullptr);
+    FileStat stat(const std::string& path);
+    void mkdir(const std::string& path, bool parents = false, uint32_t mode = 0);
+    void remove(const std::string& path, bool recursive = false);
+
     uint32_t id() const;
     
 private:

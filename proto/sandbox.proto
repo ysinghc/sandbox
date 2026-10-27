@@ -18,6 +18,7 @@ message ClientMessage {
     ResumeRequest  resume  = 4;
     InspectRequest inspect = 5;
     RenewRequest   renew   = 6;
+    GuestRequest   guest   = 7;
   }
 }
 
@@ -71,6 +72,7 @@ message ServerMessage {
     PauseResponse   pause   = 5;
     ResumeResponse  resume  = 6;
     RenewResponse   renew   = 7;
+    GuestResponse   guest   = 8;
   }
 }
 
@@ -106,4 +108,57 @@ message InspectResponse {
   uint64 uptime_ms = 3;
   uint64 memory_rss_mib = 4;
   uint32 page_faults = 5;
+}
+
+// #24: operations on a running sandbox's guest agent. One message pair serves all
+// seven ops so the daemon has one dispatch path; `op` selects the fields that
+// matter. Requires a non-zero request_id: these run concurrently on a worker
+// pool and can take minutes, so a reply can never be matched by arrival order.
+//
+// Everything here must fit one IPC frame (64 KiB). Large inputs and outputs are
+// therefore chunked by the caller (libsandbox does it for read/write), and exec
+// output is the *head* of each stream with the true byte counts alongside.
+message GuestRequest {
+  uint32 sandbox_id = 1;
+  uint32 op = 2;           // 1 exec, 2 read_file, 3 write_file, 4 list_dir,
+                           // 5 stat, 6 mkdir, 7 remove
+  string path = 3;         // the path; for exec, the working directory
+  repeated string argv = 4;
+  repeated string env = 5;  // exec, "KEY=VALUE"
+  bytes data = 6;          // exec: stdin; write_file: the chunk
+  uint32 timeout_ms = 7;   // exec; 0 = the agent's default
+  uint32 max_output = 8;   // exec: agent-side cap on stdout+stderr, 0 = default
+  uint64 offset = 9;       // read_file
+  uint32 max_bytes = 10;   // read_file
+  uint32 mode = 11;        // write_file, mkdir
+  bool shell = 12;         // exec: argv[0] is a script for /bin/sh -c
+  bool append = 13;        // write_file
+  bool exclusive = 14;     // write_file: fail if it exists
+  bool parents = 15;       // write_file, mkdir
+  bool recursive = 16;     // remove
+}
+
+message DirEntry {
+  string name = 1;
+  uint32 type = 2;         // 0 other, 1 file, 2 dir, 3 symlink
+  uint64 size = 3;
+  int64 mtime = 4;
+}
+
+message GuestResponse {
+  uint32 sandbox_id = 1;
+  int32 exit_code = 2;     // exec; -1 when killed by a signal
+  int32 term_signal = 3;
+  bool timed_out = 4;
+  bool output_truncated = 5;  // the agent's max_output cap killed the command
+  bytes out = 6;           // exec stdout head; read_file data
+  bytes err = 7;           // exec stderr head
+  uint64 out_total = 8;    // exec: bytes the command wrote, kept or not
+  uint64 err_total = 9;
+  bool truncated = 10;     // read_file: more follows; list_dir: listing cut
+  uint64 size = 11;        // stat: size in bytes
+  repeated DirEntry entries = 12;
+  uint32 type = 13;        // stat
+  uint32 mode = 14;        // stat
+  int64 mtime = 15;        // stat
 }

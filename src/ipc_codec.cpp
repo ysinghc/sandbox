@@ -21,6 +21,25 @@ void clear_env(ipc_request_t* req) {
     req->n_env = 0;
 }
 
+void clear_guest_req(ipc_request_t* req) {
+    for (int i = 0; i < req->n_argv; i++) {
+        free(req->argv[i]);
+        req->argv[i] = nullptr;
+    }
+    req->argv[0] = nullptr;
+    req->n_argv = 0;
+    free(req->data);
+    req->data = nullptr;
+    req->data_len = 0;
+}
+
+uint8_t* dup_bytes(const std::string& s) {
+    if (s.empty()) return nullptr;
+    auto* p = static_cast<uint8_t*>(malloc(s.size()));
+    if (p) memcpy(p, s.data(), s.size());
+    return p;
+}
+
 void set_str(char* dst, size_t n, const std::string& s) {
     if (n == 0) return;
     size_t k = s.size();
@@ -38,7 +57,16 @@ void ipc_request_init(ipc_request_t* req) {
 void ipc_request_clear(ipc_request_t* req) {
     if (!req) return;
     clear_env(req);
+    clear_guest_req(req);
     memset(req, 0, sizeof(*req));
+}
+
+void ipc_response_clear(ipc_response_t* resp) {
+    if (!resp) return;
+    free(resp->out);
+    free(resp->err);
+    free(resp->entries);
+    memset(resp, 0, sizeof(*resp));
 }
 
 int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
@@ -77,6 +105,30 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
             auto* r = msg.mutable_renew();
             r->set_session_key(req->session_key);
             if (req->extra_seconds) r->set_extra_seconds(req->extra_seconds);
+            break;
+        }
+        case IPC_REQ_GUEST: {
+            auto* g = msg.mutable_guest();
+            g->set_sandbox_id(req->sandbox_id);
+            g->set_op(req->guest_op);
+            g->set_path(req->path);
+            for (int i = 0; i < req->n_argv; i++) {
+                if (req->argv[i]) g->add_argv(req->argv[i]);
+            }
+            for (int i = 0; i < req->n_env; i++) {
+                if (req->env_vars[i]) g->add_env(req->env_vars[i]);
+            }
+            if (req->data_len) g->set_data(req->data, req->data_len);
+            g->set_timeout_ms(req->timeout_ms);
+            g->set_max_output(req->max_output);
+            g->set_offset(req->offset);
+            g->set_max_bytes(req->max_bytes);
+            g->set_mode(req->mode);
+            g->set_shell(req->guest_flags & IPC_GF_SHELL);
+            g->set_append(req->guest_flags & IPC_GF_APPEND);
+            g->set_exclusive(req->guest_flags & IPC_GF_EXCL);
+            g->set_parents(req->guest_flags & IPC_GF_PARENTS);
+            g->set_recursive(req->guest_flags & IPC_GF_RECURSIVE);
             break;
         }
         default:
@@ -140,6 +192,42 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
                     msg.renew().session_key());
             out->extra_seconds = msg.renew().extra_seconds();
             break;
+        case sandbox::ClientMessage::kGuest: {
+            const auto& g = msg.guest();
+            out->kind = IPC_REQ_GUEST;
+            out->sandbox_id = g.sandbox_id();
+            out->guest_op = g.op();
+            // A path that does not fit is refused, not truncated: a clipped
+            // path names a different file.
+            if (g.path().size() >= sizeof(out->path)) return -1;
+            set_str(out->path, sizeof(out->path), g.path());
+            if (g.argv_size() > IPC_MAX_ARGV || g.env_size() > IPC_MAX_ENV) return -1;
+            for (int i = 0; i < g.argv_size(); i++) {
+                out->argv[out->n_argv] = strdup(g.argv(i).c_str());
+                if (!out->argv[out->n_argv]) { ipc_request_clear(out); return -1; }
+                out->n_argv++;
+            }
+            out->argv[out->n_argv] = nullptr;
+            for (int i = 0; i < g.env_size(); i++) {
+                out->env_vars[out->n_env] = strdup(g.env(i).c_str());
+                if (!out->env_vars[out->n_env]) { ipc_request_clear(out); return -1; }
+                out->n_env++;
+            }
+            out->env_vars[out->n_env] = nullptr;
+            out->data = dup_bytes(g.data());
+            out->data_len = out->data ? g.data().size() : 0;
+            out->timeout_ms = g.timeout_ms();
+            out->max_output = g.max_output();
+            out->offset = g.offset();
+            out->max_bytes = g.max_bytes();
+            out->mode = g.mode();
+            out->guest_flags = (g.shell() ? IPC_GF_SHELL : 0) |
+                               (g.append() ? IPC_GF_APPEND : 0) |
+                               (g.exclusive() ? IPC_GF_EXCL : 0) |
+                               (g.parents() ? IPC_GF_PARENTS : 0) |
+                               (g.recursive() ? IPC_GF_RECURSIVE : 0);
+            break;
+        }
         default:
             return -1;
     }
@@ -183,6 +271,31 @@ int ipc_encode_response(const ipc_response_t* resp, uint8_t* buf, size_t cap,
             case IPC_REQ_RENEW:
                 msg.mutable_renew()->set_expires_at(resp->expires_at);
                 break;
+            case IPC_REQ_GUEST: {
+                auto* g = msg.mutable_guest();
+                g->set_sandbox_id(resp->sandbox_id);
+                g->set_exit_code(resp->exit_code);
+                g->set_term_signal(resp->term_signal);
+                g->set_timed_out(resp->timed_out);
+                g->set_output_truncated(resp->output_truncated);
+                if (resp->out_len) g->set_out(resp->out, resp->out_len);
+                if (resp->err_len) g->set_err(resp->err, resp->err_len);
+                g->set_out_total(resp->out_total);
+                g->set_err_total(resp->err_total);
+                g->set_truncated(resp->truncated);
+                g->set_size(resp->size);
+                for (size_t i = 0; i < resp->n_entries; i++) {
+                    auto* e = g->add_entries();
+                    e->set_name(resp->entries[i].name);
+                    e->set_type(resp->entries[i].type);
+                    e->set_size(resp->entries[i].size);
+                    e->set_mtime(resp->entries[i].mtime);
+                }
+                g->set_type(resp->ftype);
+                g->set_mode(resp->fmode);
+                g->set_mtime(resp->mtime);
+                break;
+            }
             default:
                 return -1;
         }
@@ -245,6 +358,41 @@ int ipc_decode_response(const uint8_t* buf, size_t len, ipc_response_t* out) {
             out->kind = IPC_REQ_RENEW;
             out->expires_at = msg.renew().expires_at();
             return 0;
+        case sandbox::ServerMessage::kGuest: {
+            const auto& g = msg.guest();
+            out->kind = IPC_REQ_GUEST;
+            out->sandbox_id = g.sandbox_id();
+            out->exit_code = g.exit_code();
+            out->term_signal = g.term_signal();
+            out->timed_out = g.timed_out();
+            out->output_truncated = g.output_truncated();
+            out->out = dup_bytes(g.out());
+            out->out_len = out->out ? g.out().size() : 0;
+            out->err = dup_bytes(g.err());
+            out->err_len = out->err ? g.err().size() : 0;
+            out->out_total = g.out_total();
+            out->err_total = g.err_total();
+            out->truncated = g.truncated();
+            out->size = g.size();
+            out->ftype = g.type();
+            out->fmode = g.mode();
+            out->mtime = g.mtime();
+            if (g.entries_size() > 0) {
+                if (g.entries_size() > IPC_MAX_DIRENTS) { ipc_response_clear(out); return -1; }
+                out->entries = static_cast<ipc_dirent_t*>(
+                    calloc(static_cast<size_t>(g.entries_size()), sizeof(ipc_dirent_t)));
+                if (!out->entries) { ipc_response_clear(out); return -1; }
+                for (int i = 0; i < g.entries_size(); i++) {
+                    const auto& e = g.entries(i);
+                    set_str(out->entries[i].name, sizeof(out->entries[i].name), e.name());
+                    out->entries[i].type = static_cast<uint8_t>(e.type());
+                    out->entries[i].size = e.size();
+                    out->entries[i].mtime = e.mtime();
+                }
+                out->n_entries = static_cast<size_t>(g.entries_size());
+            }
+            return 0;
+        }
         default:
             return -1;
     }

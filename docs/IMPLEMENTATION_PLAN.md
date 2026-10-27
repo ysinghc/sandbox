@@ -230,7 +230,7 @@ peer, cid 1) and the guest asserts the positive direction
 | M1 ARM timer (#6) | ✅ investigated on real hardware — **not fixed**, documented (§15.7); fix path #30 (modern guest kernel) |
 | M1 aarch64 privileged leg | ✅ live on the Pi 5 (`sandbox-arm64-pi5`), both legs green on `62ae6e5` |
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
-| #24 guest RPC | 🔶 guest + host client + tests done; IPC/libsandbox/CLI exposure and the CI boot check outstanding |
+| #24 guest RPC | 🔶 guest, host client, IPC, libsandbox, C++, CLI done and unit/full-stack tested; the privileged CI run of the daemon path is outstanding |
 | M2 #7, #25–#28 | ⏳ not started |
 
 ### What the `jail_cleanup` fix actually became
@@ -469,7 +469,9 @@ Status:
 | Host client (`src/guest_rpc_client.c`, in `libsandbox`) | ✅ |
 | Unprivileged test: the real server against the real client over socketpairs — 82 checks, clean under ASan/UBSan (`tests/test_guest_rpc.c`) | ✅ |
 | Booted-guest check after a snapshot restore (`tests/test_ipc.c`, privileged) | ⏳ written; awaiting the first CI run |
-| Exposure through the daemon IPC (`ClientMessage`), `libsandbox.h`, CLI | ⏳ next |
+| Exposure through the daemon IPC (`GuestRequest`/`GuestResponse`), `libsandbox` C API, C++ wrapper, `sandbox-cli run --exec` | ✅ |
+| Full-stack unprivileged test: libsandbox → daemon → worker pool → hybrid-vsock-style UDS → the real guest server, 40 checks, clean under ASan/UBSan (`tests/test_ipc_guest.c`) | ✅ |
+| Same path on a restored guest, plus "a command writes in sandbox 1, sandbox 2 of the same session reads it" (`tests/test_ipc.c`) | ⏳ written; awaiting the first CI run |
 
 **Auth is the #10 rule, and that is a decision, not an omission.** The issue asked
 for a per-VM key with replay protection. #10 established that a token cannot be
@@ -488,8 +490,11 @@ out); the final component is never followed for write/stat/remove. A request may
 opt out per call with `GRPC_F_ALLOW_OUTSIDE` — that is the host's choice, not the
 guest's. `/` and the workspace root are never removable.
 
-Known limits (v1): a file is one frame, so ≤ 4 MiB (`GRPC_MAX_FILE`); chunked
-transfer is a later addition, not a wire change. stdin is ≤ 64 KiB then EOF.
+Known limits (v1): a file is one guest frame, so ≤ 4 MiB (`GRPC_MAX_FILE`). The
+IPC leg is a 64 KiB frame, so `libsandbox` chunks files at 48 KiB and exec
+returns the head of each stream (32 KiB / 16 KiB) with the true byte counts.
+Guest ops need a non-zero `request_id` and run on a pool of 8 workers, 16 in
+flight per session, 256 daemon-wide. stdin is ≤ 64 KiB then EOF.
 The agent is PID 1 and reaps every orphan; background daemons started by `exec`
 survive the call (only the timeout/cancel path kills the group).
 

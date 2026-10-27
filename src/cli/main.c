@@ -21,7 +21,10 @@ static void on_signal(int sig) {
 static void usage(void) {
     printf("usage:\n"
            "  sandbox-cli run --template NAME [--socket PATH] [--memory MIB] "
-           "[--vcpus N] [--wait MS]\n"
+           "[--vcpus N] [--wait MS] [--session-key KEY] [--exec SCRIPT]...\n"
+           "      with --exec: run each SCRIPT (sh -c) in the new sandbox, print its\n"
+           "      output, then destroy the sandbox and exit with the first non-zero\n"
+           "      exit status (or 0). Without it, hold the sandbox until SIGINT.\n"
            "  sandbox-cli renew --session-key KEY [--extra SECONDS] [--socket PATH]\n"
            "  sandbox-cli verify --template NAME\n");
 }
@@ -34,6 +37,8 @@ int main(int argc, char** argv) {
     uint32_t vcpus = 1;
     uint32_t wait_ms = 500;
     uint32_t extra_seconds = 0;
+    const char* exec_scripts[16];
+    int n_exec = 0;
     int do_run = 0;
     int do_verify = 0;
     int do_renew = 0;
@@ -47,6 +52,13 @@ int main(int argc, char** argv) {
         else if (strcmp(a, "--socket") == 0 && v) socket_path = argv[++i];
         else if (strcmp(a, "--template") == 0 && v) template_name = argv[++i];
         else if (strcmp(a, "--session-key") == 0 && v) session_key = argv[++i];
+        else if (strcmp(a, "--exec") == 0 && v) {
+            if (n_exec >= 16) {
+                fprintf(stderr, "at most 16 --exec scripts\n");
+                return 2;
+            }
+            exec_scripts[n_exec++] = argv[++i];
+        }
         else if (strcmp(a, "--extra") == 0 && v)
             extra_seconds = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(a, "--memory") == 0 && v) memory_mib = strtoull(argv[++i], NULL, 10);
@@ -113,6 +125,7 @@ int main(int argc, char** argv) {
     spec.template_name = template_name;
     spec.env_vars = NULL;
     spec.pool_wait_ms = wait_ms;
+    spec.session_key = session_key;
 
     sandbox_handle_t* h = NULL;
     rc = sandbox_create(&spec, &h);
@@ -132,6 +145,42 @@ int main(int argc, char** argv) {
         printf("{\"event\":\"created\"}\n");
     }
     fflush(stdout);
+
+    // #24: run the requested commands, then leave. The sandbox dies with this
+    // session, so there is nothing to hold it open for.
+    if (n_exec > 0) {
+        int status = 0;
+        for (int i = 0; i < n_exec; i++) {
+            const char* av[2] = { exec_scripts[i], NULL };
+            sandbox_exec_spec_t es;
+            memset(&es, 0, sizeof(es));
+            es.argv = av;
+            es.shell = true;
+            sandbox_exec_result_t er;
+            sandbox_error_t ec = sandbox_exec(h, &es, &er);
+            if (ec != SANDBOX_OK) {
+                fprintf(stderr, "sandbox_exec: %d (%s)\n", (int)ec, sandbox_error_string(ec));
+                status = status ? status : 1;
+                continue;
+            }
+            if (er.out_len) fwrite(er.out, 1, er.out_len, stdout);
+            if (er.err_len) fwrite(er.err, 1, er.err_len, stderr);
+            if (er.out_total > er.out_len || er.err_total > er.err_len)
+                fprintf(stderr, "[output truncated: kept %zu of %llu stdout, %zu of %llu stderr bytes]\n",
+                        er.out_len, (unsigned long long)er.out_total, er.err_len,
+                        (unsigned long long)er.err_total);
+            fflush(stdout);
+            printf("{\"event\":\"exec\",\"index\":%d,\"exit_code\":%d,\"term_signal\":%d,"
+                   "\"timed_out\":%s}\n",
+                   i, er.exit_code, er.term_signal, er.timed_out ? "true" : "false");
+            if (!status && (er.exit_code != 0 || er.timed_out))
+                status = er.exit_code > 0 ? er.exit_code : 1;
+            sandbox_exec_result_free(&er);
+        }
+        sandbox_destroy(h);
+        sandbox_cleanup();
+        return status;
+    }
 
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);

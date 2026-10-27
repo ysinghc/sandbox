@@ -75,6 +75,7 @@ add_library(sandbox SHARED
     src/lifecycle.c
     src/telemetry.c
     src/guest_rpc_client.c
+    src/ipc_guest.c
     src/ipc_server.c
     src/ipc_codec.cpp
     ${PROTO_SRCS}

@@ -22,4 +22,9 @@ int lifecycle_count(void);
 // Not part of the public libsandbox.h API.
 const char* sandbox_handle_token(const sandbox_handle_t* handle);
 
+// Test seam (#24): a client handle for `sandbox_id` without going through Create,
+// so a test can drive the guest-op path against a fake VM. Free it with free().
+// Not part of the public libsandbox.h API.
+sandbox_handle_t* lifecycle_test_handle(uint32_t sandbox_id);
+
 #endif // LIFECYCLE_H
