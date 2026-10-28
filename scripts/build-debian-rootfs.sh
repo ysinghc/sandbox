@@ -57,11 +57,26 @@ trap cleanup EXIT
 
 # ── 1. Base system ───────────────────────────────────────────────────────────
 log "debootstrap $SUITE ($ARCH) from $MIRROR"
-debootstrap --arch="$ARCH" --variant=minbase --include="$PACKAGES" \
-    "$SUITE" "$ROOTDIR" "$MIRROR" >"$WORK/debootstrap.log" 2>&1 || {
+# A mirror that drops a few downloads (an index naming a package version it has
+# just replaced, a stalled connection) fails the whole run with "Couldn't download
+# packages". That is routine for a public mirror and says nothing about the image,
+# so retry; the cache keeps everything already fetched, so a retry only asks for
+# what was missing.
+CACHE="$WORK/cache"
+mkdir -p "$CACHE"
+attempt=1
+until debootstrap --arch="$ARCH" --variant=minbase --include="$PACKAGES" \
+        --cache-dir="$CACHE" "$SUITE" "$ROOTDIR" "$MIRROR" >"$WORK/debootstrap.log" 2>&1; do
+    tail -5 "$WORK/debootstrap.log" >&2
+    if [ "$attempt" -ge "${DEBOOTSTRAP_ATTEMPTS:-3}" ]; then
         tail -40 "$WORK/debootstrap.log" >&2
-        die "debootstrap failed (full log above)"
-    }
+        die "debootstrap failed after $attempt attempts (full log above)"
+    fi
+    log "debootstrap attempt $attempt failed; retrying in 20s"
+    attempt=$((attempt + 1))
+    sleep 20
+    rm -rf "$ROOTDIR"
+done
 log "  base: $(cat "$ROOTDIR/etc/debian_version" 2>/dev/null || echo unknown) ($(du -sh "$ROOTDIR" | cut -f1))"
 
 # ── 2. Guest pieces the engine requires ──────────────────────────────────────
