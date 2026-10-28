@@ -131,6 +131,7 @@ endif()
 add_library(sandbox_broker_core STATIC
     src/broker/http.c
     src/broker/credentials.c
+    src/broker/proxy.c
     src/broker/core.c
     src/egress_policy.c
     src/log.c

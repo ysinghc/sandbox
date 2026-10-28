@@ -136,14 +136,22 @@ static const char* reason_phrase(int code) {
         case 403: return "Forbidden";
         case 404: return "Not Found";
         case 405: return "Method Not Allowed";
+        case 407: return "Proxy Authentication Required";
+        case 413: return "Content Too Large";
         case 500: return "Internal Server Error";
         case 502: return "Bad Gateway";
+        case 503: return "Service Unavailable";
         case 504: return "Gateway Timeout";
         default: return "Error";
     }
 }
 
 int send_http_error(int fd, int code, const char* message) {
+    return send_http_error_ex(fd, code, message, NULL);
+}
+
+// extra_headers: zero or more complete "Name: value\r\n" lines, or NULL.
+int send_http_error_ex(int fd, int code, const char* message, const char* extra_headers) {
     if (fd < 0) {
         errno = EINVAL;
         return -1;
@@ -156,10 +164,12 @@ int send_http_error(int fd, int code, const char* message) {
     int hlen = snprintf(head, sizeof(head),
                         "HTTP/1.1 %d %s\r\n"
                         "Content-Type: application/json\r\n"
+                        "%s"
                         "Content-Length: %d\r\n"
                         "Connection: close\r\n"
                         "\r\n",
-                        code, reason_phrase(code), blen);
+                        code, reason_phrase(code), extra_headers ? extra_headers : "",
+                        blen);
     if (hlen < 0) return -1;
     // One write of header+body keeps the response atomic on a blocking socket.
     char out[1024];
@@ -175,6 +185,38 @@ int send_http_error(int fd, int code, const char* message) {
             return -1;
         }
         off += (size_t)w;
+    }
+    return 0;
+}
+
+int http_split_absolute(const char* target, char* authority, size_t auth_cap,
+                        char* path, size_t path_cap) {
+    if (!target || !authority || !path || !auth_cap || !path_cap) return -1;
+    const char* p;
+    if (strncasecmp(target, "http://", 7) == 0) p = target + 7;
+    else if (strncasecmp(target, "https://", 8) == 0) p = target + 8;
+    else return -1;
+    const char* end = p;
+    while (*end && *end != '/' && *end != '?' && *end != '#') end++;
+    size_t al = (size_t)(end - p);
+    if (al == 0 || al >= auth_cap) return -1;
+    for (size_t i = 0; i < al; i++) {
+        unsigned char c = (unsigned char)p[i];
+        if (c == '@' || c == '[' || c <= 0x20 || c >= 0x7f) return -1;
+    }
+    if (strchr(end, '#')) return -1;
+    memcpy(authority, p, al);
+    authority[al] = '\0';
+    if (*end == '\0') {
+        if (path_cap < 2) return -1;
+        strcpy(path, "/");
+    } else if (*end == '?') {
+        if (strlen(end) + 2 > path_cap) return -1;
+        path[0] = '/';
+        strcpy(path + 1, end);
+    } else {
+        if (strlen(end) + 1 > path_cap) return -1;
+        strcpy(path, end);
     }
     return 0;
 }

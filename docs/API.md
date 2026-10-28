@@ -374,6 +374,44 @@ The broker then:
    `credentials.conf`;
 4. proxies to `https://<host><target>` and streams the response back.
 
+### Using it as a proxy
+
+Stock tools reach the broker the way they reach any forward proxy, so no
+per-tool glue is needed. Give them the broker's address and the session token as
+the proxy password (the user name is ignored):
+
+```
+export http_proxy=http://sandbox:<session_token>@<broker host>:8080
+export https_proxy=$http_proxy
+pip install --target /workspace/lib requests     # CONNECT pypi.org:443, files.pythonhosted.org:443
+curl http://pypi.org/simple/                     # absolute-form, upgraded to https by the broker
+```
+
+The broker understands three request shapes:
+
+1. **Origin-form with `X-Sandbox-Token`** (as above): `Host:` names the upstream.
+2. **Absolute-form** (`GET http://host/path`): the URI's authority names the
+   upstream (the `Host:` header is ignored, as a proxy must) and the broker
+   always speaks https to it. Userinfo or a fragment in the target → `400`.
+3. **`CONNECT host:port`**: an opaque tunnel, which is what `https_proxy`
+   clients (pip, npm, apt-over-https) use. The broker cannot see inside TLS and
+   so cannot inject a credential; it therefore tunnels **only to destinations the
+   session's policy names**, never on the strength of the daemon-wide `*`. An
+   entry with no port allows any port; write `host:443` to pin it.
+
+Credentials for 2 and 3 travel as `Proxy-Authorization: Basic base64(user:token)`.
+A missing or unusable one gets `407` with `Proxy-Authenticate` (rather than `401`)
+so tools prompt for it. The broker strips `Proxy-Authorization`,
+`Proxy-Connection` and `X-Sandbox-Token` before forwarding.
+
+The broker only connects to **public** addresses. A name the policy allows that
+resolves to loopback, RFC 1918, link-local (`169.254/16`: the VM subnets and the
+cloud metadata address), CGNAT or multicast space is refused with `403`
+(`decision":"denied_address"`), for relayed requests and tunnels alike; see
+`SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM` in CONFIGURATION.md. Each connection is
+served on its own thread (`SANDBOX_BROKER_MAX_CONNS`), and the bytes moved in each
+direction are logged and exported as `broker_relayed_bytes_total`.
+
 Both directions are streamed with bounded memory: a request body is relayed a
 buffer at a time and never held whole, so a multi-hundred-MiB upload costs the
 same as a small one. A `Content-Length` body is forwarded with that length; a
@@ -388,5 +426,7 @@ silently truncated request as complete. Successful calls and rejections are
 counted in the broker's `/metrics`.
 
 Errors: `400` malformed request or body (bad chunk framing, short body,
-unsupported transfer coding), `401` missing/invalid token, `403` host not
-allow-listed, `413` request body over the limit, `502` upstream failure.
+unsupported transfer coding, bad target), `401` missing/invalid token, `403` host
+not allow-listed or address not permitted, `407` the same for proxy-style
+requests, `413` request body over the limit, `502` upstream failure, `503`
+broker at its connection limit.

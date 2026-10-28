@@ -101,6 +101,44 @@ int http_remove_header(http_request_t* req, const char* name);
 
 // Write a minimal error response (status line + JSON-ish body).
 int send_http_error(int fd, int code, const char* message);
+// As above plus complete "Name: value\r\n" header lines (e.g. Proxy-Authenticate).
+int send_http_error_ex(int fd, int code, const char* message, const char* extra_headers);
+
+// Split an absolute-form request target ("http://host[:port]/path?query", what a
+// client sends to a forward proxy). Returns 0 and fills authority (host[:port])
+// and path ("/" if empty, query kept); -1 if `target` is not absolute-form.
+// Userinfo ("user@") and fragments are rejected: a proxy has no business relaying
+// either, and "http://allowed.example@evil.example/" is the classic way to
+// disguise the real host.
+int http_split_absolute(const char* target, char* authority, size_t auth_cap,
+                        char* path, size_t path_cap);
+
+// ---------------------------------------------------------------------------
+// Forward-proxy support (src/broker/proxy.c, #26)
+// ---------------------------------------------------------------------------
+
+// Extract the session token from a "Proxy-Authorization: Basic base64(user:TOKEN)"
+// value: that is how pip/npm/apt/curl present it when given a proxy URL such as
+// http://sandbox:TOKEN@broker:8080. 0 on success (out is the 64-hex token), else -1.
+int broker_token_from_proxy_auth(const char* value, char out[BROKER_TOKEN_HEX_LEN + 1]);
+
+// The broker only dials public addresses: a name the policy allows must not be
+// able to steer it at loopback, the VM subnets (169.254/16), RFC 1918 space or
+// the host's own services, whatever its DNS says. SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM=1
+// lifts that for an operator who knowingly mirrors internally (and for tests).
+bool broker_private_upstream_allowed(void);
+struct sockaddr;
+bool broker_addr_public(const struct sockaddr* sa);
+
+// Resolve and connect (deadline timeout_ms), honouring the rule above. Returns a
+// blocking fd, or -1; *denied is set when the name resolved only to off-limits
+// addresses.
+int broker_dial(const char* host, unsigned port, int timeout_ms, bool* denied);
+
+// Pump bytes both ways between two connected sockets until both sides finish or
+// `idle_ms` passes without traffic. Half-closes are propagated. Reports the bytes
+// moved in each direction.
+void broker_tunnel(int a, int b, int idle_ms, uint64_t* a_to_b, uint64_t* b_to_a);
 
 // ---------------------------------------------------------------------------
 // Request pipeline (testable in-process)
@@ -120,7 +158,13 @@ bool broker_host_allowed(char* const* allowed_services, const char* host);
 // limit. Return values of broker_forward_upstream below.
 #define BROKER_FWD_BAD_BODY (-2)    // malformed chunking, short body, unsupported coding
 #define BROKER_FWD_TOO_LARGE (-3)   // over broker_max_body()
+#define BROKER_FWD_ADDR_DENIED (-4) // resolved only to non-public addresses
 #define BROKER_DEFAULT_MAX_BODY (256ull * 1024 * 1024)
+
+typedef struct {
+    uint64_t req_bytes;   // request body bytes sent upstream
+    uint64_t resp_bytes;  // response bytes (headers + body) relayed to the guest
+} broker_fwd_stats_t;
 
 // SANDBOX_BROKER_MAX_BODY (bytes), default 256 MiB.
 uint64_t broker_max_body(void);
@@ -131,6 +175,9 @@ uint64_t broker_max_body(void);
 // BROKER_FWD_TOO_LARGE (nothing was relayed to client_fd), or -1 on transport
 // failure (an error may already be written to client_fd).
 int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd);
+// As above, also reporting how many bytes moved (stats may be NULL).
+int broker_forward_upstream_ex(const http_request_t* req, int client_fd, int body_fd,
+                               broker_fwd_stats_t* stats);
 
 // Handle one proxied request on client_fd (never closes it). Returns the HTTP
 // status it sent. engine_fd is the validation socket.

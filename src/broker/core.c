@@ -151,7 +151,19 @@ void session_info_free(session_info_t* s) {
     s->sandbox_id = 0;
 }
 
+// The engine connection is one socket and a validation is a request/response
+// pair on it, so concurrent connection threads take turns (microseconds each).
+static pthread_mutex_t g_engine_mu = PTHREAD_MUTEX_INITIALIZER;
+static int validate_token_locked(int engine_fd, const char* token_hex, session_info_t* out);
+
 int broker_validate_token(int engine_fd, const char* token_hex, session_info_t* out) {
+    pthread_mutex_lock(&g_engine_mu);
+    int rc = validate_token_locked(engine_fd, token_hex, out);
+    pthread_mutex_unlock(&g_engine_mu);
+    return rc;
+}
+
+static int validate_token_locked(int engine_fd, const char* token_hex, session_info_t* out) {
     if (engine_fd < 0 || !out) return BROKER_VALIDATE_ERROR;
     memset(out, 0, sizeof(*out));
 
@@ -227,6 +239,8 @@ struct fwd_ctx {
     // Why the body failed, if it did: BROKER_FWD_BAD_BODY or BROKER_FWD_TOO_LARGE.
     int body_err;
     long status;
+    uint64_t resp_bytes;  // relayed to the guest, headers included
+    bool addr_denied;     // the upstream resolved only to off-limits addresses
 };
 
 static int send_all(int fd, const char* buf, size_t n) {
@@ -246,6 +260,7 @@ static size_t fwd_write_cb(char* ptr, size_t size, size_t nmemb, void* ud) {
     struct fwd_ctx* c = ud;
     size_t n = size * nmemb;
     if (send_all(c->client_fd, ptr, n) < 0) return 0;  // abort transfer
+    c->resp_bytes += n;
     return n;
 }
 
@@ -257,7 +272,20 @@ static size_t fwd_header_cb(char* buffer, size_t size, size_t nitems, void* ud) 
         c->status = (sscanf(buffer, "HTTP/%*d.%*d %d", &code) == 1) ? code : 0;
     }
     if (send_all(c->client_fd, buffer, n) < 0) return 0;
+    c->resp_bytes += n;
     return n;
+}
+
+// Every connection libcurl makes passes through here, so a name the policy
+// allows cannot be used to reach the host's own network (see broker_addr_public).
+static curl_socket_t fwd_open_cb(void* ud, curlsocktype purpose, struct curl_sockaddr* addr) {
+    struct fwd_ctx* c = ud;
+    if (purpose == CURLSOCKTYPE_IPCXN && !broker_private_upstream_allowed() &&
+        !broker_addr_public((const struct sockaddr*)&addr->addr)) {
+        c->addr_denied = true;
+        return CURL_SOCKET_BAD;
+    }
+    return socket(addr->family, addr->socktype | SOCK_CLOEXEC, addr->protocol);
 }
 
 static int recv_crlf_line(int fd, char* line, size_t cap);
@@ -367,6 +395,12 @@ static uint64_t request_content_length(const http_request_t* req) {
 }
 
 int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd) {
+    return broker_forward_upstream_ex(req, client_fd, body_fd, NULL);
+}
+
+int broker_forward_upstream_ex(const http_request_t* req, int client_fd, int body_fd,
+                               broker_fwd_stats_t* stats) {
+    if (stats) memset(stats, 0, sizeof(*stats));
     if (!req || client_fd < 0) return -1;
     const char* host = http_get_header(req, "Host");
     if (!host || !*host) return -1;
@@ -430,6 +464,11 @@ int broker_forward_upstream(const http_request_t* req, int client_fd, int body_f
     };
 
     curl_easy_setopt(h, CURLOPT_URL, url);
+    // The broker's own environment must not be able to reroute (or hide) the
+    // connection: no proxy, and every address checked by fwd_open_cb.
+    curl_easy_setopt(h, CURLOPT_PROXY, "");
+    curl_easy_setopt(h, CURLOPT_OPENSOCKETFUNCTION, fwd_open_cb);
+    curl_easy_setopt(h, CURLOPT_OPENSOCKETDATA, &ctx);
     curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, req->method);
     curl_easy_setopt(h, CURLOPT_HTTPHEADER, hdrs);
     curl_easy_setopt(h, CURLOPT_HEADERFUNCTION, fwd_header_cb);
@@ -465,6 +504,11 @@ int broker_forward_upstream(const http_request_t* req, int client_fd, int body_f
     long status = ctx.status;
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(h);
+    if (stats) {
+        stats->req_bytes = ctx.body_total;
+        stats->resp_bytes = ctx.resp_bytes;
+    }
+    if (ctx.addr_denied) return BROKER_FWD_ADDR_DENIED;
     // A body that failed mid-stream is the guest's problem and has a precise
     // answer; anything else that went wrong is the upstream's.
     if (ctx.body_err) return ctx.body_err;
@@ -501,6 +545,8 @@ static int recv_crlf_line(int fd, char* line, size_t cap) {
 static atomic_long g_req_2xx = 0, g_req_4xx = 0, g_req_5xx = 0;
 // #26: what the egress policy decided, independent of how the upstream answered.
 static atomic_long g_egress_allowed = 0, g_egress_denied = 0, g_egress_unconfigured = 0;
+static atomic_long g_egress_addr_denied = 0;
+static atomic_ulong g_bytes_up = 0, g_bytes_down = 0;  // guest->upstream, upstream->guest
 static atomic_ulong g_up_lat_count = 0, g_up_lat_sum_ms = 0;
 #define BROKER_LAT_BUCKETS 11
 static const double g_lat_bounds[BROKER_LAT_BUCKETS] = {
@@ -543,6 +589,11 @@ int broker_metrics_render(char* buf, int cap) {
          atomic_load(&g_egress_denied));
     EMIT("broker_egress_decisions_total{decision=\"denied_unconfigured\"} %ld\n",
          atomic_load(&g_egress_unconfigured));
+    EMIT("broker_egress_decisions_total{decision=\"denied_address\"} %ld\n",
+         atomic_load(&g_egress_addr_denied));
+    EMIT("# TYPE broker_relayed_bytes_total counter\n");
+    EMIT("broker_relayed_bytes_total{direction=\"to_upstream\"} %lu\n", atomic_load(&g_bytes_up));
+    EMIT("broker_relayed_bytes_total{direction=\"to_guest\"} %lu\n", atomic_load(&g_bytes_down));
     EMIT("# TYPE broker_upstream_latency_seconds histogram\n");
     for (int i = 0; i < BROKER_LAT_BUCKETS; i++) {
         EMIT("broker_upstream_latency_seconds_bucket{le=\"%g\"} %ld\n",
@@ -584,7 +635,7 @@ int broker_metrics_serve(int listen_fd) {
 }
 
 static void log_request(uint32_t sandbox_id, const char* host, int status, long ms,
-                        const char* decision) {
+                        const char* decision, uint64_t bytes_up, uint64_t bytes_down) {
     char safe[256];
     size_t j = 0;
     for (const char* p = host ? host : ""; *p && j + 1 < sizeof(safe); p++) {
@@ -596,12 +647,78 @@ static void log_request(uint32_t sandbox_id, const char* host, int status, long 
                                : (status >= 400 ? LOG_WARN : LOG_INFO);
     LOGF(level, "broker", "proxy",
          "\"sandbox_id\":%u,\"host\":\"%s\",\"decision\":\"%s\",\"status\":%d,"
-         "\"latency_ms\":%ld",
-         sandbox_id, safe, decision, status, ms);
+         "\"latency_ms\":%ld,\"bytes_up\":%llu,\"bytes_down\":%llu",
+         sandbox_id, safe, decision, status, ms, (unsigned long long)bytes_up,
+         (unsigned long long)bytes_down);
 }
 
 static long elapsed_ms(const struct timespec* a, const struct timespec* b) {
     return (b->tv_sec - a->tv_sec) * 1000L + (b->tv_nsec - a->tv_nsec) / 1000000L;
+}
+
+// CONNECT host:port -> an opaque tunnel (what https_proxy clients such as pip and
+// npm use). The broker cannot see inside TLS, so it cannot inject a credential
+// either; it therefore tunnels only to destinations the session's policy names,
+// never on the strength of the daemon-wide "*" alone.
+static int handle_connect(int client_fd, const http_request_t* req,
+                          const session_info_t* session) {
+    const char* authority = req->target;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    bool via_named = false;
+    if (!egress_match(session->allowed_services, authority, &via_named)) {
+        atomic_fetch_add(&g_egress_denied, 1);
+        log_request(session->sandbox_id, authority, 403, 0, "denied_policy", 0, 0);
+        send_http_error(client_fd, 403, "Service not allowed");
+        return 403;
+    }
+    if (!via_named) {
+        atomic_fetch_add(&g_egress_unconfigured, 1);
+        log_request(session->sandbox_id, authority, 403, 0, "denied_unconfigured", 0, 0);
+        send_http_error(client_fd, 403, "Service not configured");
+        return 403;
+    }
+    // host:port, port mandatory for CONNECT.
+    char host[256];
+    const char* colon = strrchr(authority, ':');
+    char* end = NULL;
+    unsigned long port = colon ? strtoul(colon + 1, &end, 10) : 0;
+    size_t hl = colon ? (size_t)(colon - authority) : 0;
+    if (!colon || hl == 0 || hl >= sizeof(host) || *end != '\0' || port == 0 || port > 65535) {
+        send_http_error(client_fd, 400, "CONNECT needs host:port");
+        return 400;
+    }
+    memcpy(host, authority, hl);
+    host[hl] = '\0';
+
+    bool denied = false;
+    int up = broker_dial(host, (unsigned)port, 10000, &denied);
+    if (up < 0) {
+        int st = denied ? 403 : 502;
+        if (denied) atomic_fetch_add(&g_egress_addr_denied, 1);
+        log_request(session->sandbox_id, authority, st, 0,
+                    denied ? "denied_address" : "allowed_unreachable", 0, 0);
+        send_http_error(client_fd, st, denied ? "Upstream address not permitted"
+                                              : "Upstream unreachable");
+        return st;
+    }
+    atomic_fetch_add(&g_egress_allowed, 1);
+    static const char ok[] = "HTTP/1.1 200 Connection Established\r\n\r\n";
+    if (send_all(client_fd, ok, sizeof(ok) - 1) < 0) {
+        close(up);
+        return 502;
+    }
+    int idle_s = atoi(env_or("SANDBOX_BROKER_TUNNEL_IDLE_S", "300"));
+    uint64_t to_up = 0, to_guest = 0;
+    broker_tunnel(client_fd, up, (idle_s > 0 ? idle_s : 300) * 1000, &to_up, &to_guest);
+    close(up);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    atomic_fetch_add(&g_bytes_up, to_up);
+    atomic_fetch_add(&g_bytes_down, to_guest);
+    log_request(session->sandbox_id, authority, 200, elapsed_ms(&t0, &t1), "allowed_tunnel",
+                to_up, to_guest);
+    return 200;
 }
 
 static int broker_handle_request_inner(int client_fd, const credential_store_t* creds, int engine_fd) {
@@ -618,26 +735,63 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
         return 400;
     }
 
-    // 1. Session token.
+    // 0. Proxy-style requests (#26): CONNECT, or an absolute-form target. The
+    // authority then names the upstream and the Host header is ignored, as a
+    // proxy must.
+    bool is_connect = strcasecmp(req->method, "CONNECT") == 0;
+    bool proxy_style = is_connect;
+    if (!is_connect) {
+        bool absolute = strncasecmp(req->target, "http://", 7) == 0 ||
+                        strncasecmp(req->target, "https://", 8) == 0;
+        if (absolute) {
+            char authority[256], path[HTTP_MAX_TARGET];
+            if (http_split_absolute(req->target, authority, sizeof(authority), path,
+                                    sizeof(path)) != 0) {
+                send_http_error(client_fd, 400, "Malformed request target");
+                free(req);
+                return 400;
+            }
+            snprintf(req->target, sizeof(req->target), "%s", path);
+            http_set_header(req, "Host", authority);
+            proxy_style = true;
+        }
+    }
+    const int auth_fail = proxy_style ? 407 : 401;
+    const char* auth_hdr = proxy_style ? "Proxy-Authenticate: Basic realm=\"sandbox\"\r\n" : NULL;
+
+    // 1. Session token: X-Sandbox-Token, or the password of Proxy-Authorization
+    // (http://sandbox:TOKEN@broker:8080), which is what stock tools can send.
     const char* token = http_get_header(req, "X-Sandbox-Token");
+    char proxy_token[BROKER_TOKEN_HEX_LEN + 1];
     if (!token || !*token) {
-        send_http_error(client_fd, 401, "Missing token");
+        const char* pa = http_get_header(req, "Proxy-Authorization");
+        if (pa && broker_token_from_proxy_auth(pa, proxy_token) == 0) token = proxy_token;
+    }
+    if (!token || !*token) {
+        send_http_error_ex(client_fd, auth_fail, "Missing token", auth_hdr);
         free(req);
-        return 401;
+        return auth_fail;
     }
 
     // 2. Validate with the engine daemon.
     session_info_t session;
     int vr = broker_validate_token(engine_fd, token, &session);
     if (vr == BROKER_VALIDATE_INVALID) {
-        send_http_error(client_fd, 401, "Invalid or expired token");
+        send_http_error_ex(client_fd, auth_fail, "Invalid or expired token", auth_hdr);
         free(req);
-        return 401;
+        return auth_fail;
     }
     if (vr == BROKER_VALIDATE_ERROR) {
         send_http_error(client_fd, 502, "Token validation unavailable");
         free(req);
         return 502;
+    }
+
+    if (is_connect) {
+        int st = handle_connect(client_fd, req, &session);
+        session_info_free(&session);
+        free(req);
+        return st;
     }
 
     // 3. Target host + allowlist.
@@ -653,7 +807,7 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
         // Audited like any request: what a sandbox tried to reach and was
         // refused is the part of the log that matters most.
         atomic_fetch_add(&g_egress_denied, 1);
-        log_request(session.sandbox_id, host, 403, 0, "denied_policy");
+        log_request(session.sandbox_id, host, 403, 0, "denied_policy", 0, 0);
         session_info_free(&session);
         send_http_error(client_fd, 403, "Service not allowed");
         free(req);
@@ -661,6 +815,7 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
     }
 
     // 4. Real credential for this upstream.
+    //
     // A destination the developer named in the session's policy may be relayed
     // without one (a package index has no secret to inject). The daemon-wide "*"
     // never earns that: reaching an arbitrary host unauthenticated was not
@@ -668,38 +823,52 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
     const char* real_cred = credential_store_lookup(creds, host);
     if (!real_cred && !via_named) {
         atomic_fetch_add(&g_egress_unconfigured, 1);
-        log_request(session.sandbox_id, host, 403, 0, "denied_unconfigured");
+        log_request(session.sandbox_id, host, 403, 0, "denied_unconfigured", 0, 0);
         session_info_free(&session);
         send_http_error(client_fd, 403, "Service not configured");
         free(req);
         return 403;
     }
-    atomic_fetch_add(&g_egress_allowed, 1);
 
-    // 5. Strip the session token; inject the real credential when there is one.
+    // 5. Strip what is ours (the session token, proxy credentials and hop-by-hop
+    // proxy headers); inject the real credential when there is one.
     http_remove_header(req, "X-Sandbox-Token");
+    http_remove_header(req, "Proxy-Authorization");
+    http_remove_header(req, "Proxy-Connection");
     if (real_cred) http_set_header(req, "Authorization", real_cred);
 
     // 6. Forward upstream. The request body (Content-Length or chunked) streams
     // from the guest socket straight through; nothing is buffered.
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int status = broker_forward_upstream(req, client_fd, client_fd);
+    broker_fwd_stats_t fs;
+    int status = broker_forward_upstream_ex(req, client_fd, client_fd, &fs);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = elapsed_ms(&t0, &t1);
 
-    if (status == BROKER_FWD_TOO_LARGE) {
-        send_http_error(client_fd, 413, "Request body too large");
-        status = 413;
-    } else if (status == BROKER_FWD_BAD_BODY) {
-        send_http_error(client_fd, 400, "Malformed request body");
-        status = 400;
-    } else     if (status < 0) {
-        // Best-effort: only meaningful if no upstream bytes were relayed yet.
-        send_http_error(client_fd, 502, "Upstream unreachable");
-        status = 502;
+    const char* decision = real_cred ? "allowed_credentialed" : "allowed_anonymous";
+    if (status == BROKER_FWD_ADDR_DENIED) {
+        atomic_fetch_add(&g_egress_addr_denied, 1);
+        send_http_error(client_fd, 403, "Upstream address not permitted");
+        status = 403;
+        decision = "denied_address";
+    } else {
+        atomic_fetch_add(&g_egress_allowed, 1);
+        atomic_fetch_add(&g_bytes_up, fs.req_bytes);
+        atomic_fetch_add(&g_bytes_down, fs.resp_bytes);
+        if (status == BROKER_FWD_TOO_LARGE) {
+            send_http_error(client_fd, 413, "Request body too large");
+            status = 413;
+        } else if (status == BROKER_FWD_BAD_BODY) {
+            send_http_error(client_fd, 400, "Malformed request body");
+            status = 400;
+        } else if (status < 0) {
+            // Best-effort: only meaningful if no upstream bytes were relayed yet.
+            send_http_error(client_fd, 502, "Upstream unreachable");
+            status = 502;
+        }
     }
-    log_request(session.sandbox_id, host, status, ms, real_cred ? "allowed_credentialed" : "allowed_anonymous");
+    log_request(session.sandbox_id, host, status, ms, decision, fs.req_bytes, fs.resp_bytes);
     session_info_free(&session);
     free(req);
     return status;
@@ -791,6 +960,29 @@ static void start_broker_metrics(void) {
     }
 }
 
+typedef struct {
+    int cfd;
+    const credential_store_t* creds;
+    int engine_fd;
+} conn_arg_t;
+
+static atomic_int g_active_conns = 0;
+
+static void* conn_thread(void* p) {
+    conn_arg_t a = *(conn_arg_t*)p;
+    free(p);
+    // Bound a stalled guest: header/body reads and response writes time out
+    // rather than pinning a thread forever. (CONNECT tunnels use their own idle
+    // timer on top of this.)
+    struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
+    setsockopt(a.cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(a.cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    broker_handle_request(a.cfd, a.creds, a.engine_fd);
+    close(a.cfd);
+    atomic_fetch_sub(&g_active_conns, 1);
+    return NULL;
+}
+
 int broker_run(void) {
     signal(SIGPIPE, SIG_IGN);
 
@@ -853,18 +1045,35 @@ int broker_run(void) {
         return -1;
     }
 
+    int max_conns = atoi(env_or("SANDBOX_BROKER_MAX_CONNS", "64"));
+    if (max_conns <= 0) max_conns = 64;
     for (;;) {
         int cfd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (cfd < 0) {
             if (errno == EINTR) continue;
             break;
         }
-        // Bound a stalled guest: header/body reads and response writes time out
-        // rather than pinning the single-threaded accept loop forever.
-        struct timeval tv = {.tv_sec = 30, .tv_usec = 0};
-        setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        setsockopt(cfd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-        broker_handle_request(cfd, creds, engine_fd);
+        // One thread per connection: a package install opens several at once and
+        // a CONNECT tunnel lives for the whole transfer, so serving them one at a
+        // time would stall every other sandbox behind the slowest.
+        if (atomic_load(&g_active_conns) >= max_conns) {
+            send_http_error(cfd, 503, "Broker busy");
+            close(cfd);
+            continue;
+        }
+        conn_arg_t* a = malloc(sizeof(*a));
+        pthread_t th;
+        if (a) {
+            *a = (conn_arg_t){.cfd = cfd, .creds = creds, .engine_fd = engine_fd};
+            atomic_fetch_add(&g_active_conns, 1);
+            if (pthread_create(&th, NULL, conn_thread, a) == 0) {
+                pthread_detach(th);
+                continue;
+            }
+            atomic_fetch_sub(&g_active_conns, 1);
+            free(a);
+        }
+        send_http_error(cfd, 503, "Broker busy");
         close(cfd);
     }
     close(lfd);

@@ -94,6 +94,10 @@ production-oriented):
 | `SANDBOX_BROKER_TLS_VERIFY` | on | Set to `0` to disable upstream TLS verification (**testing only**). |
 | `SANDBOX_BROKER_UID` / `SANDBOX_BROKER_GID` | *(unset)* | Drop to this uid/gid after binding. |
 | `SANDBOX_BROKER_METRICS_PORT` | *(unset)* | Optional broker `/metrics` listener. |
+| `SANDBOX_BROKER_MAX_BODY` | `268435456` | Largest request body (bytes) the broker will relay; over it → `413` (#7). |
+| `SANDBOX_BROKER_MAX_CONNS` | `64` | Concurrent guest connections (one thread each); beyond it → `503`. |
+| `SANDBOX_BROKER_TUNNEL_IDLE_S` | `300` | A `CONNECT` tunnel with no traffic for this long is dropped. |
+| `SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM` | off | Set to `1` to let the broker connect to loopback / RFC 1918 / link-local addresses. Off by default: a name the egress policy allows must not be able to point the broker at the host's own services (DNS rebinding, `169.254.169.254`, the VM subnets). Enable only for an internal mirror you mean to reach, or in tests. |
 
 ## Other environment variables
 

@@ -824,9 +824,8 @@ static void test_body_limits(void) {
 // One request through a fresh engine mock that hands out `allowed` as the
 // session's policy. With `upstream` non-NULL the upstream is live and gets the
 // connection; otherwise the request must be refused before any forward.
-static int policy_case(const char* tag, const char* const* allowed, int n_allowed,
-                       const char* host_hdr, mock_upstream_t* upstream, char* resp,
-                       size_t cap) {
+static int policy_raw(const char* tag, const char* const* allowed, int n_allowed,
+                      const char* greq, mock_upstream_t* upstream, char* resp, size_t cap) {
     char epath[512];
     snprintf(epath, sizeof(epath), "%s/engine-%s.sock", g_dir, tag);
     mock_engine_t eng;
@@ -841,11 +840,6 @@ static int policy_case(const char* tag, const char* const* allowed, int n_allowe
     eng.client_fd_fd = broker_engine_connect(epath);
     CHECK(eng.client_fd_fd >= 0, "engine connect");
 
-    char greq[1024];
-    snprintf(greq, sizeof(greq),
-             "GET /simple/ HTTP/1.1\r\nHost: %s\r\n"
-             "X-Sandbox-Token: " TOKEN_HEX "\r\n\r\n",
-             host_hdr);
     int st;
     if (upstream) {
         st = proxy_once(&eng, upstream, greq, resp, cap, "hello");
@@ -865,6 +859,17 @@ static int policy_case(const char* tag, const char* const* allowed, int n_allowe
     close(eng.listen_fd);
     unlink(epath);
     return st;
+}
+
+static int policy_case(const char* tag, const char* const* allowed, int n_allowed,
+                       const char* host_hdr, mock_upstream_t* upstream, char* resp,
+                       size_t cap) {
+    char greq[1024];
+    snprintf(greq, sizeof(greq),
+             "GET /simple/ HTTP/1.1\r\nHost: %s\r\n"
+             "X-Sandbox-Token: " TOKEN_HEX "\r\n\r\n",
+             host_hdr);
+    return policy_raw(tag, allowed, n_allowed, greq, upstream, resp, cap);
 }
 
 static void test_egress_policy(void) {
@@ -945,6 +950,318 @@ static void test_egress_policy(void) {
           "unconfigured counter moved");
     report("egress_policy", b);
 }
+
+// ---------------------------------------------------------------------------
+// #26 forward-proxy mode: what pip/npm/apt/curl send when given a proxy URL.
+
+// base64 of "sandbox:" TOKEN_HEX, precomputed by the test at runtime.
+static void proxy_auth_value(char* out, size_t cap) {
+    static const char tbl[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char raw[128];
+    int n = snprintf(raw, sizeof(raw), "sandbox:%s", TOKEN_HEX);
+    size_t o = (size_t)snprintf(out, cap, "Basic ");
+    for (int i = 0; i < n; i += 3) {
+        unsigned v = (unsigned char)raw[i] << 16;
+        if (i + 1 < n) v |= (unsigned char)raw[i + 1] << 8;
+        if (i + 2 < n) v |= (unsigned char)raw[i + 2];
+        out[o++] = tbl[(v >> 18) & 63];
+        out[o++] = tbl[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? tbl[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? tbl[v & 63] : '=';
+    }
+    out[o] = '\0';
+}
+
+static void test_proxy_helpers(void) {
+    int b = g_fail;
+    char auth[256], tok[BROKER_TOKEN_HEX_LEN + 1];
+    proxy_auth_value(auth, sizeof(auth));
+    CHECK(broker_token_from_proxy_auth(auth, tok) == 0 && strcmp(tok, TOKEN_HEX) == 0,
+          "token comes out of Proxy-Authorization");
+    CHECK(broker_token_from_proxy_auth("Bearer abc", tok) != 0, "only Basic");
+    CHECK(broker_token_from_proxy_auth("Basic !!!!", tok) != 0, "bad base64");
+    CHECK(broker_token_from_proxy_auth("Basic c2FuZGJveA==", tok) != 0, "no colon");
+    CHECK(broker_token_from_proxy_auth("Basic c2FuZGJveDpzaG9ydA==", tok) != 0,
+          "a password that is not 64 chars is not a token");
+    CHECK(broker_token_from_proxy_auth(NULL, tok) != 0, "null");
+
+    char a[64], p[256];
+    CHECK(http_split_absolute("http://pypi.org/simple/x?y=1", a, sizeof(a), p, sizeof(p)) == 0 &&
+              strcmp(a, "pypi.org") == 0 && strcmp(p, "/simple/x?y=1") == 0,
+          "absolute-form split");
+    CHECK(http_split_absolute("http://pypi.org:8080", a, sizeof(a), p, sizeof(p)) == 0 &&
+              strcmp(a, "pypi.org:8080") == 0 && strcmp(p, "/") == 0,
+          "no path -> /");
+    CHECK(http_split_absolute("http://pypi.org?q=1", a, sizeof(a), p, sizeof(p)) == 0 &&
+              strcmp(p, "/?q=1") == 0,
+          "query without a path");
+    CHECK(http_split_absolute("HTTPS://PyPI.org/a", a, sizeof(a), p, sizeof(p)) == 0, "scheme case");
+    CHECK(http_split_absolute("/simple/", a, sizeof(a), p, sizeof(p)) != 0, "origin-form is not absolute");
+    CHECK(http_split_absolute("http://allowed.example@evil.example/", a, sizeof(a), p, sizeof(p)) != 0,
+          "userinfo is refused");
+    CHECK(http_split_absolute("http:///path", a, sizeof(a), p, sizeof(p)) != 0, "empty authority");
+    CHECK(http_split_absolute("http://a b/", a, sizeof(a), p, sizeof(p)) != 0, "space in host");
+    CHECK(http_split_absolute("http://x/p#frag", a, sizeof(a), p, sizeof(p)) != 0, "fragment");
+    CHECK(http_split_absolute("http://[::1]/", a, sizeof(a), p, sizeof(p)) != 0, "ipv6 literal");
+
+    struct sockaddr_in s4;
+    memset(&s4, 0, sizeof(s4));
+    s4.sin_family = AF_INET;
+    const char* priv[] = {"127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.1.1",
+                          "169.254.169.254", "169.254.0.2", "100.64.0.1", "0.0.0.0",
+                          "224.0.0.1", "255.255.255.255", "198.18.0.1", "192.0.0.1"};
+    for (size_t i = 0; i < sizeof(priv) / sizeof(*priv); i++) {
+        inet_pton(AF_INET, priv[i], &s4.sin_addr);
+        char m[64];
+        snprintf(m, sizeof(m), "not public: %s", priv[i]);
+        CHECK(!broker_addr_public((struct sockaddr*)&s4), m);
+    }
+    const char* pub[] = {"8.8.8.8", "151.101.0.223", "172.32.0.1", "172.15.255.255", "100.63.0.1",
+                         "100.128.0.1", "198.20.0.1", "1.1.1.1"};
+    for (size_t i = 0; i < sizeof(pub) / sizeof(*pub); i++) {
+        inet_pton(AF_INET, pub[i], &s4.sin_addr);
+        char m[64];
+        snprintf(m, sizeof(m), "public: %s", pub[i]);
+        CHECK(broker_addr_public((struct sockaddr*)&s4), m);
+    }
+    struct sockaddr_in6 s6;
+    memset(&s6, 0, sizeof(s6));
+    s6.sin6_family = AF_INET6;
+    const char* priv6[] = {"::", "::1", "fe80::1", "fc00::1", "fd12::1", "ff02::1",
+                           "::ffff:127.0.0.1", "::ffff:10.0.0.1", "::ffff:169.254.169.254"};
+    for (size_t i = 0; i < sizeof(priv6) / sizeof(*priv6); i++) {
+        inet_pton(AF_INET6, priv6[i], &s6.sin6_addr);
+        char m[64];
+        snprintf(m, sizeof(m), "not public: %s", priv6[i]);
+        CHECK(!broker_addr_public((struct sockaddr*)&s6), m);
+    }
+    inet_pton(AF_INET6, "2606:4700::1111", &s6.sin6_addr);
+    CHECK(broker_addr_public((struct sockaddr*)&s6), "public v6");
+    inet_pton(AF_INET6, "::ffff:8.8.8.8", &s6.sin6_addr);
+    CHECK(broker_addr_public((struct sockaddr*)&s6), "v4-mapped public");
+    struct sockaddr_un su;
+    su.sun_family = AF_UNIX;
+    CHECK(!broker_addr_public((struct sockaddr*)&su), "other families are refused");
+    report("proxy_helpers", b);
+}
+
+typedef struct {
+    int listen_fd;
+    uint64_t got;
+} echo_t;
+
+static void* echo_thread(void* arg) {
+    echo_t* e = arg;
+    int fd = accept(e->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    char buf[4096];
+    for (;;) {
+        ssize_t r = recv(fd, buf, sizeof(buf), 0);
+        if (r <= 0) break;
+        e->got += (uint64_t)r;
+        if (write_full(fd, buf, (size_t)r) < 0) break;
+    }
+    close(fd);
+    return NULL;
+}
+
+typedef struct {
+    int fd, engine;
+    int rc;
+} broker_run_t;
+
+static void* broker_once_thread(void* arg) {
+    broker_run_t* b = arg;
+    credential_store_t* creds = credentials_load(g_creds);
+    b->rc = broker_handle_request(b->fd, creds, b->engine);
+    credentials_free(creds);
+    return NULL;
+}
+
+// One CONNECT through the broker against a live echo upstream. Returns the
+// broker's status; *tunnel_ok says the echo worked end to end.
+static int connect_case(const char* tag, const char* const* allowed, int n_allowed,
+                        const char* authority_fmt, int* tunnel_ok, char* resp, size_t cap,
+                        uint64_t* echoed) {
+    char epath[512];
+    snprintf(epath, sizeof(epath), "%s/engine-%s.sock", g_dir, tag);
+    mock_engine_t eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.expected = TOKEN_BYTES;
+    eng.n_allowed = n_allowed;
+    for (int i = 0; i < n_allowed && i < 4; i++) eng.allowed[i] = allowed[i];
+    eng.listen_fd = engine_listen(epath);
+    pthread_t eth;
+    pthread_create(&eth, NULL, engine_thread, &eng);
+    eng.client_fd_fd = broker_engine_connect(epath);
+
+    echo_t echo = {0};
+    uint16_t port = 0;
+    echo.listen_fd = upstream_listen(&port);
+    pthread_t uth;
+    pthread_create(&uth, NULL, echo_thread, &echo);
+
+    char authority[128];
+    snprintf(authority, sizeof(authority), authority_fmt, port);
+    char auth[256], greq[1024];
+    proxy_auth_value(auth, sizeof(auth));
+    snprintf(greq, sizeof(greq),
+             "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n", authority,
+             authority, auth);
+
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    broker_run_t br = {.fd = sv[0], .engine = eng.client_fd_fd, .rc = 0};
+    pthread_t bth;
+    pthread_create(&bth, NULL, broker_once_thread, &br);
+
+    write_full(sv[1], greq, strlen(greq));
+    read_response(sv[1], resp, cap, "\r\n\r\n");
+    *tunnel_ok = 0;
+    *echoed = 0;
+    if (strstr(resp, "200 Connection Established")) {
+        // 300 KiB each way, so the pump has to loop, not just relay one read.
+        enum { N = 300 * 1024 };
+        static char out[N], in[N];
+        for (int i = 0; i < N; i++) out[i] = (char)(i * 31 + 7);
+        // Writer in this thread would deadlock against the echo's full buffers, so
+        // interleave: write a block, read the same block back.
+        int ok = 1;
+        for (int off = 0; off < N && ok; off += 8192) {
+            int n = N - off < 8192 ? N - off : 8192;
+            if (write_full(sv[1], out + off, (size_t)n) < 0) ok = 0;
+            else if (read_full(sv[1], in + off, (size_t)n) < 0) ok = 0;
+        }
+        *tunnel_ok = ok && memcmp(in, out, N) == 0;
+        *echoed = N;
+    }
+    shutdown(sv[1], SHUT_WR);  // half-close: the broker must pass it on and finish
+    pthread_join(bth, NULL);
+    close(sv[0]);
+    close(sv[1]);
+    shutdown(echo.listen_fd, SHUT_RDWR);
+    pthread_join(uth, NULL);
+    close(echo.listen_fd);
+    close(eng.client_fd_fd);
+    pthread_join(eth, NULL);
+    close(eng.listen_fd);
+    unlink(epath);
+    return br.rc;
+}
+
+static void test_proxy_mode(void) {
+    int b = g_fail;
+    char resp[4096], auth[256], greq[2048], host[64];
+    uint16_t port = 0;
+    mock_upstream_t up;
+    proxy_auth_value(auth, sizeof(auth));
+
+    // Absolute-form GET: the upstream is the URI's authority (the Host header is
+    // ignored), the request line becomes origin-form, and our headers are gone.
+    memset(&up, 0, sizeof(up));
+    snprintf(up.response, sizeof(up.response),
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    up.listen_fd = upstream_listen(&port);
+    snprintf(host, sizeof(host), "localhost:%u", port);
+    snprintf(greq, sizeof(greq),
+             "GET http://%s/simple/pip/?x=1 HTTP/1.1\r\nHost: evil.example\r\n"
+             "Proxy-Authorization: %s\r\nProxy-Connection: keep-alive\r\n\r\n",
+             host, auth);
+    const char* named[] = {"localhost"};
+    int st = policy_raw("abs", named, 1, greq, &up, resp, sizeof(resp));
+    CHECK(st == 200 && strstr(resp, "hello") != NULL, "absolute-form is relayed");
+    CHECK(strstr(up.request, "GET /simple/pip/?x=1 HTTP/1.1") != NULL, "request line is origin-form");
+    CHECK(strstr(up.request, "Host: localhost") != NULL && strstr(up.request, "evil.example") == NULL,
+          "the URI decides the host, not the Host header");
+    CHECK(strstr(up.request, "Proxy-Authorization") == NULL && strstr(up.request, "Proxy-Connection") == NULL,
+          "proxy headers are not forwarded");
+    CHECK(strstr(up.request, "Authorization") == NULL, "nothing is injected for a named host");
+    close(up.listen_fd);
+
+    // The Host header cannot be used to dodge the policy when the URI says otherwise.
+    snprintf(greq, sizeof(greq),
+             "GET http://evil.example/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: %s\r\n\r\n",
+             auth);
+    st = policy_raw("abs-evil", named, 1, greq, NULL, resp, sizeof(resp));
+    CHECK(st == 403 && strstr(resp, "Service not allowed"), "URI authority is what the policy sees");
+
+    // Userinfo trick.
+    snprintf(greq, sizeof(greq),
+             "GET http://localhost@evil.example/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: %s\r\n\r\n",
+             auth);
+    st = policy_raw("abs-userinfo", named, 1, greq, NULL, resp, sizeof(resp));
+    CHECK(st == 400, "userinfo in the target is refused");
+
+    // Credentials: proxy clients are told to authenticate (407), not given 401.
+    st = policy_raw("abs-noauth", named, 1,
+                    "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\n\r\n", NULL, resp, sizeof(resp));
+    CHECK(st == 407 && strstr(resp, "Proxy-Authenticate: Basic") != NULL, "missing proxy credentials -> 407");
+    st = policy_raw("abs-badauth", named, 1,
+                    "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic AAAA\r\n\r\n",
+                    NULL, resp, sizeof(resp));
+    CHECK(st == 407, "unusable proxy credentials -> 407");
+    st = policy_raw("conn-noauth", named, 1, "CONNECT localhost:443 HTTP/1.1\r\nHost: localhost:443\r\n\r\n",
+                    NULL, resp, sizeof(resp));
+    CHECK(st == 407 && strstr(resp, "407") != NULL, "CONNECT without credentials -> 407");
+    // The token is still checked against the engine.
+    snprintf(greq, sizeof(greq),
+             "GET http://localhost/ HTTP/1.1\r\nHost: localhost\r\nProxy-Authorization: Basic "
+             "c2FuZGJveDowMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAw\r\n\r\n");
+    st = policy_raw("abs-wrongtok", named, 1, greq, NULL, resp, sizeof(resp));
+    CHECK(st == 407, "a wrong token in Proxy-Authorization is refused");
+
+    // CONNECT: a real tunnel to a live echo server.
+    int ok = 0;
+    uint64_t echoed = 0;
+    const char* named_h[] = {"localhost"};
+    st = connect_case("conn", named_h, 1, "localhost:%u", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 200, "CONNECT to a named host succeeds");
+    CHECK(ok && echoed == 300 * 1024, "300 KiB round-trips through the tunnel intact");
+
+    const char* star[] = {"*"};
+    st = connect_case("conn-star", star, 1, "localhost:%u", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 403 && !ok, "CONNECT is not allowed on the strength of '*'");
+    const char* other[] = {"pypi.org"};
+    st = connect_case("conn-other", other, 1, "localhost:%u", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 403 && !ok, "CONNECT to an unlisted host is refused");
+    const char* wrongport[] = {"localhost:1"};
+    st = connect_case("conn-port", wrongport, 1, "localhost:%u", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 403 && !ok, "CONNECT to a port the policy does not name is refused");
+    st = connect_case("conn-bad", named_h, 1, "localhost", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 400 && !ok, "CONNECT without a port is a bad request");
+
+    // The broker will not dial the host's own network, whatever the policy says.
+    unsetenv("SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM");
+    memset(&up, 0, sizeof(up));
+    snprintf(up.response, sizeof(up.response),
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    up.listen_fd = upstream_listen(&port);
+    snprintf(host, sizeof(host), "localhost:%u", port);
+    snprintf(greq, sizeof(greq),
+             "GET http://%s/ HTTP/1.1\r\nHost: x\r\nProxy-Authorization: %s\r\n\r\n", host, auth);
+    pthread_t uth;
+    pthread_create(&uth, NULL, upstream_thread, &up);
+    st = policy_raw("ssrf", named, 1, greq, NULL, resp, sizeof(resp));
+    CHECK(st == 403 && strstr(resp, "Upstream address not permitted"),
+          "a named host resolving to loopback is refused (relay)");
+    shutdown(up.listen_fd, SHUT_RDWR);
+    pthread_join(uth, NULL);
+    close(up.listen_fd);
+    st = connect_case("ssrf-conn", named_h, 1, "localhost:%u", &ok, resp, sizeof(resp), &echoed);
+    CHECK(st == 403 && !ok, "...and for CONNECT");
+    setenv("SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM", "1", 1);
+    CHECK(broker_private_upstream_allowed(), "the operator can opt in");
+
+    char mb[8192];
+    int n = broker_metrics_render(mb, sizeof(mb));
+    CHECK(n > 0 && strstr(mb, "decision=\"denied_address\"") &&
+              strstr(mb, "broker_relayed_bytes_total{direction=\"to_guest\"}"),
+          "address denials and relayed bytes are exported");
+    CHECK(strstr(mb, "{decision=\"denied_address\"} 0\n") == NULL, "denied_address counted");
+    CHECK(strstr(mb, "{direction=\"to_guest\"} 0\n") == NULL, "bytes counted");
+    report("proxy_mode", b);
+}
+
 
 static void test_denied(void) {
     int b = g_fail;
@@ -1063,6 +1380,8 @@ static void test_bad_request(void) {
 int main(void) {
     signal(SIGPIPE, SIG_IGN);
     setenv("SANDBOX_BROKER_UPSTREAM_SCHEME", "http", 1);
+    // The mock upstreams are on loopback, which the broker refuses by default.
+    setenv("SANDBOX_BROKER_ALLOW_PRIVATE_UPSTREAM", "1", 1);
 
     char tmpl[] = "/tmp/sbtest-broker-XXXXXX";
     char* d = mkdtemp(tmpl);
@@ -1083,6 +1402,8 @@ int main(void) {
     test_stream_large();
     test_body_limits();
     test_egress_policy();
+    test_proxy_helpers();
+    test_proxy_mode();
     test_denied();
     test_bad_token();
     test_missing_token();
