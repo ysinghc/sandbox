@@ -294,11 +294,7 @@ static int gsh(sandbox_handle_t* h, const char* script, char* out, size_t cap) {
     return rc;
 }
 
-static void test_guest_network(const sandbox_spec_t* base) {
-    if (system("ip addr add " UP_ADDR "/32 dev lo") != 0) {
-        printf("SKIP guest network: cannot alias " UP_ADDR " onto lo\n");
-        return;
-    }
+static void guest_network_run(const sandbox_spec_t* base) {
     char creds[PATH_MAX];
     snprintf(creds, sizeof(creds), "/tmp/sbtest-creds-%d.conf", (int)getpid());
     FILE* cf = fopen(creds, "w");
@@ -353,10 +349,14 @@ static void test_guest_network(const sandbox_spec_t* base) {
     sp.egress_allow = allow;
     sandbox_handle_t* h = NULL;
     CHECK(sandbox_create(&sp, &h) == SANDBOX_OK && h != NULL, "net: create with a policy");
-    if (!h) return;
+    if (!h) {
+        unlink(creds);
+        return;
+    }
     if (gsh(h, "command -v curl >/dev/null", NULL, 0) != 0) {
         printf("SKIP guest network: no curl in this image (the Debian image runs it)\n");
         sandbox_destroy(h);
+        unlink(creds);
         return;
     }
     const char* token = sandbox_handle_token(h);
@@ -470,8 +470,21 @@ static void test_guest_network(const sandbox_spec_t* base) {
         }
     }
 
-    system("ip addr del " UP_ADDR "/32 dev lo");
     unlink(creds);
+}
+
+// The alias belongs to this test alone, so it is added idempotently ("replace":
+// a leftover from an earlier run or leg must not turn into a skip) and removed
+// whatever way the run ends -- an early skip used to leave it behind and break
+// the next leg.
+static void test_guest_network(const sandbox_spec_t* base) {
+    if (system("ip addr replace " UP_ADDR "/32 dev lo") != 0) {
+        printf("SKIP guest network: cannot alias " UP_ADDR " onto lo\n");
+        return;
+    }
+    guest_network_run(base);
+    if (system("ip addr del " UP_ADDR "/32 dev lo") != 0)
+        fprintf(stderr, "[test] warning: could not remove the " UP_ADDR " alias from lo\n");
 }
 
 int main(void) {
