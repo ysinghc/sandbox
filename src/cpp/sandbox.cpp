@@ -43,6 +43,11 @@ sandbox_spec_t Spec::to_c_struct() const {
     for (const auto& kv : env_vars_) env_ptrs_.push_back(kv.c_str());
     env_ptrs_.push_back(nullptr);
     spec.env_vars = env_ptrs_.data();
+    egress_ptrs_.clear();
+    for (const auto& e : egress_) egress_ptrs_.push_back(e.c_str());
+    egress_ptrs_.push_back(nullptr);
+    spec.egress_allow = egress_ptrs_.data();
+    spec.egress_deny_all = egress_deny_all_ ? 1 : 0;
     return spec;
 }
 

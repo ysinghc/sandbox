@@ -73,6 +73,7 @@ add_library(sandbox SHARED
     src/cgroup.c
     src/log.c
     src/lifecycle.c
+    src/egress_policy.c
     src/telemetry.c
     src/guest_rpc_client.c
     src/ipc_guest.c
@@ -131,6 +132,7 @@ add_library(sandbox_broker_core STATIC
     src/broker/http.c
     src/broker/credentials.c
     src/broker/core.c
+    src/egress_policy.c
     src/log.c
 )
 target_include_directories(sandbox_broker_core PUBLIC include)

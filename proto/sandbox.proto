@@ -42,6 +42,10 @@ message CreateRequest {
   // #23: persistent session workspace. Empty = ephemeral (default).
   string session_key = 6;
   uint32 ttl_seconds = 7;  // 0 = platform default
+  // #26: per-session egress policy. Empty list + !deny_all = the daemon-wide
+  // policy. Entries: "host", "host:port", "*.suffix[:port]".
+  repeated string egress_allow = 8;
+  bool egress_deny_all = 9;
 }
 
 message DestroyRequest {

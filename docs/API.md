@@ -30,6 +30,8 @@ typedef struct {
     uint32_t    pool_wait_ms;   // max wait when the pool is empty (0 = fail fast)
     const char* session_key;    // persistent /workspace volume; NULL = ephemeral
     uint32_t    ttl_seconds;    // volume lifetime; 0 = platform default (7 days)
+    const char** egress_allow;  // #26: NULL-terminated hosts this sandbox may reach; NULL = daemon default
+    int         egress_deny_all; // #26: 1 = may reach nothing
 } sandbox_spec_t;
 
 **Zero-initialise it** (`sandbox_spec_t spec = {0};`) and then set the fields you
@@ -189,6 +191,7 @@ sb->pause();
 ```
 sandbox-cli run    --template NAME [--socket PATH] [--memory MiB] [--vcpus N] [--wait MS]
                    [--session-key KEY] [--exec SCRIPT]...
+                   [--egress HOST[:PORT]]... [--no-egress]
 sandbox-cli verify --template NAME
 ```
 
@@ -202,8 +205,56 @@ sandbox-cli verify --template NAME
   exits with the first non-zero exit status (`1` for an API error). A sandbox
   dies with its session, so commands for a given sandbox must come from the
   process that created it; use `--session-key` to carry `/workspace` across runs.
+- `run --egress HOST` (repeatable, up to 16) limits the sandbox to those
+  destinations; `--no-egress` gives it none. Without either, the daemon-wide
+  policy applies. See [Egress policy](#egress-policy-26).
 - `verify` runs the snapshot integrity check (`§10.10`) for a template and
   returns `0` if the manifest and files match, `1` otherwise.
+
+### Egress policy (#26)
+
+A sandbox reaches the outside world only through the credential broker, and
+what the broker will relay is the **egress policy** copied into that sandbox's
+session token when it is created. It cannot be changed afterwards and nothing in
+the guest can widen it.
+
+| `egress_allow` / `egress_deny_all` | Effective policy |
+|---|---|
+| unset / 0 | the daemon-wide `allowed_services` list (the default, as before #26) |
+| entries / 0 | exactly those entries |
+| unset / 1 | none: the broker refuses every request from this sandbox |
+| entries / 1 | error (`SANDBOX_ERR_INVALID_SPEC`): contradictory |
+
+Entries are `host`, `host:port` or `*.suffix[:port]` (case-insensitive;
+`*.example.org` matches subdomains, not `example.org` itself). An entry with no
+port matches any port; a request with no port counts as `443`. The daemon-wide
+list is a **ceiling**: every entry a session asks for must be covered by it, so a
+developer can narrow what the operator allows but never widen it. A request that
+is not covered, is malformed, or lists more than 64 entries fails the create with
+`SANDBOX_ERR_INVALID_SPEC` rather than being silently trimmed.
+
+A destination named in the policy may be relayed **without** a stored credential,
+which is what package indexes need. The daemon-wide `*` never earns that: with
+no entry in `credentials.conf` such a request is still refused (`403`). Where a
+credential *is* on file it is injected as before.
+
+Every decision is logged by the broker as one JSON line carrying `sandbox_id`,
+`host`, `decision` (`allowed_credentialed`, `allowed_anonymous`,
+`denied_policy`, `denied_unconfigured`), the status and the latency, and counted
+in `broker_egress_decisions_total{decision=...}` on the broker's `/metrics`.
+Refused requests are logged too: they are the interesting ones.
+
+```c
+const char* hosts[] = { "pypi.org", "*.pythonhosted.org", NULL };
+sandbox_spec_t spec = { .memory_mib = 256, .vcpu_count = 1,
+                        .template_name = "debian", .egress_allow = hosts };
+```
+
+```cpp
+engine.create(sandbox::Spec(256, "debian").allow_egress("pypi.org")
+                                          .allow_egress("*.pythonhosted.org"));
+engine.create(sandbox::Spec(256, "debian").no_egress());
+```
 
 ## Determinism
 

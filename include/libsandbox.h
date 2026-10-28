@@ -31,6 +31,17 @@ typedef struct {
     // 0 selects the platform default (7 days); requests are clamped to the
     // platform maximum (default 30 days). Ignored when session_key is NULL.
     uint32_t ttl_seconds;
+    // #26: what this sandbox may reach through the broker. NULL (or an empty
+    // array) with egress_deny_all == 0 keeps the daemon-wide policy. Otherwise a
+    // NULL-terminated array of "host", "host:port" or "*.suffix[:port]" entries;
+    // each must be allowed by the daemon's own list, or sandbox_create fails
+    // with SANDBOX_ERR_INVALID_SPEC -- a policy is never silently trimmed. A
+    // named destination may be relayed without a stored credential (package
+    // indexes), which the daemon-wide "*" never allows. egress_deny_all gives the
+    // sandbox no reachable destination at all; combining it with entries is an
+    // error. The policy is fixed at creation; nothing in the guest can widen it.
+    const char** egress_allow;
+    int egress_deny_all;
 } sandbox_spec_t;
 
 // Error codes

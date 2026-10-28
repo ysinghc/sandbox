@@ -29,7 +29,7 @@ integrity before starting.
 | `pool_size` (alias: `target_size`) | `SANDBOX_POOL_SIZE` | `5` | Number of warm VMs kept ready. Must be `1..POOL_MAX_SIZE`. |
 | `max_queue_depth` | `SANDBOX_MAX_QUEUE_DEPTH` | pool default (`50`) | Max queued `Create` requests before back-pressure/`POOL_EXHAUSTED`. |
 | `pool_wait_timeout_ms` | `SANDBOX_POOL_WAIT_MS` | `0` | Server-side default wait for a warm VM when the pool is empty (`0` = use the request's value). |
-| `allowed_services` | `SANDBOX_ALLOWED_SERVICES` | *(empty — deny all)* | Comma-separated upstream host allow-list copied into every session token. |
+| `allowed_services` | `SANDBOX_ALLOWED_SERVICES` | *(empty — deny all)* | Comma-separated upstream host allow-list. Since #26 this is the **ceiling**: a session that names no policy gets exactly this list in its token, and a session that does name one may only narrow it (entries are `host`, `host:port`, `*.suffix[:port]`, or `*`). See [API.md](API.md#egress-policy-26). |
 | `allowed_uids` | `SANDBOX_ALLOWED_UIDS` | *(empty)* | Peer-uid allow-list for the engine socket (checked via `SO_PEERCRED`). Empty accepts any uid in the socket's group; `0` = root only. |
 | `jailer_uid` | `SANDBOX_JAILER_UID` | `65534` (nobody) | Unprivileged uid Firecracker runs as inside the jail. |
 | `jailer_gid` | `SANDBOX_JAILER_GID` | `65534` | Unprivileged gid inside the jail. |

@@ -56,6 +56,8 @@ static int64_t now_ms(void) {
 
 static grpc_server_t* g_gsrv;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
+#define CHECK_RC(got, want, msg) check((got) == (want), (msg))
+
 static int g_stop;  // atomic: read by helper threads, set by main
 static char g_dir[PATH_MAX], g_ws[PATH_MAX], g_uds[PATH_MAX], g_ipc[PATH_MAX];
 static int g_uds_fd = -1;
@@ -354,6 +356,48 @@ static void test_ownership_and_protocol(void) {
     close(fd);
 }
 
+// #26: the egress policy is settled in the daemon before anything is provisioned.
+// There is no pool here, so a policy the daemon accepts reaches the "pool not
+// configured" refusal (SANDBOX_ERR_INTERNAL) and one it rejects stops earlier
+// with INVALID_SPEC -- the two outcomes tell the cases apart.
+static sandbox_error_t create_with(const char** allow, int deny_all) {
+    sandbox_spec_t sp;
+    memset(&sp, 0, sizeof(sp));
+    sp.memory_mib = 128;
+    sp.vcpu_count = 1;
+    sp.egress_allow = allow;
+    sp.egress_deny_all = deny_all;
+    sandbox_handle_t* h = NULL;
+    sandbox_error_t rc = sandbox_create(&sp, &h);
+    if (h) sandbox_destroy(h);
+    return rc;
+}
+
+static void test_egress_policy(void) {
+    // The daemon-wide list is "pypi.org,*.pythonhosted.org" (set in main()).
+    CHECK_RC(create_with(NULL, 0), SANDBOX_ERR_INTERNAL, "egress: no policy inherits the daemon list");
+    const char* ok1[] = {"pypi.org", NULL};
+    CHECK_RC(create_with(ok1, 0), SANDBOX_ERR_INTERNAL, "egress: a listed host is accepted");
+    const char* ok2[] = {"files.pythonhosted.org:443", "pypi.org:443", NULL};
+    CHECK_RC(create_with(ok2, 0), SANDBOX_ERR_INTERNAL, "egress: narrower than the daemon list is accepted");
+    CHECK_RC(create_with(NULL, 1), SANDBOX_ERR_INTERNAL, "egress: deny-all is accepted");
+    const char* evil[] = {"evil.example", NULL};
+    CHECK_RC(create_with(evil, 0), SANDBOX_ERR_INVALID_SPEC, "egress: a host outside the daemon list is refused");
+    const char* mixed[] = {"pypi.org", "evil.example", NULL};
+    CHECK_RC(create_with(mixed, 0), SANDBOX_ERR_INVALID_SPEC, "egress: one bad entry refuses the whole policy");
+    const char* star[] = {"*", NULL};
+    CHECK_RC(create_with(star, 0), SANDBOX_ERR_INVALID_SPEC, "egress: a session cannot ask for '*'");
+    const char* wide[] = {"*.org", NULL};
+    CHECK_RC(create_with(wide, 0), SANDBOX_ERR_INVALID_SPEC, "egress: a wider wildcard than the daemon's is refused");
+    const char* junk[] = {"not a host", NULL};
+    CHECK_RC(create_with(junk, 0), SANDBOX_ERR_INVALID_SPEC, "egress: a malformed entry is refused");
+    CHECK_RC(create_with(ok1, 1), SANDBOX_ERR_INVALID_SPEC, "egress: deny-all plus entries is a contradiction");
+    const char* many[IPC_MAX_EGRESS + 2];
+    for (int i = 0; i < IPC_MAX_EGRESS + 1; i++) many[i] = "pypi.org";
+    many[IPC_MAX_EGRESS + 1] = NULL;
+    CHECK_RC(create_with(many, 0), SANDBOX_ERR_INVALID_SPEC, "egress: too many entries is refused client-side");
+}
+
 int main(void) {
     prctl(PR_SET_CHILD_SUBREAPER, 1);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -384,6 +428,7 @@ int main(void) {
     vm9->sandbox_id = 9; snprintf(vm9->vsock_uds, sizeof(vm9->vsock_uds), "%s/gone.sock", g_dir);
     lifecycle_track(vm7); lifecycle_track(vm8); lifecycle_track(vm9);
 
+    ipc_server_set_allowed_services("pypi.org,*.pythonhosted.org");
     pthread_create(&t_ipc, NULL, ipc_thread, NULL);
     for (int i = 0; i < 200 && access(g_ipc, F_OK) != 0; i++) usleep(10000);
 
@@ -400,6 +445,7 @@ int main(void) {
     test_list();
     test_concurrency_and_limits();
     test_ownership_and_protocol();
+    test_egress_policy();
 
     // Take the fake VM out of the registry *before* the session drops: the server
     // tears a dropped session's VMs down with the real vmm_destroy(), which must

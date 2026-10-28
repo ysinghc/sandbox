@@ -40,6 +40,19 @@ public:
         return *this;
     }
 
+    // #26: reach `host` (or "host:port", "*.suffix") through the broker. Calling
+    // this at all replaces the daemon-wide policy with the listed destinations;
+    // each must be allowed by the daemon or the create throws.
+    Spec& allow_egress(std::string host) {
+        egress_.push_back(std::move(host));
+        return *this;
+    }
+    // #26: no reachable destinations at all.
+    Spec& no_egress() {
+        egress_deny_all_ = true;
+        return *this;
+    }
+
     sandbox_spec_t to_c_struct() const;
 private:
     uint64_t memory_mib_;
@@ -49,6 +62,9 @@ private:
     uint32_t pool_wait_ms_;
     std::string session_key_;
     uint32_t ttl_seconds_ = 0;
+    std::vector<std::string> egress_;
+    bool egress_deny_all_ = false;
+    mutable std::vector<const char*> egress_ptrs_;
     // Stable backing store for the const char* array handed to the C API.
     mutable std::vector<const char*> env_ptrs_;
 };

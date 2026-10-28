@@ -61,6 +61,77 @@ int main(void) {
               strcmp(back.session_key, "sess-12") == 0,
           "strings survive round trip");
 
+    // --- #26 egress policy --------------------------------------------------
+    CHECK(back.n_egress == 0 && back.egress_deny_all == 0,
+          "no policy decodes as 'inherit the daemon default'");
+    uint8_t plain[IPC_FRAME_MAX];
+    size_t n_plain = 0;
+    CHECK(ipc_encode_request(&req, plain, sizeof(plain), &n_plain) == 0, "encode plain");
+    {
+        ipc_request_t pol = req;
+        pol.egress[0] = strdup("pypi.org");
+        pol.egress[1] = strdup("*.pythonhosted.org:443");
+        pol.egress[2] = NULL;
+        pol.n_egress = 2;
+        uint8_t pb[IPC_FRAME_MAX];
+        size_t pn = 0;
+        CHECK(ipc_encode_request(&pol, pb, sizeof(pb), &pn) == 0, "encode with egress");
+        CHECK(pn > n_plain, "a policy is actually on the wire");
+        ipc_request_t pback;
+        CHECK(ipc_decode_request(pb, pn, &pback) == 0, "decode with egress");
+        CHECK(pback.n_egress == 2 && strcmp(pback.egress[0], "pypi.org") == 0 &&
+                  strcmp(pback.egress[1], "*.pythonhosted.org:443") == 0 &&
+                  pback.egress[2] == NULL,
+              "egress entries survive, in order");
+        CHECK(pback.egress_deny_all == 0, "deny_all stays off");
+        ipc_request_clear(&pback);
+        free(pol.egress[0]);
+        free(pol.egress[1]);
+
+        ipc_request_t deny = req;
+        deny.egress_deny_all = 1;
+        CHECK(ipc_encode_request(&deny, pb, sizeof(pb), &pn) == 0, "encode deny_all");
+        CHECK(ipc_decode_request(pb, pn, &pback) == 0 && pback.egress_deny_all == 1 &&
+                  pback.n_egress == 0,
+              "deny_all survives");
+        ipc_request_clear(&pback);
+    }
+    {
+        // More entries than the server will hold is refused at decode, never
+        // truncated into a shorter (and different) policy.
+        ipc_request_t big = req;
+        for (int i = 0; i < IPC_MAX_EGRESS; i++) big.egress[i] = strdup("a.example");
+        big.egress[IPC_MAX_EGRESS] = NULL;
+        big.n_egress = IPC_MAX_EGRESS;
+        uint8_t bb[IPC_FRAME_MAX];
+        size_t bn = 0;
+        ipc_request_t bback;
+        CHECK(ipc_encode_request(&big, bb, sizeof(bb), &bn) == 0 &&
+                  ipc_decode_request(bb, bn, &bback) == 0 && bback.n_egress == IPC_MAX_EGRESS,
+              "the maximum policy round-trips");
+        ipc_request_clear(&bback);
+        // One more, hand-built on the wire: ClientMessage.create (field 1) holding
+        // IPC_MAX_EGRESS+1 CreateRequest.egress_allow (field 8) strings.
+        uint8_t wire[2048];
+        size_t wn = 0, inner = 0;
+        uint8_t body[1024];
+        for (int i = 0; i <= IPC_MAX_EGRESS; i++) {
+            body[inner++] = 0x42;  // field 8, length-delimited
+            body[inner++] = 9;
+            memcpy(body + inner, "a.example", 9);
+            inner += 9;
+        }
+        wire[wn++] = 0x0a;  // field 1, length-delimited
+        wire[wn++] = (uint8_t)((inner & 0x7f) | 0x80);
+        wire[wn++] = (uint8_t)(inner >> 7);
+        memcpy(wire + wn, body, inner);
+        wn += inner;
+        CHECK(ipc_decode_request(wire, wn, &bback) != 0,
+              "an over-long policy is refused, not truncated");
+        ipc_request_clear(&bback);
+        for (int i = 0; i < IPC_MAX_EGRESS; i++) free(big.egress[i]);
+    }
+
     // --- legacy compatibility: id 0 adds nothing to the wire ----------------
     req.request_id = 0;
     uint8_t legacy[IPC_FRAME_MAX];

@@ -668,6 +668,63 @@ int main(void) {
         int vrb = broker_validate_token(bfd, bad, &si_bad);
         CHECK(vrb == BROKER_VALIDATE_INVALID, "bad token rejected");
 
+        // --- #26 per-session egress policy: the token carries the policy this
+        // sandbox was created with, not the daemon-wide list. The daemon list is
+        // "api.example.com,*.internal". ---
+        {
+            sandbox_spec_t ps = spec;
+            ps.env_vars = NULL;
+            const char* narrow[] = {"api.example.com", NULL};
+            ps.egress_allow = narrow;
+            sandbox_handle_t* hp = NULL;
+            CHECK(sandbox_create(&ps, &hp) == SANDBOX_OK && hp != NULL,
+                  "egress: create with a narrowed policy");
+            session_info_t sp;
+            memset(&sp, 0, sizeof(sp));
+            if (hp && bfd >= 0 &&
+                broker_validate_token(bfd, sandbox_handle_token(hp), &sp) == BROKER_VALIDATE_OK) {
+                int cnt = 0;
+                while (sp.allowed_services && sp.allowed_services[cnt]) cnt++;
+                CHECK(cnt == 1 && strcmp(sp.allowed_services[0], "api.example.com") == 0,
+                      "egress: the token carries exactly the session's policy");
+                session_info_free(&sp);
+            } else {
+                CHECK(0, "egress: narrowed token validates");
+            }
+            if (hp) sandbox_destroy(hp);
+
+            ps.egress_allow = NULL;
+            ps.egress_deny_all = 1;
+            sandbox_handle_t* hd = NULL;
+            CHECK(sandbox_create(&ps, &hd) == SANDBOX_OK && hd != NULL,
+                  "egress: create with deny-all");
+            memset(&sp, 0, sizeof(sp));
+            if (hd && bfd >= 0 &&
+                broker_validate_token(bfd, sandbox_handle_token(hd), &sp) == BROKER_VALIDATE_OK) {
+                CHECK(sp.allowed_services && sp.allowed_services[0] == NULL,
+                      "egress: deny-all token has an empty list");
+                session_info_free(&sp);
+            } else {
+                CHECK(0, "egress: deny-all token validates");
+            }
+            if (hd) sandbox_destroy(hd);
+
+            // Wider than the daemon allows: refused, and nothing was provisioned.
+            const char* wide[] = {"evil.example", NULL};
+            ps.egress_deny_all = 0;
+            ps.egress_allow = wide;
+            sandbox_handle_t* hw = NULL;
+            CHECK(sandbox_create(&ps, &hw) == SANDBOX_ERR_INVALID_SPEC && hw == NULL,
+                  "egress: a policy wider than the daemon's is refused");
+            // A narrower entry under a ceiling wildcard is fine.
+            const char* under[] = {"db.internal:5432", NULL};
+            ps.egress_allow = under;
+            sandbox_handle_t* hu = NULL;
+            CHECK(sandbox_create(&ps, &hu) == SANDBOX_OK && hu != NULL,
+                  "egress: an entry under the daemon's wildcard is accepted");
+            if (hu) sandbox_destroy(hu);
+        }
+
         // --- pidfd VMM crash detection (§4.2): kill the VMM and confirm the
         // event loop reaps it, bumps the crash metric, revokes the token, and
         // stops reporting the sandbox as live. ---

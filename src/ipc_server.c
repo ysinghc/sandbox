@@ -16,6 +16,7 @@
 #include "ipc_server.h"
 
 #include "broker.h"       // broker-control wire constants (§5.8)
+#include "egress_policy.h"
 #include "ipc_codec.h"
 #include "ipc_guest.h"
 #include "ipc_internal.h"
@@ -89,6 +90,8 @@ typedef struct create_job {
     char session_key[IPC_MAX_SESSION_KEY];
     uint32_t ttl_seconds;
     char* env[IPC_MAX_ENV + 1];  // NULL-terminated
+    // #26: this sandbox's resolved egress policy (NULL-terminated, owned).
+    char** egress;
     struct create_job* next;
 } create_job_t;
 
@@ -340,7 +343,8 @@ static void hex_encode(const uint8_t* in, size_t n, char* out) {
 
 // Mint a token for sandbox_id; writes 64 lowercase hex chars to out_hex.
 // Returns 0 on success.
-static int token_issue(uint32_t sandbox_id, char out_hex[IPC_TOKEN_HEX_LEN + 1]) {
+static int token_issue(uint32_t sandbox_id, char* const* services,
+                       char out_hex[IPC_TOKEN_HEX_LEN + 1]) {
     token_entry_t* e = calloc(1, sizeof(*e));
     if (!e) return -1;
     if (getrandom(e->token, sizeof(e->token), 0) != (ssize_t)sizeof(e->token)) {
@@ -354,7 +358,10 @@ static int token_issue(uint32_t sandbox_id, char out_hex[IPC_TOKEN_HEX_LEN + 1])
     }
     e->sandbox_id = sandbox_id;
     pthread_mutex_lock(&g.tok_lock);
-    for (int i = 0; i < g.n_allowed; i++) e->services[i] = strdup(g.allowed[i]);
+    // #26: the policy resolved at Create time, not the daemon default: that is
+    // what makes it per-session. Bounded by egress_resolve (<= TOKEN_MAX_SERVICES).
+    for (int i = 0; services && services[i] && i < TOKEN_MAX_SERVICES; i++)
+        e->services[i] = strdup(services[i]);
     e->next = g.tokens;
     g.tokens = e;
     pthread_mutex_unlock(&g.tok_lock);
@@ -579,6 +586,7 @@ static void reply_error(int fd, uint64_t rid, sandbox_error_t code,
 static void free_job(create_job_t* j) {
     if (!j) return;
     for (int i = 0; j->env[i]; i++) free(j->env[i]);
+    egress_free(j->egress);
     free(j);
 }
 
@@ -717,7 +725,7 @@ static void* create_worker_fn(void* arg) {    (void)arg;
                          "\"sandbox_id\":%u", vm->sandbox_id);
                 }
             }
-            if (token_issue(vm->sandbox_id, r->token) < 0) {
+            if (token_issue(vm->sandbox_id, job->egress, r->token) < 0) {
                 r->code = SANDBOX_ERR_INTERNAL;  // loop destroys vm
                 r->vm = vm;
             } else {
@@ -781,27 +789,44 @@ static void submit_create(int fd, session_t* s, const ipc_request_t* req) {
                     "unknown template");
         return;
     }
+    // #26: settle the egress policy before any VM exists, so a bad one costs
+    // nothing and is reported to the caller, not discovered at first request.
+    char** egress = NULL;
+    int n_egress = 0;
+    if (egress_resolve(g.allowed, (const char* const*)req->egress, req->n_egress,
+                       req->egress_deny_all != 0, &egress, &n_egress) != 0) {
+        LOGF(LOG_WARN, "ipc_server", "egress_rejected", "\"entries\":%d,\"deny_all\":%s",
+             req->n_egress, req->egress_deny_all ? "true" : "false");
+        reply_error(fd, req->request_id, SANDBOX_ERR_INVALID_SPEC,
+                    "egress policy invalid or wider than the daemon allows");
+        return;
+    }
     if (!g.pool) {
+        egress_free(egress);
         reply_error(fd, req->request_id, SANDBOX_ERR_INTERNAL,
                     "pool not configured");
         return;
     }
     // §10.8 rate limiting: bound outstanding creates per session and per uid.
     if (s->n_outstanding >= g.per_session_max) {
+        egress_free(egress);
         reply_error(fd, req->request_id, SANDBOX_ERR_POOL_EXHAUSTED,
                     "too many concurrent creates");
         return;
     }
     if (uid_inflight_get(s->uid) >= g.per_uid_max) {
+        egress_free(egress);
         reply_error(fd, req->request_id, SANDBOX_ERR_POOL_EXHAUSTED,
                     "uid create limit reached");
         return;
     }
     create_job_t* j = build_job(req, s);
     if (!j) {
+        egress_free(egress);
         reply_error(fd, req->request_id, SANDBOX_ERR_INTERNAL, "out of memory");
         return;
     }
+    j->egress = egress;
     if (s->cq_tail) s->cq_tail->next = j;
     else s->cq_head = j;
     s->cq_tail = j;

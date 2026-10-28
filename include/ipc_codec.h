@@ -29,6 +29,7 @@ typedef enum {
 #define IPC_MAX_ENV 64
 #define IPC_MAX_TEMPLATE 128
 #define IPC_MAX_SESSION_KEY 128
+#define IPC_MAX_EGRESS 64  // == EGRESS_MAX_ENTRIES
 #define IPC_TOKEN_HEX_LEN 64
 #define IPC_MAX_ERRMSG 192
 
@@ -71,6 +72,11 @@ typedef struct {
     // #23: empty = ephemeral workspace. Non-empty = persistent session volume.
     char session_key[IPC_MAX_SESSION_KEY];
     uint32_t ttl_seconds;  // 0 = platform default
+    // #26: egress policy. Owned by the struct, NULL-terminated; an empty list
+    // with egress_deny_all == 0 means "the daemon-wide policy".
+    char* egress[IPC_MAX_EGRESS + 1];
+    int n_egress;
+    int egress_deny_all;
 
     // renew (#23/D5): seconds to add to session_key's deadline. 0 = default.
     uint32_t extra_seconds;

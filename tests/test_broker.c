@@ -817,6 +817,135 @@ static void test_body_limits(void) {
     report("body_limits", b);
 }
 
+// ---------------------------------------------------------------------------
+// #26 egress policy at the broker: what the token's list allows, what a named
+// destination may do without a credential, and that refusals are accounted.
+
+// One request through a fresh engine mock that hands out `allowed` as the
+// session's policy. With `upstream` non-NULL the upstream is live and gets the
+// connection; otherwise the request must be refused before any forward.
+static int policy_case(const char* tag, const char* const* allowed, int n_allowed,
+                       const char* host_hdr, mock_upstream_t* upstream, char* resp,
+                       size_t cap) {
+    char epath[512];
+    snprintf(epath, sizeof(epath), "%s/engine-%s.sock", g_dir, tag);
+    mock_engine_t eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.expected = TOKEN_BYTES;
+    eng.n_allowed = n_allowed;
+    for (int i = 0; i < n_allowed && i < 4; i++) eng.allowed[i] = allowed[i];
+    eng.listen_fd = engine_listen(epath);
+    CHECK(eng.listen_fd >= 0, "engine listen");
+    pthread_t eth;
+    pthread_create(&eth, NULL, engine_thread, &eng);
+    eng.client_fd_fd = broker_engine_connect(epath);
+    CHECK(eng.client_fd_fd >= 0, "engine connect");
+
+    char greq[1024];
+    snprintf(greq, sizeof(greq),
+             "GET /simple/ HTTP/1.1\r\nHost: %s\r\n"
+             "X-Sandbox-Token: " TOKEN_HEX "\r\n\r\n",
+             host_hdr);
+    int st;
+    if (upstream) {
+        st = proxy_once(&eng, upstream, greq, resp, cap, "hello");
+    } else {
+        int sv[2];
+        CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+        write_full(sv[1], greq, strlen(greq));
+        credential_store_t* creds = credentials_load(g_creds);
+        st = broker_handle_request(sv[0], creds, eng.client_fd_fd);
+        read_response(sv[1], resp, cap, "\r\n\r\n");
+        credentials_free(creds);
+        close(sv[0]);
+        close(sv[1]);
+    }
+    close(eng.client_fd_fd);
+    pthread_join(eth, NULL);
+    close(eng.listen_fd);
+    unlink(epath);
+    return st;
+}
+
+static void test_egress_policy(void) {
+    int b = g_fail;
+    char resp[2048], host[64];
+    uint16_t port = 0;
+    mock_upstream_t up;
+
+    // A destination the developer named, with no credential on file: relayed,
+    // and nothing is injected (a package index has no secret).
+    memset(&up, 0, sizeof(up));
+    snprintf(up.response, sizeof(up.response),
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    up.listen_fd = upstream_listen(&port);
+    snprintf(host, sizeof(host), "localhost:%u", port);
+    const char* named[] = {"localhost"};
+    int st = policy_case("named", named, 1, host, &up, resp, sizeof(resp));
+    CHECK(st == 200, "named host without a credential is relayed");
+    CHECK(strstr(resp, "hello") != NULL, "its response reaches the guest");
+    CHECK(strstr(up.request, "GET /simple/ HTTP/1.1") != NULL, "request forwarded");
+    CHECK(strstr(up.request, "Authorization") == NULL, "no credential is made up");
+    CHECK(strstr(up.request, "X-Sandbox-Token") == NULL, "session token never leaves");
+    close(up.listen_fd);
+
+    // A named host that does have a credential still gets it.
+    memset(&up, 0, sizeof(up));
+    snprintf(up.response, sizeof(up.response),
+             "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello");
+    up.listen_fd = upstream_listen(&port);
+    snprintf(host, sizeof(host), "127.0.0.1:%u", port);
+    const char* cred_named[] = {"127.0.0.1"};
+    st = policy_case("cred", cred_named, 1, host, &up, resp, sizeof(resp));
+    CHECK(st == 200 && strstr(up.request, "Authorization: Bearer test-secret") != NULL,
+          "a configured credential is still injected");
+    close(up.listen_fd);
+
+    // A malformed entry in the list allows nothing (and does not poison the rest).
+    snprintf(host, sizeof(host), "localhost:%u", 9);
+    const char* wild[] = {"*.nope.test", "localhost:0000"};
+    st = policy_case("bad-entry", wild, 2, host, NULL, resp, sizeof(resp));
+    CHECK(st == 403, "malformed entries allow nothing");
+
+    // Default deny: not on the list.
+    const char* other[] = {"pypi.org"};
+    st = policy_case("deny", other, 1, "evil.example", NULL, resp, sizeof(resp));
+    CHECK(st == 403 && strstr(resp, "Service not allowed") != NULL, "unlisted host -> 403");
+
+    // Empty policy (deny-all): nothing is reachable, not even a credentialed host.
+    st = policy_case("none", NULL, 0, "127.0.0.1:9", NULL, resp, sizeof(resp));
+    CHECK(st == 403 && strstr(resp, "Service not allowed") != NULL, "empty policy -> 403");
+
+    // Port is part of the policy.
+    const char* ported[] = {"localhost:1"};
+    st = policy_case("port", ported, 1, "localhost:2", NULL, resp, sizeof(resp));
+    CHECK(st == 403, "wrong port -> 403");
+    // No port in the request means 443, so a :80 entry does not match it.
+    const char* p80[] = {"localhost:80"};
+    st = policy_case("p80", p80, 1, "localhost", NULL, resp, sizeof(resp));
+    CHECK(st == 403, "implicit 443 does not match a :80 entry");
+
+    // The daemon-wide "*" is a ceiling, not a statement of intent: with no
+    // credential on file the request is refused, as before #26.
+    const char* star[] = {"*"};
+    st = policy_case("star", star, 1, "localhost:9", NULL, resp, sizeof(resp));
+    CHECK(st == 403 && strstr(resp, "Service not configured") != NULL,
+          "star without a credential is not relayed");
+
+    // Every decision is counted.
+    char mb[8192];
+    int n = broker_metrics_render(mb, sizeof(mb));
+    CHECK(n > 0 && strstr(mb, "broker_egress_decisions_total{decision=\"allowed\"}") &&
+              strstr(mb, "broker_egress_decisions_total{decision=\"denied_policy\"}") &&
+              strstr(mb, "broker_egress_decisions_total{decision=\"denied_unconfigured\"}"),
+          "egress decisions are exported");
+    CHECK(strstr(mb, "{decision=\"allowed\"} 0\n") == NULL, "allowed counter moved");
+    CHECK(strstr(mb, "{decision=\"denied_policy\"} 0\n") == NULL, "denied counter moved");
+    CHECK(strstr(mb, "{decision=\"denied_unconfigured\"} 0\n") == NULL,
+          "unconfigured counter moved");
+    report("egress_policy", b);
+}
+
 static void test_denied(void) {
     int b = g_fail;
     char epath[512];
@@ -953,6 +1082,7 @@ int main(void) {
     test_chunked();
     test_stream_large();
     test_body_limits();
+    test_egress_policy();
     test_denied();
     test_bad_token();
     test_missing_token();

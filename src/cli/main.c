@@ -22,6 +22,9 @@ static void usage(void) {
     printf("usage:\n"
            "  sandbox-cli run --template NAME [--socket PATH] [--memory MIB] "
            "[--vcpus N] [--wait MS] [--session-key KEY] [--exec SCRIPT]...\n"
+           "                        [--egress HOST[:PORT]]... [--no-egress]\n"
+           "      --egress: this sandbox may reach only these hosts (\"*.suffix\" ok);\n"
+           "      --no-egress: it may reach none. Default: the daemon-wide policy.\n"
            "      with --exec: run each SCRIPT (sh -c) in the new sandbox, print its\n"
            "      output, then destroy the sandbox and exit with the first non-zero\n"
            "      exit status (or 0). Without it, hold the sandbox until SIGINT.\n"
@@ -39,6 +42,9 @@ int main(int argc, char** argv) {
     uint32_t extra_seconds = 0;
     const char* exec_scripts[16];
     int n_exec = 0;
+    const char* egress[17];
+    int n_egress = 0;
+    int egress_deny_all = 0;
     int do_run = 0;
     int do_verify = 0;
     int do_renew = 0;
@@ -59,6 +65,14 @@ int main(int argc, char** argv) {
             }
             exec_scripts[n_exec++] = argv[++i];
         }
+        else if (strcmp(a, "--egress") == 0 && v) {
+            if (n_egress >= 16) {
+                fprintf(stderr, "at most 16 --egress entries\n");
+                return 2;
+            }
+            egress[n_egress++] = argv[++i];
+        }
+        else if (strcmp(a, "--no-egress") == 0) egress_deny_all = 1;
         else if (strcmp(a, "--extra") == 0 && v)
             extra_seconds = (uint32_t)strtoul(argv[++i], NULL, 10);
         else if (strcmp(a, "--memory") == 0 && v) memory_mib = strtoull(argv[++i], NULL, 10);
@@ -126,6 +140,9 @@ int main(int argc, char** argv) {
     spec.env_vars = NULL;
     spec.pool_wait_ms = wait_ms;
     spec.session_key = session_key;
+    egress[n_egress] = NULL;
+    spec.egress_allow = egress;
+    spec.egress_deny_all = egress_deny_all;
 
     sandbox_handle_t* h = NULL;
     rc = sandbox_create(&spec, &h);

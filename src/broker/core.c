@@ -6,6 +6,7 @@
 #define _GNU_SOURCE
 
 #include "broker.h"
+#include "egress_policy.h"
 #include "log.h"
 
 #include <arpa/inet.h>
@@ -94,19 +95,6 @@ static int tls_verify_enabled(void) {
     return !(v && strcmp(v, "0") == 0);
 }
 
-// Copy host with any ":port" removed and ASCII case folded.
-static void host_key(const char* host, char* out, size_t n) {
-    size_t i = 0;
-    if (!host) {
-        out[0] = '\0';
-        return;
-    }
-    for (const char* p = host; *p && i + 1 < n; p++) {
-        if (*p == ':') break;
-        out[i++] = (char)tolower((unsigned char)*p);
-    }
-    out[i] = '\0';
-}
 
 // ---------------------------------------------------------------------------
 // Token validation
@@ -213,16 +201,7 @@ fail:
 // ---------------------------------------------------------------------------
 
 bool broker_host_allowed(char* const* allowed_services, const char* host) {
-    if (!host || !allowed_services) return false;
-    char key[256];
-    host_key(host, key, sizeof(key));
-    if (key[0] == '\0') return false;
-    for (char* const* p = allowed_services; *p; p++) {
-        char ent[256];
-        host_key(*p, ent, sizeof(ent));
-        if (strcmp(ent, "*") == 0 || strcmp(ent, key) == 0) return true;
-    }
-    return false;
+    return egress_match(allowed_services, host, NULL);
 }
 
 // ---------------------------------------------------------------------------
@@ -520,6 +499,8 @@ static int recv_crlf_line(int fd, char* line, size_t cap) {
 // ---------------------------------------------------------------------------
 
 static atomic_long g_req_2xx = 0, g_req_4xx = 0, g_req_5xx = 0;
+// #26: what the egress policy decided, independent of how the upstream answered.
+static atomic_long g_egress_allowed = 0, g_egress_denied = 0, g_egress_unconfigured = 0;
 static atomic_ulong g_up_lat_count = 0, g_up_lat_sum_ms = 0;
 #define BROKER_LAT_BUCKETS 11
 static const double g_lat_bounds[BROKER_LAT_BUCKETS] = {
@@ -555,6 +536,13 @@ int broker_metrics_render(char* buf, int cap) {
     EMIT("broker_requests_total{status=\"2xx\"} %ld\n", atomic_load(&g_req_2xx));
     EMIT("broker_requests_total{status=\"4xx\"} %ld\n", atomic_load(&g_req_4xx));
     EMIT("broker_requests_total{status=\"5xx\"} %ld\n", atomic_load(&g_req_5xx));
+    EMIT("# TYPE broker_egress_decisions_total counter\n");
+    EMIT("broker_egress_decisions_total{decision=\"allowed\"} %ld\n",
+         atomic_load(&g_egress_allowed));
+    EMIT("broker_egress_decisions_total{decision=\"denied_policy\"} %ld\n",
+         atomic_load(&g_egress_denied));
+    EMIT("broker_egress_decisions_total{decision=\"denied_unconfigured\"} %ld\n",
+         atomic_load(&g_egress_unconfigured));
     EMIT("# TYPE broker_upstream_latency_seconds histogram\n");
     for (int i = 0; i < BROKER_LAT_BUCKETS; i++) {
         EMIT("broker_upstream_latency_seconds_bucket{le=\"%g\"} %ld\n",
@@ -595,7 +583,8 @@ int broker_metrics_serve(int listen_fd) {
     }
 }
 
-static void log_request(uint32_t sandbox_id, const char* host, int status, long ms) {
+static void log_request(uint32_t sandbox_id, const char* host, int status, long ms,
+                        const char* decision) {
     char safe[256];
     size_t j = 0;
     for (const char* p = host ? host : ""; *p && j + 1 < sizeof(safe); p++) {
@@ -606,8 +595,9 @@ static void log_request(uint32_t sandbox_id, const char* host, int status, long 
     int level = (status >= 500) ? LOG_ERROR
                                : (status >= 400 ? LOG_WARN : LOG_INFO);
     LOGF(level, "broker", "proxy",
-         "\"sandbox_id\":%u,\"host\":\"%s\",\"status\":%d,\"latency_ms\":%ld",
-         sandbox_id, safe, status, ms);
+         "\"sandbox_id\":%u,\"host\":\"%s\",\"decision\":\"%s\",\"status\":%d,"
+         "\"latency_ms\":%ld",
+         sandbox_id, safe, decision, status, ms);
 }
 
 static long elapsed_ms(const struct timespec* a, const struct timespec* b) {
@@ -658,7 +648,12 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
         free(req);
         return 400;
     }
-    if (!broker_host_allowed(session.allowed_services, host)) {
+    bool via_named = false;
+    if (!egress_match(session.allowed_services, host, &via_named)) {
+        // Audited like any request: what a sandbox tried to reach and was
+        // refused is the part of the log that matters most.
+        atomic_fetch_add(&g_egress_denied, 1);
+        log_request(session.sandbox_id, host, 403, 0, "denied_policy");
         session_info_free(&session);
         send_http_error(client_fd, 403, "Service not allowed");
         free(req);
@@ -666,17 +661,24 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
     }
 
     // 4. Real credential for this upstream.
+    // A destination the developer named in the session's policy may be relayed
+    // without one (a package index has no secret to inject). The daemon-wide "*"
+    // never earns that: reaching an arbitrary host unauthenticated was not
+    // something anyone asked for.
     const char* real_cred = credential_store_lookup(creds, host);
-    if (!real_cred) {
+    if (!real_cred && !via_named) {
+        atomic_fetch_add(&g_egress_unconfigured, 1);
+        log_request(session.sandbox_id, host, 403, 0, "denied_unconfigured");
         session_info_free(&session);
         send_http_error(client_fd, 403, "Service not configured");
         free(req);
         return 403;
     }
+    atomic_fetch_add(&g_egress_allowed, 1);
 
-    // 5. Strip the session token; inject the real credential.
+    // 5. Strip the session token; inject the real credential when there is one.
     http_remove_header(req, "X-Sandbox-Token");
-    http_set_header(req, "Authorization", real_cred);
+    if (real_cred) http_set_header(req, "Authorization", real_cred);
 
     // 6. Forward upstream. The request body (Content-Length or chunked) streams
     // from the guest socket straight through; nothing is buffered.
@@ -697,7 +699,7 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
         send_http_error(client_fd, 502, "Upstream unreachable");
         status = 502;
     }
-    log_request(session.sandbox_id, host, status, ms);
+    log_request(session.sandbox_id, host, status, ms, real_cred ? "allowed_credentialed" : "allowed_anonymous");
     session_info_free(&session);
     free(req);
     return status;

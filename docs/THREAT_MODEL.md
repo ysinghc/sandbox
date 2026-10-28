@@ -69,6 +69,7 @@ Three boundaries matter:
 | T6 | Guest reaches the internet directly | nft drops all egress except the host broker; no NAT (`src/network_manager.c`) | `tests/test_network.c` (root) |
 | T7 | Guest reads an upstream credential | credentials live only in the broker; the guest sees just its session token | by design |
 | T8 | Local user reads `credentials.conf` | broker now refuses a group/world-readable or foreign-owned file (#3) | `tests/test_broker.c` |
+| T8a | Guest widens its own egress policy | the policy is fixed into the session token at Create by the developer's process and validated against the daemon-wide ceiling; the guest only ever holds the token, and the broker re-reads the list for it on every request (#26) | `tests/test_egress.c`, `tests/test_broker.c`, `tests/test_ipc_guest.c` |
 | T9 | Upstream TLS interception / MITM | `CURLOPT_SSL_VERIFYPEER=1`, `VERIFYHOST=2` by default (`src/broker/core.c:343-345`); off only via `SANDBOX_BROKER_TLS_VERIFY=0` | default-safe |
 | T10 | A guest forges host→guest control traffic on vsock :5001 | the agent accepts only a peer whose vsock CID is `VMADDR_CID_HOST`; anything else is closed and logged (`include/vsock_peer.h`, `scripts/sandbox-agent.c`). A guest cannot forge CID 2: `connect()` to it is routed out to the host, never back to the guest's listener | fixed (#10): host test with a real loopback peer + in-guest `cid=2` assertion |
 | T11 | Token guessing | 32 bytes from `getrandom()`, `/dev/urandom` only as fallback (`src/ipc_server.c:290`) | adequate |

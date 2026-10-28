@@ -299,6 +299,20 @@ sandbox_error_t sandbox_create(const sandbox_spec_t* spec,
     snprintf(req.session_key, sizeof(req.session_key), "%s",
              spec->session_key ? spec->session_key : "");
     req.ttl_seconds = spec->ttl_seconds;
+    // #26: an entry we cannot carry is an error, never a shorter policy.
+    for (int i = 0; spec->egress_allow && spec->egress_allow[i]; i++) {
+        if (i >= IPC_MAX_EGRESS) {
+            ipc_request_clear(&req);
+            return SANDBOX_ERR_INVALID_SPEC;
+        }
+        req.egress[i] = strdup(spec->egress_allow[i]);
+        if (!req.egress[i]) {
+            ipc_request_clear(&req);
+            return SANDBOX_ERR_INTERNAL;
+        }
+        req.n_egress++;
+    }
+    req.egress_deny_all = spec->egress_deny_all ? 1 : 0;
     for (int i = 0; spec->env_vars && spec->env_vars[i] && i < IPC_MAX_ENV; i++) {
         req.env_vars[i] = strdup(spec->env_vars[i]);
         if (!req.env_vars[i]) break;
