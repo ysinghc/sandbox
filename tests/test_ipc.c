@@ -462,7 +462,7 @@ static void guest_network_run(const sandbox_spec_t* base) {
         sandbox_handle_t* hi = NULL;
         CHECK(sandbox_create(&si, &hi) == SANDBOX_OK && hi != NULL, "net: create for the package index");
         if (hi) {
-            rc = gsh(hi, "curl -sS --max-time 45 -H 'Accept: application/vnd.pypi.simple.v1+json' https://pypi.org/simple/pip/ | head -c 300", out, sizeof(out));
+            rc = gsh(hi, "curl -sS --max-time 45 -H 'Accept: application/vnd.pypi.simple.v1+json' https://pypi.org/simple/pip/ | grep -o '\"name\":\"pip\"' | head -1", out, sizeof(out));
             CHECK(rc == 0 && strstr(out, "\"name\":\"pip\"") != NULL, "net: pypi.org simple index through the broker");
             gsh(hi, "curl -s -o /dev/null -w '%{http_code}' --max-time 20 -p https://example.com/", out, sizeof(out));
             CHECK(strcmp(out, "000") == 0 || strcmp(out, "403") == 0, "net: a host outside the policy is refused");
