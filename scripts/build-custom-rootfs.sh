@@ -31,7 +31,16 @@ mkdir -p "$(dirname "$ROOTFS_OUT")"
 # Best effort: without network we fall back to whatever busybox is installed,
 # which must be statically linked (the rootfs ships no libc) -- verified below.
 log "Installing busybox-static..."
-apt-get install -y --no-install-recommends busybox-static 2>/dev/null | tail -3
+# Only ask apt when no static busybox is already here, and never let a failed
+# apt abort the build: the check below is what decides whether the binary is
+# usable. (Under `set -o pipefail` the old `apt-get ... | tail` exited 100 the
+# moment another apt/dpkg held the lock -- on a self-hosted runner that is a
+# routine `apt upgrade` -- even with busybox-static already installed.)
+if ! { which busybox-static || which busybox; } >/dev/null 2>&1 \
+   || ldd "$(which busybox-static 2>/dev/null || which busybox)" >/dev/null 2>&1; then
+    apt-get install -y --no-install-recommends busybox-static >/dev/null 2>&1 \
+        || log "  apt-get could not install busybox-static (lock held or offline); using what is installed"
+fi
 BUSYBOX=$(which busybox-static 2>/dev/null || which busybox)
 log "  busybox: $BUSYBOX ($($BUSYBOX --help 2>&1 | head -1))"
 if ldd "$BUSYBOX" >/dev/null 2>&1; then
