@@ -64,6 +64,7 @@ add_library(sandbox SHARED
     src/prefault_worker.c
     src/vmm_manager.c
     src/snapshot_manager.c
+    src/template_store.c
     src/network_manager.c
     src/jailer.c
     src/fs_util.c
@@ -147,6 +148,7 @@ target_link_libraries(sandbox-broker sandbox_broker_core)
 # CLI tool
 add_executable(sandbox-cli
     src/cli/main.c
+    src/cli/template_cmd.c
 )
 target_include_directories(sandbox-cli PRIVATE include)
 target_link_libraries(sandbox-cli sandbox++)

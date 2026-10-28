@@ -54,6 +54,9 @@ typedef struct {
     const char* workspace_path;
 } template_config_t;
 
+// The template store root (SANDBOX_SNAPSHOT_ROOT, else the installed default).
+const char* snapshot_root_dir(void);
+
 int create_snapshot_template(const char* template_name, const template_config_t* config);
 snap_manifest_t* build_manifest(const char* memory_path);
 int write_manifest(const char* path, const snap_manifest_t* manifest);

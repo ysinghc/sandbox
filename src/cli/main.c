@@ -12,6 +12,9 @@
 #include <string.h>
 #include <unistd.h>
 
+int template_main(int argc, char** argv);
+void template_usage(void);
+
 static volatile sig_atomic_t g_stop = 0;
 static void on_signal(int sig) {
     (void)sig;
@@ -30,9 +33,12 @@ static void usage(void) {
            "      exit status (or 0). Without it, hold the sandbox until SIGINT.\n"
            "  sandbox-cli renew --session-key KEY [--extra SECONDS] [--socket PATH]\n"
            "  sandbox-cli verify --template NAME\n");
+    template_usage();
 }
 
 int main(int argc, char** argv) {
+    if (argc >= 2 && strcmp(argv[1], "template") == 0)
+        return template_main(argc - 2, argv + 2);
     const char* socket_path = "/var/run/sandbox-engine/engine.sock";
     const char* template_name = NULL;
     const char* session_key = NULL;

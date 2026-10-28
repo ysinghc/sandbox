@@ -255,3 +255,10 @@ target_include_directories(test_cpp_wrap PRIVATE ../include)
 target_link_libraries(test_cpp_wrap sandbox++)
 add_test(NAME cpp_wrap COMMAND test_cpp_wrap)
 set_tests_properties(cpp_wrap PROPERTIES TIMEOUT 30)
+
+# #25: content-addressed template store (tiny fabricated templates; no root/KVM).
+add_executable(test_template_store test_template_store.c)
+target_include_directories(test_template_store PRIVATE ../include)
+target_link_libraries(test_template_store sandbox pthread)
+add_test(NAME template_store COMMAND test_template_store)
+set_tests_properties(template_store PROPERTIES TIMEOUT 120)

@@ -37,6 +37,8 @@ static const char* snapshot_root(void) {
     return (e && *e) ? e : SNAPSHOT_DEFAULT_ROOT;
 }
 
+const char* snapshot_root_dir(void) { return snapshot_root(); }
+
 static void template_paths(const char* template_name, char* final_dir, size_t n) {
     snprintf(final_dir, n, "%s/%s", snapshot_root(), template_name);
 }
