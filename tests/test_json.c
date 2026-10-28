@@ -49,7 +49,7 @@ int main(void) {
     char deep[64 + 1];
     memset(deep, '[', 40); deep[40] = '\0';
     CHECK(bad(deep), "nesting past the depth limit is refused");
-    char* many = malloc(JSON_MAX_ELEMS * 2 + 16);
+    char* many = malloc((JSON_MAX_ELEMS + 10) * 2 + 16);
     strcpy(many, "[");
     for (int k = 0; k < JSON_MAX_ELEMS + 10; k++) strcat(many, k ? ",1" : "1");
     strcat(many, "]");
