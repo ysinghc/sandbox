@@ -216,6 +216,264 @@ static void* conc_create(void* p) {
     return NULL;
 }
 
+
+// ---------------------------------------------------------------------------
+// #26 end to end: a real guest reaches an allow-listed host through the real
+// broker, and nothing else. The upstream is a mock on 192.0.2.1 (TEST-NET-1,
+// aliased onto the host's loopback for the test): an address the guest has no
+// route to and the host does, so a request can only get there via the broker.
+// Needs an image with curl (the Debian one); the busybox fixture skips.
+
+#include <arpa/inet.h>
+#include <curl/curl.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#define UP_ADDR "192.0.2.1"
+
+static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_up_last[4096];     // the last request the mock upstream received
+static int g_up_hits;
+static int g_up_fd = -1;
+
+static void* upstream_loop(void* arg) {
+    (void)arg;
+    for (;;) {
+        int fd = accept(g_up_fd, NULL, NULL);
+        if (fd < 0) return NULL;
+        char buf[4096];
+        size_t n = 0;
+        while (n + 1 < sizeof(buf)) {
+            ssize_t r = recv(fd, buf + n, sizeof(buf) - 1 - n, 0);
+            if (r <= 0) break;
+            n += (size_t)r;
+            buf[n] = '\0';
+            if (strstr(buf, "\r\n\r\n")) break;
+        }
+        pthread_mutex_lock(&g_up_mu);
+        memcpy(g_up_last, buf, n + 1);
+        g_up_hits++;
+        pthread_mutex_unlock(&g_up_mu);
+        char path[256] = "?";
+        sscanf(buf, "%*s %255s", path);
+        char body[400], resp[600];
+        int bl = snprintf(body, sizeof(body), "package-index-ok %s", path);
+        int rl = snprintf(resp, sizeof(resp),
+                          "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+                          bl, body);
+        send(fd, resp, (size_t)rl, MSG_NOSIGNAL);
+        close(fd);
+    }
+}
+
+static void* broker_loop(void* arg) {
+    (void)arg;
+    broker_run();
+    return NULL;
+}
+
+// Run `script` in the guest; returns its exit code (-100 if it did not run).
+static int gsh(sandbox_handle_t* h, const char* script, char* out, size_t cap) {
+    const char* av[2] = { script, NULL };
+    sandbox_exec_spec_t es;
+    memset(&es, 0, sizeof(es));
+    es.argv = av;
+    es.shell = true;
+    es.timeout_ms = 60000;
+    sandbox_exec_result_t er;
+    if (out && cap) out[0] = '\0';
+    if (sandbox_exec(h, &es, &er) != SANDBOX_OK) return -100;
+    if (out && cap) {
+        size_t n = er.out_len < cap - 1 ? er.out_len : cap - 1;
+        memcpy(out, er.out, n);
+        out[n] = '\0';
+        while (n && (out[n - 1] == '\n' || out[n - 1] == ' ')) out[--n] = '\0';
+    }
+    int rc = er.exit_code;
+    sandbox_exec_result_free(&er);
+    return rc;
+}
+
+static void test_guest_network(const sandbox_spec_t* base) {
+    if (system("ip addr add " UP_ADDR "/32 dev lo") != 0) {
+        printf("SKIP guest network: cannot alias " UP_ADDR " onto lo\n");
+        return;
+    }
+    char creds[PATH_MAX];
+    snprintf(creds, sizeof(creds), "/tmp/sbtest-creds-%d.conf", (int)getpid());
+    FILE* cf = fopen(creds, "w");
+    if (cf) { fputs("# none: package indexes need no credential\n", cf); fclose(cf); }
+    chmod(creds, 0600);
+
+    // The broker, in this process, against this daemon's own token authority.
+    setenv("SANDBOX_BROKER_CONTROL", g_bc_sock, 1);
+    setenv("SANDBOX_BROKER_CREDENTIALS", creds, 1);
+    setenv("SANDBOX_BROKER_UPSTREAM_SCHEME", "http", 1);  // the mock speaks plain HTTP
+    char listen_addr[64];
+    snprintf(listen_addr, sizeof(listen_addr), "0.0.0.0:%d", broker_port());
+    setenv("SANDBOX_BROKER_LISTEN", listen_addr, 1);
+    setenv("SANDBOX_BROKER_TUNNEL_IDLE_S", "20", 1);
+    // broker_run() drops to nobody when started as root, and that would drop this
+    // whole process. uid/gid 0 makes the drop a no-op.
+    setenv("SANDBOX_BROKER_UID", "0", 1);
+    setenv("SANDBOX_BROKER_GID", "0", 1);
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    pthread_t bth;
+    pthread_create(&bth, NULL, broker_loop, NULL);
+    pthread_detach(bth);
+
+    g_up_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int one = 1;
+    setsockopt(g_up_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in ua = { .sin_family = AF_INET };
+    inet_pton(AF_INET, UP_ADDR, &ua.sin_addr);
+    ua.sin_port = 0;
+    bind(g_up_fd, (struct sockaddr*)&ua, sizeof(ua));
+    listen(g_up_fd, 16);
+    socklen_t ul = sizeof(ua);
+    getsockname(g_up_fd, (struct sockaddr*)&ua, &ul);
+    int up_port = ntohs(ua.sin_port);
+    pthread_t uth;
+    pthread_create(&uth, NULL, upstream_loop, NULL);
+    pthread_detach(uth);
+    for (int i = 0; i < 100; i++) {  // wait for the broker's listener
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in ba = { .sin_family = AF_INET, .sin_port = htons((uint16_t)broker_port()) };
+        inet_pton(AF_INET, "127.0.0.1", &ba.sin_addr);
+        int ok = connect(s, (struct sockaddr*)&ba, sizeof(ba)) == 0;
+        close(s);
+        if (ok) break;
+        usleep(50000);
+    }
+
+    char out[2048], cmd[1024];
+    sandbox_spec_t sp = *base;
+    sp.env_vars = NULL;
+    const char* allow[] = { UP_ADDR, "127.0.0.1", NULL };
+    sp.egress_allow = allow;
+    sandbox_handle_t* h = NULL;
+    CHECK(sandbox_create(&sp, &h) == SANDBOX_OK && h != NULL, "net: create with a policy");
+    if (!h) return;
+    if (gsh(h, "command -v curl >/dev/null", NULL, 0) != 0) {
+        printf("SKIP guest network: no curl in this image (the Debian image runs it)\n");
+        sandbox_destroy(h);
+        return;
+    }
+    const char* token = sandbox_handle_token(h);
+
+    // The guest was told its address, where the broker is, and its login.
+    snprintf(cmd, sizeof(cmd), "echo $http_proxy");
+    gsh(h, cmd, out, sizeof(out));
+    char want[256];
+    snprintf(want, sizeof(want), "http://sandbox:%s@169.254.", token);
+    CHECK(strncmp(out, want, strlen(want)) == 0, "net: guest has its proxy settings");
+    char broker[96] = "";
+    gsh(h, "echo $SANDBOX_BROKER", broker, sizeof(broker));
+    CHECK(strchr(broker, ':') != NULL, "net: guest knows the broker address");
+    gsh(h, "ip -4 -o addr show | grep -c 'inet 169\\.254\\.'", out, sizeof(out));
+    CHECK(strcmp(out, "1") == 0, "net: the NIC carries the assigned /30 address");
+
+    // A request for an allow-listed host is relayed -- and arrives clean.
+    snprintf(cmd, sizeof(cmd), "curl -sS --max-time 20 http://" UP_ADDR ":%d/simple/pip/", up_port);
+    int rc = gsh(h, cmd, out, sizeof(out));
+    CHECK(rc == 0 && strcmp(out, "package-index-ok /simple/pip/") == 0,
+          "net: allow-listed host reached through the broker");
+    pthread_mutex_lock(&g_up_mu);
+    CHECK(strstr(g_up_last, "GET /simple/pip/ HTTP/1.1") != NULL &&
+              strstr(g_up_last, "Proxy-Authorization") == NULL &&
+              strstr(g_up_last, token) == NULL,
+          "net: the upstream never sees the session token");
+    pthread_mutex_unlock(&g_up_mu);
+
+    // The same through a CONNECT tunnel (what https_proxy clients use).
+    snprintf(cmd, sizeof(cmd), "curl -sS --max-time 20 -p http://" UP_ADDR ":%d/tunnelled", up_port);
+    rc = gsh(h, cmd, out, sizeof(out));
+    CHECK(rc == 0 && strcmp(out, "package-index-ok /tunnelled") == 0, "net: CONNECT tunnel works end to end");
+
+    // Default deny: anything not on the policy is refused at the broker.
+    gsh(h, "curl -s -o /dev/null -w '%{http_code}' --max-time 20 http://not-allowed.example/", out, sizeof(out));
+    CHECK(strcmp(out, "403") == 0, "net: a host outside the policy -> 403");
+    gsh(h, "curl -s -o /dev/null -w '%{http_code}' --max-time 20 -p https://not-allowed.example/", out, sizeof(out));
+    CHECK(strcmp(out, "000") == 0 || strcmp(out, "403") == 0, "net: ...and a CONNECT to it is refused");
+
+    // A name the policy allows still cannot be used to reach the host itself.
+    snprintf(cmd, sizeof(cmd),
+             "curl -s -o /dev/null -w '%%{http_code}' --max-time 20 --noproxy '' -x \"$http_proxy\" http://127.0.0.1:%d/", up_port);
+    gsh(h, cmd, out, sizeof(out));
+    CHECK(strcmp(out, "403") == 0, "net: loopback is refused even though the policy names it");
+
+    // The token is the credential: a forged one gets nothing.
+    snprintf(cmd, sizeof(cmd),
+             "curl -s -o /dev/null -w '%%{http_code}' --max-time 20 -x http://sandbox:%064d@$SANDBOX_BROKER http://" UP_ADDR ":%d/", 0, up_port);
+    gsh(h, cmd, out, sizeof(out));
+    CHECK(strcmp(out, "407") == 0, "net: a forged token -> 407");
+
+    // No bypass: the host drops everything but the broker's port, so a direct
+    // connection to the host on another port times out (drop, not refuse).
+    snprintf(cmd, sizeof(cmd),
+             "H=${SANDBOX_BROKER%%:*}; P=${SANDBOX_BROKER##*:}; curl --noproxy '*' -s -o /dev/null --max-time 4 http://$H:$((P+1))/; echo $?");
+    gsh(h, cmd, out, sizeof(out));
+    CHECK(strcmp(out, "28") == 0, "net: no direct route to anything but the broker");
+
+    // The decisions were counted and the bytes measured.
+    char mb[8192];
+    int mn = broker_metrics_render(mb, sizeof(mb));
+    CHECK(mn > 0 && strstr(mb, "{decision=\"allowed\"} 0\n") == NULL &&
+              strstr(mb, "{decision=\"denied_policy\"} 0\n") == NULL &&
+              strstr(mb, "{decision=\"denied_address\"} 0\n") == NULL &&
+              strstr(mb, "{direction=\"to_guest\"} 0\n") == NULL,
+          "net: allow/deny decisions and bytes are measured");
+    sandbox_destroy(h);
+
+    // deny-all: no address at all, so no network of any kind.
+    sandbox_spec_t sd = *base;
+    sd.env_vars = NULL;
+    sd.egress_deny_all = 1;
+    sandbox_handle_t* hd = NULL;
+    CHECK(sandbox_create(&sd, &hd) == SANDBOX_OK && hd != NULL, "net: create with deny-all");
+    if (hd) {
+        gsh(hd, "echo \"[$http_proxy]\"", out, sizeof(out));
+        CHECK(strcmp(out, "[]") == 0, "net: deny-all gets no proxy settings");
+        gsh(hd, "ip -4 -o addr show | grep -vc ' lo '", out, sizeof(out));
+        CHECK(strcmp(out, "0") == 0, "net: deny-all leaves the NIC without an address");
+        sandbox_destroy(hd);
+    }
+
+    // The spec's own environment now reaches exec'd commands.
+    sandbox_spec_t se = *base;
+    const char* envp[] = { "MY_SETTING=from-the-spec", NULL };
+    se.env_vars = envp;
+    se.egress_deny_all = 1;
+    sandbox_handle_t* he = NULL;
+    CHECK(sandbox_create(&se, &he) == SANDBOX_OK && he != NULL, "env: create with env");
+    if (he) {
+        gsh(he, "echo $MY_SETTING", out, sizeof(out));
+        CHECK(strcmp(out, "from-the-spec") == 0, "env: the spec's env is inherited by exec");
+        sandbox_destroy(he);
+    }
+
+    // Optional: the real thing. A package index on the real internet, through
+    // the real broker, over real TLS, limited to the names the policy lists.
+    if (getenv("SANDBOX_E2E_INTERNET")) {
+        sandbox_spec_t si = *base;
+        si.env_vars = NULL;
+        const char* pk[] = { "pypi.org", "*.pythonhosted.org", NULL };
+        si.egress_allow = pk;
+        sandbox_handle_t* hi = NULL;
+        CHECK(sandbox_create(&si, &hi) == SANDBOX_OK && hi != NULL, "net: create for the package index");
+        if (hi) {
+            rc = gsh(hi, "curl -sS --max-time 45 -H 'Accept: application/vnd.pypi.simple.v1+json' https://pypi.org/simple/pip/ | head -c 300", out, sizeof(out));
+            CHECK(rc == 0 && strstr(out, "\"name\":\"pip\"") != NULL, "net: pypi.org simple index through the broker");
+            gsh(hi, "curl -s -o /dev/null -w '%{http_code}' --max-time 20 -p https://example.com/", out, sizeof(out));
+            CHECK(strcmp(out, "000") == 0 || strcmp(out, "403") == 0, "net: a host outside the policy is refused");
+            sandbox_destroy(hi);
+        }
+    }
+
+    system("ip addr del " UP_ADDR "/32 dev lo");
+    unlink(creds);
+}
+
 int main(void) {
     const char* snap = getenv("SANDBOX_SNAPSHOT_ROOT");
     if (!snap || !*snap || geteuid() != 0 || access("/dev/kvm", R_OK | W_OK) < 0) {
@@ -223,6 +481,9 @@ int main(void) {
         return 0;
     }
 
+    // The broker port is one value for the nft rules and the broker listener; pick
+    // one unlikely to clash with whatever already holds 8080 on a CI host.
+    setenv("SANDBOX_BROKER_PORT", "18089", 1);
     snprintf(g_engine_sock, sizeof(g_engine_sock), "/tmp/sbtest-ipc-%d.sock",
              (int)getpid());
     snprintf(g_bc_sock, sizeof(g_bc_sock), "/tmp/sbtest-bc-%d.sock",
@@ -256,7 +517,10 @@ int main(void) {
     }
     ipc_server_set_pool(&g_pool);
     ipc_server_set_template("e2e");
-    ipc_server_set_allowed_services("api.example.com,*.internal");
+    // 192.0.2.1 / 127.0.0.1 are what the guest-network test names; the pypi names
+    // are for its optional real-internet leg. The first entry stays what the
+    // token checks below expect.
+    ipc_server_set_allowed_services("api.example.com,*.internal,192.0.2.1,127.0.0.1,pypi.org,*.pythonhosted.org");
 
     CHECK(ipc_server_start_broker_control(g_bc_sock) == 0, "broker-control start");
 
@@ -773,6 +1037,8 @@ int main(void) {
 
         session_info_free(&si);
         if (bfd >= 0) close(bfd);
+
+        test_guest_network(&spec);
     }
 
     sandbox_cleanup();

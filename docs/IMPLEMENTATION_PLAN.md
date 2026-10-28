@@ -232,7 +232,8 @@ peer, cid 1) and the guest asserts the positive direction
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
 | #24 guest RPC | ✅ guest, host client, IPC, libsandbox, C++, CLI; privileged CI green on busybox and Debian |
 | #7 broker streaming | ✅ chunked and Content-Length bodies stream with bounded memory; `SANDBOX_BROKER_MAX_BODY` (256 MiB) → 413; 64 MiB SHA-256 fidelity + RSS bound tested |
-| M2 #25–#28 | ⏳ not started |
+| #26 egress policy | 🔶 policy model, per-session plumbing, broker as a forward proxy (absolute-form + CONNECT), public-address guard, threaded broker, guest NIC + proxy env hand-off, exec inherits the spec env; unit/in-process tests green, privileged Debian e2e (incl. a real package index) awaiting its CI run |
+| M2 #25, #27, #28 | ⏳ not started |
 
 ### What the `jail_cleanup` fix actually became
 

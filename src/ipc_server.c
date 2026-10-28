@@ -27,11 +27,15 @@
 #include "vmm_manager.h"
 #include "workspace.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -670,6 +674,75 @@ static sandbox_error_t session_provision(const create_job_t* job,
 
 // A pool restore + env inject + token mint. Runs off the epoll loop; the only
 // shared mutation is the token registry (token_lock) and the result queue.
+// #26: what the guest is told at Create, in one vsock exchange: the spec's env,
+// and -- when this sandbox's policy lets it reach anything at all -- the address
+// it should configure on its NIC plus where the broker is and the token to use
+// there, spelled the way stock tools want it (http_proxy and friends). A sandbox
+// with an empty policy gets none of it: no address, so no network whatsoever.
+// A variable the caller already set is left alone, so a spec can override any of
+// these. Returns a NULL-terminated array of malloc'd "KEY=VALUE" strings; free
+// with free_env_lines(). *n is its length.
+static void free_env_lines(char** v) {
+    if (!v) return;
+    for (int i = 0; v[i]; i++) free(v[i]);
+    free(v);
+}
+
+static bool env_has_key(char* const* v, int n, const char* key) {
+    size_t kl = strlen(key);
+    for (int i = 0; i < n; i++)
+        if (!strncmp(v[i], key, kl) && v[i][kl] == '=') return true;
+    return false;
+}
+
+static char** build_guest_env(const create_job_t* job, const vm_handle_t* vm,
+                              const char* token_hex, int* n_out) {
+    enum { EXTRA = 12 };
+    int n_user = 0;
+    while (job->env[n_user]) n_user++;
+    char** v = calloc((size_t)n_user + EXTRA + 1, sizeof(char*));
+    if (!v) return NULL;
+    int n = 0;
+    for (int i = 0; i < n_user; i++) {
+        v[n] = strdup(job->env[i]);
+        if (!v[n]) { free_env_lines(v); return NULL; }
+        n++;
+    }
+    if (vm && vm->has_net && job->egress && job->egress[0]) {
+        struct in_addr gip = { .s_addr = vm->net.guest_ip };
+        struct in_addr hip = { .s_addr = htonl((ntohl(vm->net.guest_ip) & ~3u) | 1u) };
+        char g[INET_ADDRSTRLEN], h[INET_ADDRSTRLEN];
+        if (inet_ntop(AF_INET, &gip, g, sizeof(g)) && inet_ntop(AF_INET, &hip, h, sizeof(h))) {
+            char proxy[256], broker[64];
+            snprintf(broker, sizeof(broker), "%s:%d", h, broker_port());
+            snprintf(proxy, sizeof(proxy), "http://sandbox:%s@%s", token_hex, broker);
+            const struct { const char* k; const char* v; } extra[] = {
+                {"SANDBOX_NET_ADDR", g},
+                {"SANDBOX_NET_MASK", "255.255.255.252"},
+                {"SANDBOX_BROKER", broker},
+                {"SANDBOX_SESSION_TOKEN", token_hex},
+                {"http_proxy", proxy},
+                {"https_proxy", proxy},
+                {"HTTP_PROXY", proxy},
+                {"HTTPS_PROXY", proxy},
+                {"no_proxy", "127.0.0.1,localhost"},
+                {"NO_PROXY", "127.0.0.1,localhost"},
+            };
+            for (size_t i = 0; i < sizeof(extra) / sizeof(*extra) && n < n_user + EXTRA; i++) {
+                if (env_has_key(v, n, extra[i].k)) continue;
+                size_t len = strlen(extra[i].k) + strlen(extra[i].v) + 2;
+                v[n] = malloc(len);
+                if (!v[n]) { free_env_lines(v); return NULL; }
+                snprintf(v[n], len, "%s=%s", extra[i].k, extra[i].v);
+                n++;
+            }
+        }
+    }
+    v[n] = NULL;
+    *n_out = n;
+    return v;
+}
+
 static void* create_worker_fn(void* arg) {    (void)arg;
     for (;;) {
         pthread_mutex_lock(&g.q_lock);
@@ -716,19 +789,24 @@ static void* create_worker_fn(void* arg) {    (void)arg;
             r->code = (err != SANDBOX_OK) ? err : SANDBOX_ERR_INTERNAL;
             telemetry_pool_exhausted();
         } else {
-            if (job->env[0]) {
-                if (vmm_inject_env(vm, (const char* const*)job->env) == 0) {
-                    LOGF(LOG_DEBUG, "ipc_server", "env_injected",
-                         "\"sandbox_id\":%u", vm->sandbox_id);
-                } else {
-                    LOGF(LOG_WARN, "ipc_server", "env_inject_failed",
-                         "\"sandbox_id\":%u", vm->sandbox_id);
-                }
-            }
+            // The token comes first: the guest is handed it (as its proxy login)
+            // in the same exchange as the rest of its environment.
             if (token_issue(vm->sandbox_id, job->egress, r->token) < 0) {
                 r->code = SANDBOX_ERR_INTERNAL;  // loop destroys vm
                 r->vm = vm;
             } else {
+                int n_env = 0;
+                char** lines = build_guest_env(job, vm, r->token, &n_env);
+                if (lines && n_env > 0) {
+                    if (vmm_inject_env(vm, (const char* const*)lines) == 0) {
+                        LOGF(LOG_DEBUG, "ipc_server", "env_injected",
+                             "\"sandbox_id\":%u,\"vars\":%d", vm->sandbox_id, n_env);
+                    } else {
+                        LOGF(LOG_WARN, "ipc_server", "env_inject_failed",
+                             "\"sandbox_id\":%u", vm->sandbox_id);
+                    }
+                }
+                free_env_lines(lines);
                 r->code = SANDBOX_OK;
                 r->vm = vm;
             }
@@ -1547,9 +1625,23 @@ void ipc_server_set_create_limits(int workers, int per_session, int per_uid) {
 // broker-control server (§5.8): the credential broker validates tokens here.
 // ---------------------------------------------------------------------------
 
+// Wait for the next request, noticing shutdown: a broker holds its connection
+// open for as long as it runs, so a blocking read here would make stopping the
+// daemon wait for the broker to exit first.
+static int bc_wait_readable(int fd) {
+    for (;;) {
+        if (!g.bc_running) return -1;
+        struct pollfd p = { .fd = fd, .events = POLLIN };
+        int r = poll(&p, 1, 200);
+        if (r > 0) return 0;
+        if (r < 0 && errno != EINTR) return -1;
+    }
+}
+
 static void bc_handle_conn(int fd) {
     uint8_t req[BROKER_VALIDATE_REQ_LEN];
     for (;;) {
+        if (bc_wait_readable(fd) < 0) return;
         if (read_full(fd, req, sizeof(req)) < 0) return;
         if (req[0] != BROKER_MSG_VALIDATE_TOKEN) return;
 
@@ -1591,6 +1683,19 @@ static void bc_handle_conn(int fd) {
     }
 }
 
+// One thread per broker connection, so a second broker (or one reconnecting
+// while the old connection is still draining) is served rather than queued
+// behind it.
+static atomic_int g_bc_conns;
+
+static void* bc_conn_fn(void* arg) {
+    int fd = (int)(intptr_t)arg;
+    bc_handle_conn(fd);
+    close(fd);
+    atomic_fetch_sub(&g_bc_conns, 1);
+    return NULL;
+}
+
 static void* bc_thread_fn(void* arg) {
     (void)arg;
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -1629,9 +1734,18 @@ static void* bc_thread_fn(void* arg) {
         if (pr == 0) continue;
         int cfd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
         if (cfd < 0) continue;
-        bc_handle_conn(cfd);
-        close(cfd);
+        pthread_t ct;
+        atomic_fetch_add(&g_bc_conns, 1);
+        if (pthread_create(&ct, NULL, bc_conn_fn, (void*)(intptr_t)cfd) == 0) {
+            pthread_detach(ct);
+        } else {
+            atomic_fetch_sub(&g_bc_conns, 1);
+            close(cfd);
+        }
     }
+    // Connections notice bc_running within 200 ms; wait them out so none still
+    // touches the token table when the server is torn down.
+    for (int i = 0; i < 500 && atomic_load(&g_bc_conns) > 0; i++) usleep(10000);
     close(lfd);
     unlink(g.bc_path);
     g.bc_listen_fd = -1;

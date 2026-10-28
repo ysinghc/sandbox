@@ -398,6 +398,48 @@ static void test_egress_policy(void) {
     CHECK_RC(create_with(many, 0), SANDBOX_ERR_INVALID_SPEC, "egress: too many entries is refused client-side");
 }
 
+// The broker-control socket (the broker's token authority). A broker keeps its
+// connection open for as long as it runs, so the server must serve several at
+// once and must not let one idle connection hold up shutdown (#26: the in-process
+// broker of the guest-network test, and a restarting broker in production).
+static int bc_connect(const char* path) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    snprintf(a.sun_path, sizeof(a.sun_path), "%s", path);
+    if (fd < 0 || connect(fd, (struct sockaddr*)&a, sizeof(a)) != 0) { if (fd >= 0) close(fd); return -1; }
+    struct timeval tv = { .tv_sec = 3 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    return fd;
+}
+
+static int bc_ask(int fd) {  // validate an all-zero token; returns the status byte, or -1
+    uint8_t req[33] = { 1 };
+    uint8_t st = 0xff;
+    if (write(fd, req, sizeof(req)) != (ssize_t)sizeof(req)) return -1;
+    return read(fd, &st, 1) == 1 ? st : -1;
+}
+
+static void test_broker_control(void) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/bc.sock", g_dir);
+    check(ipc_server_start_broker_control(path) == 0, "broker-control: starts");
+    for (int i = 0; i < 200 && access(path, F_OK) != 0; i++) usleep(10000);
+    int a = bc_connect(path), b = bc_connect(path);
+    check(a >= 0 && b >= 0, "broker-control: two connections at once");
+    check(bc_ask(a) == 1, "broker-control: first connection answers (unknown token -> invalid)");
+    // Under the old one-at-a-time loop this blocked until the first closed.
+    check(bc_ask(b) == 1, "broker-control: the second is served while the first is open");
+    check(bc_ask(a) == 1, "broker-control: and the first still works");
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    ipc_server_stop_broker_control();
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    check(ms < 3000, "broker-control: stops promptly with idle connections still open");
+    close(a);
+    close(b);
+}
+
 int main(void) {
     prctl(PR_SET_CHILD_SUBREAPER, 1);
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -446,6 +488,7 @@ int main(void) {
     test_concurrency_and_limits();
     test_ownership_and_protocol();
     test_egress_policy();
+    test_broker_control();
 
     // Take the fake VM out of the registry *before* the session drops: the server
     // tears a dropped session's VMs down with the real vmm_destroy(), which must

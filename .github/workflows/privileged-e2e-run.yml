@@ -147,12 +147,29 @@ jobs:
           set -euo pipefail
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
           DEB_IMG="$PWD/guest/rootfs-debian.ext4"
-          $SUDO env SANDBOX_ROOTFS="$DEB_IMG" ctest --test-dir build -V \
+          # SANDBOX_E2E_INTERNET=1 adds the real thing to the guest-network test
+          # (#26): a package index on the real internet, through the real broker,
+          # over real TLS, for a sandbox whose policy names only that index.
+          $SUDO env SANDBOX_ROOTFS="$DEB_IMG" SANDBOX_E2E_INTERNET=1 ctest --test-dir build -V \
             -R "^(pool|tmpl_setup|vmm|ipc)$" \
             | tee /tmp/privileged-ctest-debian.log
           if grep -nE '\*\*\*Skipped|SKIP \(|\*\*\*Not Run' /tmp/privileged-ctest-debian.log; then
             echo "::error::a privileged test skipped against the Debian image"; exit 1
           fi
+          # The fixture image has no curl, so the guest-network test may skip there.
+          # On the Debian image it must run, or "a guest reaches only its allow-list"
+          # is unproven: demand the lines that show it did.
+          if grep -n 'SKIP guest network' /tmp/privileged-ctest-debian.log; then
+            echo "::error::the guest-network test skipped on the Debian image"; exit 1
+          fi
+          for want in 'net: allow-listed host reached through the broker' \
+                      'net: CONNECT tunnel works end to end' \
+                      'net: a host outside the policy -> 403' \
+                      'net: no direct route to anything but the broker' \
+                      'net: pypi.org simple index through the broker'; do
+            grep -F "$want" /tmp/privileged-ctest-debian.log | grep -q PASS \
+              || { echo "::error::guest-network check did not pass: $want"; exit 1; }
+          done
           grep -F "rootfs=$DEB_IMG" /tmp/privileged-ctest-debian.log \
             || { echo "::error::the Debian run did not use $DEB_IMG"; exit 1; }
           grep -F "kernel=$SANDBOX_KERNEL" /tmp/privileged-ctest-debian.log \

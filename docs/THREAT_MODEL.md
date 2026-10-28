@@ -66,7 +66,8 @@ Three boundaries matter:
 
 | # | Threat | Mitigation | Status |
 |---|---|---|---|
-| T6 | Guest reaches the internet directly | nft drops all egress except the host broker; no NAT (`src/network_manager.c`) | `tests/test_network.c` (root) |
+| T6 | Guest reaches the internet directly | nft drops all egress except the host broker; no NAT (`src/network_manager.c`); a deny-all sandbox is never given an address | `tests/test_network.c` (root); `tests/test_ipc.c` "net: no direct route to anything but the broker" (a direct connection to the host on another port times out) |
+| T6a | An allowed name is steered at the host's own network (DNS rebinding, `127.0.0.1`, `169.254.169.254`, the VM subnets) | the broker connects only to public addresses, for relays and CONNECT tunnels alike (`broker_addr_public`); opt-out is an explicit operator setting | `tests/test_broker.c` (unit + in-process), `tests/test_ipc.c` "loopback is refused even though the policy names it" |
 | T7 | Guest reads an upstream credential | credentials live only in the broker; the guest sees just its session token | by design |
 | T8 | Local user reads `credentials.conf` | broker now refuses a group/world-readable or foreign-owned file (#3) | `tests/test_broker.c` |
 | T8a | Guest widens its own egress policy | the policy is fixed into the session token at Create by the developer's process and validated against the daemon-wide ceiling; the guest only ever holds the token, and the broker re-reads the list for it on every request (#26) | `tests/test_egress.c`, `tests/test_broker.c`, `tests/test_ipc_guest.c` |

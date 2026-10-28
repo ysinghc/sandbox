@@ -207,6 +207,16 @@ typedef struct grpc_server grpc_server_t;
 grpc_server_t* grpc_server_new(const char* root, int (*pre_op)(void));
 void grpc_server_free(grpc_server_t* s);
 
+// The sandbox's base environment: what the host injected at Create (the spec's
+// env plus the broker/proxy settings, #26). Every exec starts from it; an exec's
+// own env wins on a clashing key. `payload` is the injected "KEY=VALUE\n..." text;
+// lines that are not a well-formed KEY=VALUE (or that are engine control verbs,
+// SANDBOX_CONTROL=...) are ignored. Replaces any previous base. Not thread-safe
+// against a concurrent step(): call it from the thread that steps the server.
+// Returns the number of variables kept.
+int grpc_server_set_base_env(grpc_server_t* s, const char* payload, size_t len);
+#define GRPC_BASE_ENV_MAX 128
+
 // Hand an already-authenticated connected socket to the server (it takes
 // ownership). Returns 0, or -1 when the connection limit is reached (the fd is
 // then answered with GRPC_E_BUSY and closed).

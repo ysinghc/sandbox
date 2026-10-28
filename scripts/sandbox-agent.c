@@ -36,6 +36,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
+
 #include "guest_rpc.h"
 #include "vsock_peer.h"
 
@@ -47,6 +51,90 @@
 // control verb that happens to arrive on the env channel, and it is matched
 // exactly so no user-supplied KEY=VALUE can trigger it.
 #define CONTROL_FLUSH "SANDBOX_CONTROL=flush"
+
+// #26: network bring-up. The host assigns each VM a /30 on its own tap and
+// tells the guest which address to use inside the env payload (a restored guest
+// cannot be given one any other way: the snapshot is shared and carries no
+// address). The guest then has exactly one reachable peer, the host end of that
+// /30, where the broker listens; the host's nft rules drop everything else.
+static void say(const char* s);
+
+#define NET_KEY_ADDR "SANDBOX_NET_ADDR="
+#define NET_KEY_MASK "SANDBOX_NET_MASK="
+
+static int net_set_flags(int s, const char* name, short set) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0) return -1;
+    ifr.ifr_flags |= set;
+    return ioctl(s, SIOCSIFFLAGS, &ifr);
+}
+
+static int net_set_addr(int s, const char* name, int req, const char* dotted) {
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    snprintf(ifr.ifr_name, IFNAMSIZ, "%s", name);
+    struct sockaddr_in* a = (struct sockaddr_in*)&ifr.ifr_addr;
+    a->sin_family = AF_INET;
+    if (inet_pton(AF_INET, dotted, &a->sin_addr) != 1) return -1;
+    return ioctl(s, req, &ifr);
+}
+
+// Loopback up (a bare init leaves it down, and workloads expect 127.0.0.1).
+static void net_loopback_up(void) {
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return;
+    net_set_flags(s, "lo", IFF_UP | IFF_RUNNING);
+    close(s);
+}
+
+// Find the value of KEY in the payload ("KEY=VALUE" lines); copies into out.
+static int payload_get(const char* buf, size_t n, const char* key, char* out, size_t cap) {
+    size_t kl = strlen(key);
+    for (size_t i = 0; i < n;) {
+        size_t j = i;
+        while (j < n && buf[j] != '\n' && buf[j] != '\0') j++;
+        if (j - i > kl && memcmp(buf + i, key, kl) == 0) {
+            size_t vl = j - i - kl;
+            if (vl >= cap) return -1;
+            memcpy(out, buf + i + kl, vl);
+            out[vl] = '\0';
+            return 0;
+        }
+        i = j + 1;
+    }
+    return -1;
+}
+
+static void net_configure(const char* buf, size_t n) {
+    char addr[32], mask[32];
+    if (payload_get(buf, n, NET_KEY_ADDR, addr, sizeof(addr)) != 0 ||
+        payload_get(buf, n, NET_KEY_MASK, mask, sizeof(mask)) != 0)
+        return;  // no network for this sandbox: the NIC stays unconfigured
+    // The first interface that is not loopback (virtio-net: eth0).
+    char name[IFNAMSIZ] = "";
+    struct if_nameindex* ni = if_nameindex();
+    for (struct if_nameindex* p = ni; p && p->if_index; p++)
+        if (strcmp(p->if_name, "lo") != 0) {
+            snprintf(name, sizeof(name), "%s", p->if_name);
+            break;
+        }
+    if (ni) if_freenameindex(ni);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0 || !name[0]) {
+        say("SANDBOX-NET-FAIL no-interface\n");
+        if (s >= 0) close(s);
+        return;
+    }
+    int rc = net_set_addr(s, name, SIOCSIFADDR, addr);
+    if (rc == 0) rc = net_set_addr(s, name, SIOCSIFNETMASK, mask);
+    if (rc == 0) rc = net_set_flags(s, name, IFF_UP | IFF_RUNNING);
+    close(s);
+    say(rc == 0 ? "SANDBOX-NET-OK\n" : "SANDBOX-NET-FAIL ioctl\n");
+}
+
+static grpc_server_t* g_rpc;  // the exec/file server; takes the base env from serve()
 
 // #23: the session workspace. The probe below is a *diagnostic*: it lets the
 // host observe, from inside the guest, that /workspace is this session's own
@@ -268,6 +356,12 @@ static void serve(int cfd) {
         say("\n");
         i = (j < off) ? j + 1 : off;
     }
+    // #26: bring the NIC up if the host assigned one, and make the injected env
+    // the base of every exec (until now it only reached a file nobody read).
+    // Both happen before the end marker the host waits for, so by the time
+    // Create returns the guest is ready to use them.
+    net_configure(buf, off);
+    if (g_rpc) grpc_server_set_base_env(g_rpc, buf, off);
     say("SANDBOX-ENV-END\n");
     got_env = 1;
 
@@ -326,7 +420,9 @@ int main(void) {
     // volume, which is mounted on first use exactly as for the env probe.
     int rfd = bind_listen(GRPC_PORT);
     grpc_server_t* rpc = grpc_server_new(WS_DIR, ws_ensure_mount);
+    g_rpc = rpc;
     if (rfd < 0 || !rpc) say("SANDBOX-RPC-FAIL\n");
+    net_loopback_up();
     int rpc_live = 0;
     unsigned long rpc_idle = 0;
 

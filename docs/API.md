@@ -374,6 +374,33 @@ The broker then:
    `credentials.conf`;
 4. proxies to `https://<host><target>` and streams the response back.
 
+### What a guest is given
+
+A sandbox with a non-empty policy gets, at Create, in the same single exchange
+as its `env_vars`: an address for its NIC (the guest end of a private `/30` on
+its own tap, `169.254.x.y`; the host end is where the broker listens), and these
+variables, which every `exec` inherits:
+
+| Variable | Value |
+|---|---|
+| `http_proxy`, `https_proxy` (and upper-case) | `http://sandbox:<token>@<host end>:<broker port>` |
+| `no_proxy`, `NO_PROXY` | `127.0.0.1,localhost` |
+| `SANDBOX_BROKER` | `<host end>:<broker port>` |
+| `SANDBOX_SESSION_TOKEN` | the session token |
+| `SANDBOX_NET_ADDR`, `SANDBOX_NET_MASK` | what the guest agent configured |
+
+A variable the spec's `env_vars` already sets is left alone, so a spec can
+override any of them. A sandbox whose policy is empty (`no_egress()`, or an empty
+daemon list) gets **none** of this: no address, no variables, no route. Its NIC
+stays unconfigured, which is the strongest form of deny-all.
+
+The host drops everything the guest sends except TCP to the broker port on the
+host end of its own `/30` (`src/network_manager.c`), so the broker is the only
+thing reachable, whatever the guest tries.
+
+Since #26 the spec's `env_vars` also reach `exec`'d commands. Until then they
+were written to a file inside the guest that nothing read.
+
 ### Using it as a proxy
 
 Stock tools reach the broker the way they reach any forward proxy, so no

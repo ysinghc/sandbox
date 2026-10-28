@@ -233,6 +233,34 @@ static void test_exec(void) {
     check(rc == 0 && !strcmp(c.out, "/etc\n"), "exec: cwd outside allowed only with the explicit flag");
 }
 
+// #26: the host-injected environment is the base of every exec.
+static void test_base_env(void) {
+    cap_t c; grpc_exec_res_t res;
+    int rc = sh("echo $SBX_BASE_A $SBX_BASE_B", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && !strcmp(c.out, "alpha beta\n"), "base env: injected variables reach exec");
+    rc = sh("[ \"${SBX_EMPTY+set}\" = set ] && [ -z \"$SBX_EMPTY\" ] && echo ok", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && !strcmp(c.out, "ok\n"), "base env: an empty value is kept as set-but-empty");
+    rc = sh("echo \"$SBX_EQ\"", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && !strcmp(c.out, "a=b=c\n"), "base env: only the first '=' splits key from value");
+    rc = sh("env | grep -E '^(SANDBOX_CONTROL|bad key|NOEQ|9BAD|=)'; echo rc=$?", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && !strcmp(c.out, "rc=1\n"), "base env: control verbs and malformed lines never become variables");
+    rc = sh("echo $HTTP_PROXY", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && !strcmp(c.out, "http://p:1\n"), "base env: a proxy setting is inherited");
+
+    // The request's own env wins on a clashing key and the rest is still merged.
+    const char* script[] = { "echo $SBX_BASE_A $SBX_BASE_B $SBX_REQ" };
+    const char* renv[] = { "SBX_BASE_A=override", "SBX_REQ=r" };
+    grpc_exec_req_t rq = { .argv = script, .argc = 1, .env = renv, .envc = 2,
+                           .timeout_ms = 5000, .flags = GRPC_F_SHELL };
+    char msg[160];
+    memset(&c, 0, sizeof(c));
+    rc = grpc_exec(conn_new(), &rq, on_chunk, &c, 20000, &res, msg, sizeof(msg));
+    check(rc == 0 && !strcmp(c.out, "override beta r\n"), "base env: the request overrides a clashing key");
+    check(rc == 0 && c.no == strlen("override beta r\n"), "base env: no duplicate of the overridden key");
+    rc = sh("echo $HOME; echo ${PATH:+path}", 5000, 0, NULL, &c, &res);
+    check(rc == 0 && strstr(c.out, "path") != NULL, "base env: PATH/HOME defaults still apply");
+}
+
 static void test_exec_limits(void) {
     cap_t c; grpc_exec_res_t res;
     int64_t t0 = now_ms();
@@ -559,12 +587,19 @@ int main(void) {
 
     g_srv = grpc_server_new(g_root, pre_op);
     if (!g_srv) { fprintf(stderr, "server_new failed\n"); return 1; }
+    // Before the server thread exists, so nothing steps it while it is written.
+    static const char base[] =
+        "SBX_BASE_A=alpha\nSBX_BASE_B=beta\nSANDBOX_CONTROL=flush\nbad key=1\n=x\nNOEQ\n"
+        "9BAD=1\nSBX_EMPTY=\nSBX_EQ=a=b=c\nHTTP_PROXY=http://p:1\n";
+    check(grpc_server_set_base_env(g_srv, base, sizeof(base) - 1) == 5,
+          "base env: exactly the well-formed variables are kept");
     pthread_t th;
     pthread_create(&th, NULL, server_thread, NULL);
 
     test_paths();
     test_codec();
     test_exec();
+    test_base_env();
     test_exec_limits();
     test_files();
     test_file_limits();

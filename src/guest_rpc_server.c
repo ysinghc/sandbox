@@ -12,12 +12,14 @@
 // orphan; exec children are matched by pid and everything else is discarded.
 #define _GNU_SOURCE
 
+#include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <ftw.h>
 #include <limits.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -68,6 +70,8 @@ struct grpc_server {
     conn_t c[MAX_CONNS];
     size_t in_bytes;
     unsigned tmp_seq;
+    char** benv;   // base environment, owned
+    int n_benv;
 };
 
 static uint64_t now_ms(void) {
@@ -196,8 +200,54 @@ grpc_server_t* grpc_server_new(const char* root, int (*pre_op)(void)) {
     return s;
 }
 
+static void benv_clear(grpc_server_t* s) {
+    for (int i = 0; i < s->n_benv; i++) free(s->benv[i]);
+    free(s->benv);
+    s->benv = NULL;
+    s->n_benv = 0;
+}
+
+int grpc_server_set_base_env(grpc_server_t* s, const char* payload, size_t len) {
+    if (!s) return 0;
+    benv_clear(s);
+    if (!payload || !len) return 0;
+    char** v = calloc(GRPC_BASE_ENV_MAX, sizeof(char*));
+    if (!v) return 0;
+    int n = 0;
+    for (size_t i = 0; i < len && n < GRPC_BASE_ENV_MAX;) {
+        size_t j = i;
+        while (j < len && payload[j] != '\n' && payload[j] != '\0') j++;
+        size_t ll = j - i;
+        const char* eq = memchr(payload + i, '=', ll);
+        bool ok = eq && eq > payload + i;
+        // KEY must look like an environment variable name: a stray "bad key=1"
+        // would otherwise be handed to execve as-is.
+        for (const char* k = payload + i; ok && k < eq; k++)
+            if (!(isalnum((unsigned char)*k) || *k == '_')) ok = false;
+        if (ok && isdigit((unsigned char)payload[i])) ok = false;
+        // Engine control verbs share the channel with env; never a variable.
+        if (ok && ll >= 16 && !memcmp(payload + i, "SANDBOX_CONTROL=", 16)) ok = false;
+        if (ok) {
+            char* e = malloc(ll + 1);
+            if (!e) break;
+            memcpy(e, payload + i, ll);
+            e[ll] = '\0';
+            v[n++] = e;
+        }
+        i = j + 1;
+    }
+    if (n == 0) {
+        free(v);
+        return 0;
+    }
+    s->benv = v;
+    s->n_benv = n;
+    return n;
+}
+
 void grpc_server_free(grpc_server_t* s) {
     if (!s) return;
+    benv_clear(s);
     for (int i = 0; i < MAX_CONNS; i++)
         if (s->c[i].fd >= 0 || s->c[i].exec) conn_close(s, &s->c[i]);
     free(s);
@@ -556,7 +606,7 @@ static void op_exec(grpc_server_t* s, conn_t* c, grpc_rd_t* r, uint32_t flags) {
     // string that already contains a NUL is refused (it would be silently cut).
     size_t cap = r->len + 64;
     char* arena = malloc(cap);
-    char** vec = calloc((size_t)argc + 8 + GRPC_MAX_ARGS, sizeof(char*));
+    char** vec = calloc((size_t)argc + 8 + GRPC_MAX_ARGS + (size_t)s->n_benv, sizeof(char*));
     if (!arena || !vec) { free(arena); free(vec); errno = ENOMEM; return q_errno(c, "exec"); }
     size_t ao = 0;
     uint32_t nargv = 0, nenv = 0;
@@ -585,6 +635,20 @@ static void op_exec(grpc_server_t* s, conn_t* c, grpc_rd_t* r, uint32_t flags) {
         if (n >= 5 && !strncmp(e, "HOME=", 5)) have_home = 1;
         envp[nenv++] = arena + ao;
         ao += n + 1;
+    }
+    // The sandbox's base environment fills in whatever the request did not set
+    // itself. The strings live in the server and outlive the exec (the child
+    // inherits a copy of them).
+    for (int i = 0; i < s->n_benv && !r->err; i++) {
+        const char* b = s->benv[i];
+        size_t kl = (size_t)(strchr(b, '=') - b) + 1;  // "KEY="
+        bool shadowed = false;
+        for (uint32_t j = 0; j < nenv; j++)
+            if (!strncmp(envp[j], b, kl)) { shadowed = true; break; }
+        if (shadowed) continue;
+        if (!strncmp(b, "PATH=", 5)) have_path = 1;
+        if (!strncmp(b, "HOME=", 5)) have_home = 1;
+        envp[nenv++] = (char*)b;
     }
     uint32_t timeout = grpc_rd_u32(r);
     uint32_t maxout = grpc_rd_u32(r);
