@@ -260,6 +260,20 @@ jobs:
           $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
                 bash tests/e2e/smoke.sh
 
+      - name: HTTP control-plane API (root, #27)
+        # sandbox-api in front of the real daemon: create, exec, files both ways,
+        # SSE, idempotency, principal isolation, idle VM reclaim with the workspace
+        # intact, delete + re-create by key. Prints the HTTP create latency.
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
+                bash tests/e2e/http_api.sh 2>&1 | tee http_api.log
+          grep -q 'ALL PASSED' http_api.log
+          for p in 'VM is reclaimed; the session stays +PASS' 'workspace is intact +PASS' 'files from before are still there +PASS' 'another principal cannot see the session +PASS'; do
+            grep -Eq "$p" http_api.log || { echo "missing PASS line: $p"; exit 1; }
+          done
+
       - name: Latency assertions (root)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo

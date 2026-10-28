@@ -79,6 +79,25 @@ sandboxd [--config FILE] [--socket PATH] [--broker-control PATH]
          [--validate-config] [--version]
 ```
 
+## `sandbox-api` options (#27)
+
+Every flag also reads `SANDBOX_API_<NAME>` from the environment.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--engine-socket PATH` | engine default | Daemon socket. |
+| `--socket PATH` / `--no-socket` | none | Unix listener (mode 0600); the caller's uid is the principal. |
+| `--listen HOST:PORT` | off | TCP listener; needs `--tokens`. Non-loopback needs `--allow-public-bind`. |
+| `--tokens FILE` | none | `[name]` entries with `token_sha256`, optional `max_sessions`, `templates`; `[uid:N]` for unix limits. Not group/world-writable. |
+| `--template NAME` | daemon default | Template for sessions that name none. |
+| `--memory MIB`, `--vcpus N`, `--ttl SECONDS` | engine defaults | Session defaults. |
+| `--pool-wait MS` | 0 | How long a provision waits for a warm VM. |
+| `--max-running N` | 64 | VMs running at once (LRU idle eviction beyond it). |
+| `--max-sessions N` | 16 | Default sessions per principal. |
+| `--idle SECONDS` | 300 | Idle time before a session's VM is reclaimed. |
+
+`sandbox-api new-token NAME` prints a fresh token (shown once) and its tokens-file entry.
+
 ## Broker environment variables
 
 The broker is configured purely through the environment (its defaults are

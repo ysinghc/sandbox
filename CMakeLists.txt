@@ -145,6 +145,21 @@ add_executable(sandbox-broker
 )
 target_link_libraries(sandbox-broker sandbox_broker_core)
 
+# Control-plane HTTP API (#27). The core is a library so the whole server is
+# testable in-process against a fake engine; main.c is the process shim.
+add_library(sandbox_http_api STATIC
+    src/http_api/json.c
+    src/http_api/auth.c
+    src/http_api/sessions.c
+    src/http_api/server.c
+    src/http_api/engine_libsandbox.c
+)
+target_include_directories(sandbox_http_api PUBLIC include src/http_api)
+target_link_libraries(sandbox_http_api PUBLIC sandbox sandbox_broker_core pthread)
+
+add_executable(sandbox-api src/http_api/main.c)
+target_link_libraries(sandbox-api sandbox_http_api)
+
 # CLI tool
 add_executable(sandbox-cli
     src/cli/main.c
@@ -163,7 +178,7 @@ set(SANDBOX_STATE_DIR "/var/lib/sandbox-engine" CACHE PATH "Engine state dir")
 set(SANDBOX_ETC_DIR   "/etc/sandbox-engine"     CACHE PATH "Engine config dir")
 set(SANDBOX_RUN_DIR   "/var/run/sandbox-engine" CACHE PATH "Engine runtime dir")
 
-install(TARGETS sandboxd sandbox-broker sandbox-cli
+install(TARGETS sandboxd sandbox-broker sandbox-cli sandbox-api
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS sandbox sandbox++
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -181,7 +196,7 @@ install(FILES config/engine.conf DESTINATION ${SANDBOX_STATE_DIR}/config)
 install(FILES config/credentials.conf.example DESTINATION ${SANDBOX_ETC_DIR})
 
 # systemd unit (§10.3).
-install(FILES systemd/sandboxd.service
+install(FILES systemd/sandboxd.service systemd/sandbox-api.service
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
 
 # Documentation and license.

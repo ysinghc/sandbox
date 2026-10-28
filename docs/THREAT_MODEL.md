@@ -85,7 +85,22 @@ Three boundaries matter:
 | T15 | Resource exhaustion / DoS | cgroup v2 memory/CPU/OOM-group; pool queue depth; per-uid create caps | implemented, not yet load-tested |
 | T16 | Prompt-injected command does something destructive **inside** the VM | out of scope for isolation: the VM *is* the blast radius. Containment is the workspace-only writable surface (D3/D4) | by design |
 
-### 4.4 Supply chain & integrity
+### 4.3a HTTP clients → control-plane API (#27)
+
+`sandbox-api` is the first network-facing surface that can start VMs. It runs
+unprivileged and reaches the engine only as an ordinary libsandbox client, so a
+compromise of it yields the engine's per-uid session and quota limits, not root.
+
+| # | Threat | Mitigation | Status |
+|---|---|---|---|
+| T21 | Unauthenticated use over TCP | TCP refuses to start without a tokens file; tokens are 256-bit, stored as SHA-256, compared in constant time across all entries; the tokens file must not be group/world-writable | tested (`http_api`) |
+| T22 | One caller reads or drives another's session | every route resolves a session by (id, principal); a foreign id is `404`, identical to absent; the id is not guessable (96 bits) and is not the authority | tested on every route |
+| T23 | Request smuggling / oversized bodies | `Content-Length` only (chunked → 501), conflicting lengths → 400, JSON ≤ 1 MiB, files ≤ 4 MiB, bounded JSON depth/elements, connection cap | tested |
+| T24 | Path escape through the file API | paths must be under `/workspace`, `%00` rejected, enforced again by the guest agent | tested |
+| T25 | Exhausting VMs | per-principal session cap, global running-VM cap with LRU idle eviction, engine quotas | tested |
+| T26 | Credentials in transit | plain HTTP: bind loopback and put TLS in front; `--allow-public-bind` is explicit | documented |
+
+
 
 | # | Threat | Mitigation | Status |
 |---|---|---|---|

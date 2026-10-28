@@ -10,6 +10,7 @@ Start with the [project README](../README.md). These documents go deeper.
 | [CONFIGURATION.md](CONFIGURATION.md) | set daemon keys, environment variables, or broker env. |
 | [API.md](API.md) | use the C/C++ API, the CLI, the wire protocol, or the broker. |
 | [DEPLOYMENT.md](DEPLOYMENT.md) | prepare a host, install, stamp a template, start services. |
+| [API.md#http-control-plane-api-27](API.md#http-control-plane-api-27) | run `sandbox-api` and call sessions over HTTP. |
 | [TEMPLATES.md](TEMPLATES.md) | build, version, publish, roll back and garbage-collect templates; add a library. |
 | [TROUBLESHOOTING.md](TROUBLESHOOTING.md) | debug a failure. |
 

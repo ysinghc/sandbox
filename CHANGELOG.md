@@ -7,6 +7,17 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## [Unreleased]
 
+### Control-plane HTTP API (#27)
+
+- **`sandbox-api`**, an unprivileged process that exposes sessions over HTTP
+  (`/v1/sessions`): create-or-attach by key, exec, file transfer, stat/ls/mkdir, renew,
+  delete. Session ids and workspaces are a deterministic function of principal and key.
+- Bearer tokens (stored hashed) on TCP, peer uid on the Unix socket; sessions of other
+  principals are indistinguishable from absent ones. Idempotent `exec` replay, SSE
+  responses, per-principal limits, VM reclaim when idle with the workspace kept.
+- Known limits: streamed output arrives at command completion; `DELETE` leaves the
+  workspace until its TTL. See `docs/API.md`.
+
 ### Template pipeline (#25)
 
 - **Spec-driven builds.** `scripts/build-template.sh templates/<name>` goes from a

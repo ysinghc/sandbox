@@ -55,6 +55,8 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `config` | no | no | Config parser against the packaged `engine.conf`. |
 | `cgroup` | yes | no | cgroup v2 hierarchy + limits (SKIPs if not writable). |
 | `metrics` | no | no | `/health`, `/ready`, `/metrics`. |
+| `json` | no | no | #27 JSON parser/writer: depth and element bounds, surrogates, invalid UTF-8, escaping. |
+| `http_api` | no | no | #27 `sandbox-api` against an in-memory fake engine over real sockets: auth, determinism, validation, cross-principal 404s, exec (all input/encoding forms, error mapping), idempotency, SSE, files, framing limits, concurrency, unix-socket uid identity, idle reclaim, eviction, TTL expiry, start-up refusals. Also run under ASan/UBSan/TSan. The real-engine half is `tests/e2e/http_api.sh` (root, CI). |
 | `cpp_wrap` | no | no | C++ wrapper linkage against the C API. |
 
 ## CI

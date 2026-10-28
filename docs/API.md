@@ -256,6 +256,100 @@ engine.create(sandbox::Spec(256, "debian").allow_egress("pypi.org")
 engine.create(sandbox::Spec(256, "debian").no_egress());
 ```
 
+## HTTP control-plane API (#27)
+
+`sandbox-api` is a separate, **unprivileged** process in front of the daemon. It
+turns the engine into something a web assistant (or the MCP gateway, #28) can call
+over HTTP: a *session* is a persistent `/workspace` plus a VM that is provisioned on
+demand and reclaimed when idle. It speaks libsandbox to the daemon over one IPC
+connection; it holds no credentials and runs no code itself.
+
+```
+sandbox-api --socket /run/sandbox-api/api.sock --listen 127.0.0.1:8088 \
+            --tokens /etc/sandbox-engine/api-tokens.conf
+sandbox-api new-token alice      # prints the token once, and the tokens-file entry
+```
+
+### Sessions and determinism
+
+`POST /v1/sessions {"key": "..."}` is **create-or-attach**. The session id is
+`ses_` + 24 hex of SHA-256(owner, key); the engine workspace key is derived from the
+same inputs. So the same principal and key always get the same id and the same
+files, across VM reclaim, `DELETE`, and an API restart. A different principal using
+the same key gets a different session and a different workspace. Omit `key` and the
+API picks a random one.
+
+| State | Meaning |
+| --- | --- |
+| `ready` | a VM is attached |
+| `idle` | the VM was reclaimed after `--idle` seconds; the next call re-provisions one (workspace intact) |
+| `closing` | being deleted |
+
+### Endpoints
+
+All bodies are JSON unless stated. Unknown request fields are rejected (400).
+
+| Method and path | Purpose |
+| --- | --- |
+| `GET /v1/health` | liveness; no credentials |
+| `POST /v1/sessions` | create or attach. Fields: `key`, `template`, `memory_mib`, `vcpus`, `ttl_seconds`, `env`, `egress_allow` (≤16 hosts), `egress_deny_all`. `201` new, `200` attached, `409` if an existing session has different resources |
+| `GET /v1/sessions` | the caller's sessions |
+| `GET /v1/sessions/{id}` | one session |
+| `DELETE /v1/sessions/{id}` | release the VM and forget the session (`204`). The workspace remains until its TTL: the engine has no volume delete |
+| `POST /v1/sessions/{id}/renew` | `{"ttl_seconds": N}`; returns the new `expires_at` |
+| `POST /v1/sessions/{id}/exec` | `command` (shell) **or** `argv`; `cwd`, `env`, `timeout_ms`, `max_output`, `stdin` / `stdin_base64`, `output_encoding`, `stream` |
+| `PUT/GET/DELETE /v1/sessions/{id}/files?path=` | raw bytes in and out; `PUT` takes `append=1` / `exclusive=1`; limit `SANDBOX_MAX_FILE` (4 MiB) → `413` |
+| `GET /v1/sessions/{id}/stat?path=`, `/ls?path=` | metadata, directory listing |
+| `POST /v1/sessions/{id}/mkdir` | `{"path": ..., "parents": bool}` |
+
+`exec` returns `exit_code`, `term_signal`, `timed_out`, `output_truncated`,
+`duration_ms`, `stdout`, `stderr`. Invalid UTF-8 is replaced with U+FFFD unless
+`output_encoding` is `base64`. Paths must be under `/workspace` (`400 path_denied`).
+
+### Streaming
+
+`"stream": true` answers `text/event-stream` with `started`, `stdout`, `stderr`,
+`exit` (and `error`) events plus `: keepalive` comments. **Output is delivered when
+the command finishes**: the engine returns a command's output at completion, so this
+is a transport for long commands (the connection stays alive), not live tailing. Live
+streaming needs a streaming operation in the guest RPC and is not done.
+
+### Authentication and isolation
+
+* **TCP** requires a bearer token. The tokens file (INI, mode ≤ 0640, never
+  group/world-writable) stores only `token_sha256`; comparison is constant time over
+  every entry. Per-principal `max_sessions` and `templates` allow-list. Without
+  tokens a TCP listener is refused at start-up; non-loopback needs `--allow-public-bind`
+  (and TLS in front: the API speaks plain HTTP).
+* **Unix socket** (mode 0600 by default): the caller is `uid:N` from `SO_PEERCRED`;
+  no token.
+* A session belongs to its principal. Anyone else gets `404`, identical to a session
+  that does not exist.
+
+### Idempotency
+
+`Idempotency-Key` on `exec` replays the first response for 10 minutes instead of
+running the command again (128-entry cache; `5xx` responses are not cached). Create
+is idempotent by construction.
+
+### Errors
+
+`{"error": {"code": "...", "message": "..."}}`. Engine errors map as: invalid
+argument/path → 400, not found → 404, quota/pool exhausted → 429 (with `Retry-After`),
+timeout → 504, unavailable → 503, other → 500. `401` bad or missing token, `403`
+template not allowed, `413` body/file too large, `501` chunked requests (send
+`Content-Length`).
+
+### Limits
+
+JSON body ≤ 1 MiB; `--max-connections` 128; `--max-running` VMs 64 (least-recently-used
+idle sessions are evicted to admit a new one); sessions per principal default 16.
+One process holds one daemon connection, so total capacity is bounded by the engine's
+per-connection caps (128 owned sandboxes, 16 concurrent guest operations). If the
+daemon stays unreachable (3 failures in 10 s) the process exits `75` so systemd
+restarts it. The session table is in memory: after a restart, re-POST `create` with
+the same key to reattach.
+
 ## Determinism
 
 "Deterministic" here means **a reproducible environment and start state**, not

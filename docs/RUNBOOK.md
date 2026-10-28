@@ -9,6 +9,7 @@ Operational procedures for a production install. Paths use the CMake defaults
 | Unit / process | Binary | Listens / talks to |
 |---|---|---|
 | `sandboxd.service` | `/usr/local/bin/sandboxd` | `engine.sock` (clients), `broker-control.sock` (broker), `:9180` (metrics/health) |
+| `sandbox-api.service` | `/usr/local/bin/sandbox-api` | `/run/sandbox-api/api.sock`, `127.0.0.1:8088` (see [API.md](API.md#http-control-plane-api-27)); exits 75 if the daemon is lost and is restarted by systemd. Its tokens file lives at `/etc/sandbox-engine/api-tokens.conf`; mint one with `sandbox-api new-token NAME`. Add the service uid (and any unix-socket callers) to `allowed_uids` |
 | `sandbox-broker` | `/usr/local/bin/sandbox-broker` | `0.0.0.0:8080` (guests), `broker-control.sock` (engine) |
 | Firecracker | `/usr/local/bin/firecracker` | spawned per VM by sandboxd, jailed + cgroup-limited |
 

@@ -1,0 +1,30 @@
+[Unit]
+Description=Sandbox Engine control-plane HTTP API
+After=sandboxd.service
+Requires=sandboxd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandbox-api --socket /run/sandbox-api/api.sock --listen 127.0.0.1:8088 --tokens /etc/sandbox-engine/api-tokens.conf
+# Exit code 75 means the daemon was lost; come back once it is.
+Restart=on-failure
+RestartSec=3s
+StandardError=journal
+
+# Unprivileged: it only needs to reach the daemon's socket (allow this uid in
+# allowed_uids) and write its own socket directory.
+User=sandbox-api
+Group=sandbox-api
+RuntimeDirectory=sandbox-api
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

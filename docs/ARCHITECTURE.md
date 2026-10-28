@@ -35,6 +35,7 @@ reclaims every sandbox in that session.
 | Network manager | `src/network_manager.c` | Per-VM tap and nftables rules (via libnftables, or `nft`). |
 | cgroups | `src/cgroup.c` | cgroup v2 hierarchy, memory/cpu limits, OOM grouping. |
 | Broker | `src/broker/{core,http,credentials}.c` | Token validation, allow-listing, credential injection, HTTPS proxying. |
+| HTTP API | `src/http_api/{server,sessions,auth,json,main}.c` | `sandbox-api`: unprivileged HTTP front end (#27). Sessions = persistent workspace + lazily provisioned VM; a libsandbox client of the daemon. |
 | Telemetry | `src/telemetry.c` | `/health`, `/ready`, `/metrics`. |
 | Logging | `src/log.c` | Structured JSON logs to stderr (captured by journald). |
 | Client libs | `src/lifecycle.c`, `src/cpp/sandbox.cpp` | C and C++ client APIs. |

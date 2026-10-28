@@ -266,3 +266,16 @@ set_tests_properties(template_store PROPERTIES TIMEOUT 120)
 # #25: the spec format and its validation (build-template.sh --check; no root).
 add_test(NAME template_spec COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_template_spec.sh)
 set_tests_properties(template_spec PROPERTIES TIMEOUT 60)
+
+# #27: the control-plane API's JSON reader/writer.
+add_executable(test_json test_json.c ../src/http_api/json.c)
+target_include_directories(test_json PRIVATE ../include)
+add_test(NAME json COMMAND test_json)
+set_tests_properties(json PROPERTIES TIMEOUT 30)
+
+# #27: the control-plane HTTP API over real sockets against a fake engine (no
+# root, no KVM, no daemon).
+add_executable(test_http_api test_http_api.c)
+target_link_libraries(test_http_api sandbox_http_api)
+add_test(NAME http_api COMMAND test_http_api)
+set_tests_properties(http_api PROPERTIES TIMEOUT 120)
