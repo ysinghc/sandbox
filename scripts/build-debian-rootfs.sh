@@ -62,10 +62,17 @@ log "debootstrap $SUITE ($ARCH) from $MIRROR"
 # packages". That is routine for a public mirror and says nothing about the image,
 # so retry; the cache keeps everything already fetched, so a retry only asks for
 # what was missing.
+#
+# A stalled connection is worse than a failed one: debootstrap's wget has no
+# overall timeout, and one dead socket hung a CI job for 40+ minutes. So give wget
+# its own read timeout and bound every attempt, which turns a stall into a failure
+# the retry can handle.
 CACHE="$WORK/cache"
 mkdir -p "$CACHE"
+printf 'timeout = 30\ntries = 3\nwaitretry = 2\n' >"$WORK/wgetrc"
+export WGETRC="$WORK/wgetrc"
 attempt=1
-until debootstrap --arch="$ARCH" --variant=minbase --include="$PACKAGES" \
+until timeout --kill-after=30 "${DEBOOTSTRAP_TIMEOUT:-900}" debootstrap --arch="$ARCH" --variant=minbase --include="$PACKAGES" \
         --cache-dir="$CACHE" "$SUITE" "$ROOTDIR" "$MIRROR" >"$WORK/debootstrap.log" 2>&1; do
     tail -5 "$WORK/debootstrap.log" >&2
     if [ "$attempt" -ge "${DEBOOTSTRAP_ATTEMPTS:-3}" ]; then
