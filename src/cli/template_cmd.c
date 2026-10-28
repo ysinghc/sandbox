@@ -5,12 +5,23 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+#include <stdint.h>
+
+#include "sandbox_fs.h"
+#include "sha256.h"
 #include "snapshot_manager.h"
 #include "template_store.h"
 
 void template_usage(void) {
-    printf("  sandbox-cli template list\n"
+    printf("  sandbox-cli template build --name NAME --kernel PATH --rootfs PATH\n"
+           "                             [--memory MIB] [--vcpus N] [--workspace-mb MIB]\n"
+           "                             [--spec NAME] [--spec-sha256 HEX]\n"
+           "      cold-boots the image, snapshots it and publishes it as NAME (needs\n"
+           "      root and /dev/kvm). The build is staged as .build-NAME, so the\n"
+           "      template being served is untouched until the new one is complete.\n"
+           "  sandbox-cli template list\n"
            "      every published name with its digest, then store entries nothing\n"
            "      points at (JSON, one object per line)\n"
            "  sandbox-cli template publish --name NAME --staged DIR [--spec NAME]\n"
@@ -37,6 +48,8 @@ int template_main(int argc, char** argv) {
     }
     const char* sub = argv[0];
     const char *name = NULL, *staged = NULL, *spec = NULL, *spec_sha = NULL, *kernel_sha = NULL;
+    const char *kernel = NULL, *rootfs = NULL;
+    unsigned long memory = 256, vcpus = 1, workspace_mb = 512;
     unsigned keep = 2;
     long min_age = 86400;
     int apply = 0;
@@ -50,6 +63,11 @@ int template_main(int argc, char** argv) {
         else if (!strcmp(a, "--kernel-sha256") && v) kernel_sha = argv[++i];
         else if (!strcmp(a, "--keep") && v) keep = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--min-age") && v) min_age = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--kernel") && v) kernel = argv[++i];
+        else if (!strcmp(a, "--rootfs") && v) rootfs = argv[++i];
+        else if (!strcmp(a, "--memory") && v) memory = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--vcpus") && v) vcpus = strtoul(argv[++i], NULL, 10);
+        else if (!strcmp(a, "--workspace-mb") && v) workspace_mb = strtoul(argv[++i], NULL, 10);
         else if (!strcmp(a, "--apply")) apply = 1;
         else {
             fprintf(stderr, "template %s: unknown argument %s\n", sub, a);
@@ -72,6 +90,33 @@ int template_main(int argc, char** argv) {
     if (!name) {
         template_usage();
         return 2;
+    }
+    if (!strcmp(sub, "build")) {
+        if (!kernel || !rootfs || !tstore_name_valid(name) || memory == 0 || vcpus == 0) {
+            template_usage();
+            return 2;
+        }
+        char staged[80], sp[4200];
+        snprintf(staged, sizeof(staged), ".build-%s", name);
+        snprintf(sp, sizeof(sp), "%s/%s", snapshot_root_dir(), staged);
+        chmod(sp, 0755);
+        sandbox_rm_rf(sp);  // a crashed earlier build
+        template_config_t cfg = {.memory_mib = memory,
+                                 .vcpu_count = (uint32_t)vcpus,
+                                 .kernel_path = kernel,
+                                 .rootfs_path = rootfs,
+                                 .ready_marker = "SANDBOX-READY",
+                                 .workspace_size_mb = (uint32_t)workspace_mb};
+        if (create_snapshot_template(staged, &cfg) < 0) return fail("build");
+        uint8_t kd[32];
+        char khex[65];
+        if (sha256_file(kernel, kd) < 0) return fail("build (hash kernel)");
+        sha256_hex(kd, khex);
+        tstore_meta_t meta = {.spec_sha256 = spec_sha, .kernel_sha256 = khex,
+                              .spec_name = spec};
+        if (tstore_publish(name, staged, &meta, dg) < 0) return fail("publish");
+        printf("{\"event\":\"built\",\"name\":\"%s\",\"digest\":\"%s\"}\n", name, dg);
+        return 0;
     }
     if (!strcmp(sub, "publish")) {
         if (!staged) {

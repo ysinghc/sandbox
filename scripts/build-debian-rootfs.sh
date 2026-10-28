@@ -21,14 +21,33 @@
 #   SANDBOX_DEBIAN_ARCH       amd64/arm64 (default: host arch; must match host)
 #   SANDBOX_DEBIAN_PACKAGES   extra comma-separated packages
 #   SANDBOX_DEBIAN_SIZE_MB    fixed image size (default: derived from content)
+#   SANDBOX_DEBIAN_CACHE_DIR  package cache; reuse it so a rebuild installs the same .debs
+#   SANDBOX_DEBIAN_PROVISION  script run as root inside the new root after the packages
+#                             are installed (the "build steps" of a template, #25)
+#   SOURCE_DATE_EPOCH         timestamp every file is clamped to and the filesystem is
+#                             stamped with; default: the commit time of this checkout.
+#                             With the same inputs (revision, suite, mirror, packages,
+#                             provision script, cached packages) the image is
+#                             byte-identical, which is what makes a template's digest
+#                             attributable to its spec rather than to the build.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --suite) SANDBOX_DEBIAN_SUITE="${2:?--suite needs a value}"; shift 2 ;;
+        --out) SANDBOX_ROOTFS_OUT="${2:?--out needs a value}"; shift 2 ;;
+        *) echo "[debian] error: unknown argument $1" >&2; exit 2 ;;
+    esac
+done
 SUITE="${SANDBOX_DEBIAN_SUITE:-bookworm}"
 MIRROR="${SANDBOX_DEBIAN_MIRROR:-http://deb.debian.org/debian}"
 ARCH="${SANDBOX_DEBIAN_ARCH:-$(dpkg --print-architecture)}"
 OUT="${SANDBOX_ROOTFS_OUT:-/opt/sandbox-assets/rootfs-debian.ext4}"
 SIZE_MB="${SANDBOX_DEBIAN_SIZE_MB:-0}"
+PROVISION="${SANDBOX_DEBIAN_PROVISION:-}"
+SDE="${SOURCE_DATE_EPOCH:-$(git -C "$REPO_ROOT" log -1 --format=%ct 2>/dev/null || true)}"
+SDE="${SDE:-1700000000}"
 
 # The set an agent sandbox needs to be useful out of the box. Deliberately small:
 # python3 (not the -dev tree), curl for API calls, iproute2 because /init brings
@@ -52,7 +71,10 @@ HOST_ARCH="$(dpkg --print-architecture)"
 mkdir -p "$(dirname "$OUT")"
 WORK="$(mktemp -d /var/tmp/debian-rootfs.XXXXXX)"
 ROOTDIR="$WORK/root"
-cleanup() { rm -rf "$WORK"; }
+cleanup() {
+    for m in dev/pts dev proc; do umount "$ROOTDIR/$m" 2>/dev/null || true; done
+    rm -rf "$WORK"
+}
 trap cleanup EXIT
 
 # ── 1. Base system ───────────────────────────────────────────────────────────
@@ -67,7 +89,7 @@ log "debootstrap $SUITE ($ARCH) from $MIRROR"
 # overall timeout, and one dead socket hung a CI job for 40+ minutes. So give wget
 # its own read timeout and bound every attempt, which turns a stall into a failure
 # the retry can handle.
-CACHE="$WORK/cache"
+CACHE="${SANDBOX_DEBIAN_CACHE_DIR:-$WORK/cache}"
 mkdir -p "$CACHE"
 printf 'timeout = 30\ntries = 3\nwaitretry = 2\n' >"$WORK/wgetrc"
 export WGETRC="$WORK/wgetrc"
@@ -91,13 +113,33 @@ log "  base: $(cat "$ROOTDIR/etc/debian_version" 2>/dev/null || echo unknown) ($
 # env injection over vsock, /workspace mounted after every restore.
 log "Building the guest agent (static, $ARCH)"
 gcc -static -O2 -Wall -Wextra -I"$REPO_ROOT/include" \
-    -o "$ROOTDIR/bin/sandbox-agent" \
+    -ffile-prefix-map="$REPO_ROOT"=. -o "$ROOTDIR/bin/sandbox-agent" \
     "$REPO_ROOT/scripts/sandbox-agent.c" "$REPO_ROOT/src/vsock_peer.c" \
     "$REPO_ROOT/src/guest_rpc_server.c" "$REPO_ROOT/src/guest_rpc_wire.c"
 chmod 0755 "$ROOTDIR/bin/sandbox-agent"
 
 log "Installing /init (shared with the busybox image)"
 install -m 0755 "$REPO_ROOT/scripts/guest-init.sh" "$ROOTDIR/init"
+
+# ── 2b. Template build steps ─────────────────────────────────────────────────
+# What a template adds to the base image beyond the package list. It runs with
+# the host's network (it is a build, not a sandbox) so it can fetch pinned
+# artifacts; for the image to stay reproducible it must not depend on anything
+# that changes between runs (unpinned downloads, the date, random values).
+if [ -n "$PROVISION" ]; then
+    [ -f "$PROVISION" ] || die "provision script not found: $PROVISION"
+    log "Running the provision script: $PROVISION"
+    install -m 0755 "$PROVISION" "$ROOTDIR/tmp/provision.sh"
+    cp /etc/resolv.conf "$ROOTDIR/etc/resolv.conf"
+    mount -t proc proc "$ROOTDIR/proc"
+    mount --bind /dev "$ROOTDIR/dev"
+    mount -t devpts devpts "$ROOTDIR/dev/pts"
+    if ! chroot "$ROOTDIR" /usr/bin/env -i HOME=/root PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            SOURCE_DATE_EPOCH="$SDE" DEBIAN_FRONTEND=noninteractive /bin/bash /tmp/provision.sh; then
+        die "the provision script failed"
+    fi
+    umount "$ROOTDIR/dev/pts" "$ROOTDIR/dev" "$ROOTDIR/proc"
+fi
 
 # The root fs is mounted read-only, so the mountpoint must exist in the image.
 mkdir -p "$ROOTDIR/workspace" "$ROOTDIR/run" "$ROOTDIR/tmp"
@@ -129,6 +171,20 @@ nameserver 1.1.1.1
 RESOLV
 ln -sf /usr/share/zoneinfo/Etc/UTC "$ROOTDIR/etc/localtime"
 
+# ── 3b. Make the image a function of its inputs ──────────────────────────────
+# Everything below removes or pins something that would otherwise differ between
+# two builds of the same spec: the install date, caches keyed on inode numbers
+# and mtimes, and files newer than the epoch.
+rm -f "$ROOTDIR"/var/cache/ldconfig/aux-cache "$ROOTDIR"/var/cache/apt/*.bin \
+      "$ROOTDIR"/var/cache/debconf/*-old "$ROOTDIR"/var/lib/dpkg/*-old \
+      "$ROOTDIR"/etc/resolv.conf.dpkg-* "$ROOTDIR"/run/* 2>/dev/null || true
+: > "$ROOTDIR/etc/machine-id"
+for f in "$ROOTDIR/etc/shadow" "$ROOTDIR/etc/shadow-"; do
+    # field 3 of shadow is "days since epoch of the last password change"
+    [ -f "$f" ] && sed -i -E "s/^([^:]*:[^:]*:)[0-9]+:/\1$((SDE / 86400)):/" "$f"
+done
+find "$ROOTDIR" -xdev -newermt "@$SDE" -print0 | xargs -0 -r touch -h -d "@$SDE"
+
 # ── 4. ext4 image ────────────────────────────────────────────────────────────
 # mke2fs -d populates the filesystem from the directory in one pass: no loop
 # mount, no mount namespace, and the result is a sparse file (the image's
@@ -141,7 +197,12 @@ fi
 log "creating ${SIZE_MB}MiB sparse ext4 at $OUT (content ${USED_MB}MiB)"
 rm -f "$OUT"
 truncate -s "${SIZE_MB}M" "$OUT"
-mke2fs -q -t ext4 -F -L sandbox-root -d "$ROOTDIR" "$OUT"
+# A fixed UUID and hash seed, and every timestamp the tool would take from the
+# clock taken from SOURCE_DATE_EPOCH instead: mke2fs would otherwise stamp each
+# image with a fresh random identity and "now".
+FS_UUID="5b0e5a1d-7c0f-4f6e-9d2a-0c1f5a6d7e80"
+E2FSPROGS_FAKE_TIME="$SDE" mke2fs -q -t ext4 -F -L sandbox-root -U "$FS_UUID" \
+    -E "hash_seed=$FS_UUID,root_owner=0:0,nodiscard" -d "$ROOTDIR" "$OUT"
 
 # ── 5. Verify the image itself, not the directory it came from ──────────────
 # Both checks read the finished filesystem, so a bad copy (lost mode, missing

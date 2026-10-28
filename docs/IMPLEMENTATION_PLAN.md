@@ -232,8 +232,9 @@ peer, cid 1) and the guest asserts the positive direction
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
 | #24 guest RPC | ✅ guest, host client, IPC, libsandbox, C++, CLI; privileged CI green on busybox and Debian |
 | #7 broker streaming | ✅ chunked and Content-Length bodies stream with bounded memory; `SANDBOX_BROKER_MAX_BODY` (256 MiB) → 413; 64 MiB SHA-256 fidelity + RSS bound tested |
+| #25 template pipeline | 🔶 spec-driven build, content-addressed store, rollback, GC, reproducible image, docs; unit tests green, privileged CI run pending. aarch64 build leg deferred with the ARM milestone |
 | #26 egress policy | ✅ policy model, per-session plumbing, broker as a forward proxy (absolute-form + CONNECT), public-address guard, threaded broker, guest NIC + proxy env hand-off, exec inherits the spec env; unit/in-process tests and the privileged Debian e2e (incl. a real package index through the broker) green in CI |
-| M2 #25, #27, #28 | ⏳ not started |
+| M2 #27, #28 | ⏳ not started |
 
 ### What the `jail_cleanup` fix actually became
 
@@ -501,9 +502,11 @@ The agent is PID 1 and reaps every orphan; background daemons started by `exec`
 survive the call (only the timeout/cancel path kills the group).
 
 ### #25 — Template pipeline
-`scripts/build-template.sh`, `publish-template.sh`, `gc-templates.sh`;
-`template.json` metadata; `snapshot_publish()`/GC in `src/snapshot_manager.c`;
-`sandbox-cli template {list,build,gc}`.
+`scripts/build-template.sh` (spec → image → snapshot → publish), `templates/<name>/`
+specs, `src/template_store.c` (content-addressed store: publish, rollback, GC),
+`sandbox-cli template {build,publish,list,verify,rollback,unpublish,gc}`;
+`template.json` metadata. Documented in `docs/TEMPLATES.md`. Publish/GC are CLI
+operations rather than separate scripts so they share one locked implementation.
 
 ### #26 — Per-session egress policy
 Extend `sandbox_egress_policy_t` into `sandbox_spec_t`. `src/network_manager.c`

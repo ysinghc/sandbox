@@ -5,6 +5,7 @@
 // root/KVM/assets; hard-fails only on real errors so consumers never run
 // against half-built state.
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,6 +14,7 @@
 
 #include "sandbox_fs.h"
 #include "snapshot_manager.h"
+#include "template_store.h"
 
 #define ASSET_KERNEL "/opt/sandbox-assets/vmlinux"
 #define ASSET_ROOTFS "/opt/sandbox-assets/rootfs.ext4"
@@ -107,8 +109,27 @@ int main(void) {
     char rm[8192];
     snprintf(rm, sizeof(rm), "rm -rf %s %s", stale, stale_ready);
     if (system(rm) != 0) return 1;
-    if (create_snapshot_template(tmpl, &cfg) < 0) {
+    // Build it the way an operator does (#25): staged, then published into the
+    // content-addressed store, so every consumer of this fixture -- the daemon
+    // and the whole privileged suite -- restores through the name symlink.
+    char staged[128];
+    snprintf(staged, sizeof(staged), ".build-%s", tmpl);
+    char stale_stage[4096];
+    snprintf(stale_stage, sizeof(stale_stage), "%s/%s", snap_root, staged);
+    chmod(stale_stage, 0755);
+    sandbox_rm_rf(stale_stage);
+    if (create_snapshot_template(staged, &cfg) < 0) {
         fprintf(stderr, "FAIL template setup: create_snapshot_template\n");
+        return 1;
+    }
+    char digest[TSTORE_DIGEST_LEN + 1];
+    if (tstore_publish(tmpl, staged, NULL, digest) < 0) {
+        fprintf(stderr, "FAIL template setup: tstore_publish: %s\n", strerror(errno));
+        return 1;
+    }
+    printf("[tmpl] published %s as %s\n", tmpl, digest);
+    if (tstore_verify(tmpl) < 0) {
+        fprintf(stderr, "FAIL template setup: the published template does not verify\n");
         return 1;
     }
     char ready[4096];

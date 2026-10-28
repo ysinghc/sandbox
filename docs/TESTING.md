@@ -42,7 +42,9 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `jailer` | no* | no | seccomp enforcement (always); full chroot+uid-drop sequence (*SKIPs where unprivileged user namespaces are restricted, e.g. Ubuntu 24.04 AppArmor). |
 | `network` / `network_cleanup` | yes | no | Per-VM tap + nftables rules; leaks are cleaned by fixture teardown. |
 | `snapshot` | no | no | Manifest build/read, `header_size` guard, SHA-256 integrity of `memory.snap`, `vmstate` **and `rootfs.ext4`**. |
-| `tmpl_setup` | yes | yes | Builds the `e2e` template (fixture setup). |
+| `tmpl_setup` | yes | yes | Builds the `e2e` template (fixture setup) through the content-addressed store, so every consumer restores through the name symlink. |
+| `template_store` | no | no | The store (#25): publish, dedupe, rollback, adoption of a legacy directory, tamper detection, GC policy, and that a concurrent reader never sees the name missing. Fabricated tiny templates. |
+| `template_spec` | no | no | `build-template.sh --check`: spec validation, digests, and that a spec is parsed as data. |
 | `vmm` | yes | yes | Restore, env inject, readiness/confirm, cgroup placement; the `/snapshot/load` body (clock/tap/vsock) is asserted even without root. |
 | `uffd` | no | no | Lazy-restore page-fault handling (SKIPs if userfaultfd denied). |
 | `broker` | no | no | Request pipeline against an in-process mock engine + upstream. #26: proxy mode (absolute-form, 407, CONNECT through a live echo with 300 KiB round trips and half-close), the public-address guard (relay and CONNECT, v4/v6/mapped), a named host is relayed without a credential, `*` is not, wrong port / unlisted / empty policy → 403, decisions exported as metrics. #7: 64 MiB bodies (Content-Length and chunked) hashed end to end with a peak-RSS bound, 413 for oversize (declared and chunked), exact-limit pass, 400 for bad chunk framing. |

@@ -104,17 +104,29 @@ static void fsync_dir(const char* path) {
 int tstore_digest(const char* ref, char out[TSTORE_DIGEST_LEN + 1]) {
     snap_manifest_t* m = NULL;
     if (read_manifest(ref, &m) < 0) return -1;
-    char mem[65], vms[65], rfs[65], wks[65];
+    char mem[65], vms[65], rfs[65], wks[65], krn[65] = "none";
+    // The kernel is bundled beside the snapshot but not bound by the manifest.
+    // It decides what the guest runs on, so it is part of the identity.
+    char kp[PATH_MAX];
+    uint8_t kd[32];
+    if (pfmt(kp, sizeof(kp), "%s/%s/vmlinux", snapshot_root_dir(), ref) == 0 &&
+        access(kp, F_OK) == 0) {
+        if (sha256_file(kp, kd) < 0) {
+            free(m);
+            return -1;
+        }
+        sha256_hex(kd, krn);
+    }
     sha256_hex(m->memory_sha256, mem);
     sha256_hex(m->vmstate_sha256, vms);
     sha256_hex(m->rootfs_sha256, rfs);
     sha256_hex(m->workspace_sha256, wks);
-    char buf[512];
+    char buf[640];
     int n = snprintf(buf, sizeof(buf),
                      "sandbox-template/v1\nmemory %s\nvmstate %s\nrootfs %s\n"
-                     "workspace %s\nmem_size %llu\nrootfs_size %llu\n"
+                     "workspace %s\nkernel %s\nmem_size %llu\nrootfs_size %llu\n"
                      "workspace_size %llu\n",
-                     mem, vms, rfs, wks, (unsigned long long)m->guest_mem_size,
+                     mem, vms, rfs, wks, krn, (unsigned long long)m->guest_mem_size,
                      (unsigned long long)m->rootfs_size,
                      (unsigned long long)m->workspace_size);
     free(m);
@@ -282,8 +294,32 @@ static int write_meta(const char* dir, const char* name, const char* digest,
 // Verify the template at <root>/<ref>, then move it into the store as its
 // digest. If that digest is already stored the new copy is a duplicate and is
 // dropped (and the stored one's age refreshed).
+// The manifest's version is how the daemon notices a changed template (it drains
+// its warm pool when the number differs). A staged build cannot count rebuilds --
+// it is built under a staging name -- so the version is derived from the content:
+// the same template always has the same version, a different one a different
+// version (to within a 32-bit collision), and a rollback restores the old one.
+static int stamp_version(const char* ref, const char* digest) {
+    snap_manifest_t* m = NULL;
+    if (read_manifest(ref, &m) < 0) return -1;
+    char hex[9];
+    memcpy(hex, digest, 8);
+    hex[8] = '\0';
+    uint32_t v = (uint32_t)strtoul(hex, NULL, 16);
+    if (v == 0) v = 1;
+    int rc = 0;
+    if (m->version != v) {
+        char p[PATH_MAX];
+        m->version = v;
+        rc = pfmt(p, sizeof(p), "%s/%s/manifest.bin", snapshot_root_dir(), ref);
+        if (rc == 0) rc = write_manifest(p, m);
+    }
+    free(m);
+    return rc;
+}
+
 static int ingest(const char* ref, const char* name, const tstore_meta_t* meta,
-                  char digest[TSTORE_DIGEST_LEN + 1]) {
+                  char digest[TSTORE_DIGEST_LEN + 1], int stamp) {
     if (snapshot_verify(ref) < 0) {
         errno = EBADMSG;
         return -1;
@@ -297,6 +333,7 @@ static int ingest(const char* ref, const char* name, const tstore_meta_t* meta,
         remove_entry(src);
         return 0;
     }
+    if (stamp && stamp_version(ref, digest) < 0) return -1;
     if (write_meta(src, name, digest, meta) < 0) return -1;
     freeze_files(src);
     if (rename(src, dst) < 0) return -1;
@@ -358,7 +395,7 @@ int tstore_publish(const char* name, const char* staged, const tstore_meta_t* me
     // what was being served stays reachable (and rollback-able).
     if (pfmt(np, sizeof(np), "%s/%s", snapshot_root_dir(), name) < 0) goto out;
     if (lstat(np, &st) == 0 && S_ISDIR(st.st_mode)) {
-        if (ingest(name, name, meta, dg) < 0) goto out;
+        if (ingest(name, name, meta, dg, 0) < 0) goto out;
         hist_append(name, dg, "adopt");
         adopted = 1;
     }
@@ -369,7 +406,7 @@ int tstore_publish(const char* name, const char* staged, const tstore_meta_t* me
             errno = ENOTDIR;
             goto out;
         }
-        if (ingest(staged, name, meta, dg) < 0) goto out;
+        if (ingest(staged, name, meta, dg, 1) < 0) goto out;
     } else if (!adopted) {
         // Nothing staged and nothing legacy to adopt: there is nothing to publish.
         errno = ENOENT;

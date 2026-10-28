@@ -175,6 +175,85 @@ jobs:
           grep -F "kernel=$SANDBOX_KERNEL" /tmp/privileged-ctest-debian.log \
             || { echo "::error::the Debian run did not use $SANDBOX_KERNEL"; exit 1; }
 
+      - name: Template pipeline from a checked-in spec (#25)
+        # The pipeline an operator drives: spec -> image -> cold boot -> snapshot ->
+        # content-addressed store. Asserted, not just run:
+        #   * the image is a function of the spec (two builds, same bytes);
+        #   * the published template verifies, is a store link, and records the
+        #     spec and kernel it came from;
+        #   * a second build is published beside it, rollback returns to the
+        #     first and back, and GC keeps the current one and drops the other.
+        # (The restore path itself is covered by the suites above, which build
+        # their template through the same store.)
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          set -euo pipefail
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          ROOT="$(mktemp -d /var/tmp/tpl-e2e.XXXXXX)"
+          cleanup() { $SUDO chmod -R u+w "$ROOT" 2>/dev/null || true; $SUDO rm -rf "$ROOT"; }
+          trap cleanup EXIT
+          export SOURCE_DATE_EPOCH=1700000000
+          CLI="$PWD/build/sandbox-cli"
+
+          for n in a b; do
+            $SUDO env SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" bash scripts/build-template.sh \
+                templates/python-agent --rootfs-only --cache-dir "$ROOT/cache" \
+                --keep-rootfs "$ROOT/$n.ext4" | tee "$ROOT/$n.out"
+          done
+          A="$(sed -n 's/^rootfs_sha256=//p' "$ROOT/a.out")"; B="$(sed -n 's/^rootfs_sha256=//p' "$ROOT/b.out")"
+          [ -n "$A" ] || { echo "::error::no image digest was printed"; exit 1; }
+          if [ "$A" != "$B" ]; then
+            echo "::error::two builds of the same spec produced different images ($A vs $B)"
+            mkdir -p "$ROOT/ma" "$ROOT/mb"
+            $SUDO mount -o loop,ro "$ROOT/a.ext4" "$ROOT/ma"; $SUDO mount -o loop,ro "$ROOT/b.ext4" "$ROOT/mb"
+            $SUDO diff -rq "$ROOT/ma" "$ROOT/mb" | head -40 || true
+            for m in ma mb; do $SUDO sh -c "cd $ROOT/$m && find . -xdev -printf '%p %m %U %G %s %T@ %i\n' | sort" > "$ROOT/$m.meta"; done
+            diff "$ROOT/ma.meta" "$ROOT/mb.meta" | head -40 || true
+            $SUDO umount "$ROOT/ma" "$ROOT/mb"
+            exit 1
+          fi
+          echo "image reproducible: $A"
+
+          SNAP="$ROOT/snap"
+          tenv() { $SUDO env SANDBOX_SNAPSHOT_ROOT="$SNAP" SANDBOX_JAIL_ROOT="$ROOT/jails" \
+                       SANDBOX_WORKSPACE_ROOT="$ROOT/ws" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" "$@"; }
+          build() { tenv bash scripts/build-template.sh templates/python-agent --kernel "$SANDBOX_KERNEL" \
+                        --cli "$CLI" --cache-dir "$ROOT/cache" --keep-rootfs "$ROOT/t.ext4" | tee "$ROOT/build.out" >&2
+                    sed -n 's/.*"event":"built".*"digest":"\([0-9a-f]\{64\}\)".*/\1/p' "$ROOT/build.out" | tail -1; }
+          D1="$(build | tail -1)"
+          [ -n "$D1" ] || { echo "::error::the build printed no digest"; exit 1; }
+          [ -L "$SNAP/python-agent" ] || { echo "::error::the published name is not a store link"; exit 1; }
+          tenv "$CLI" template verify --name python-agent
+          tenv "$CLI" template verify --name "$D1"
+          tenv "$CLI" template list | tee "$ROOT/list.out"
+          grep -F "\"digest\":\"$D1\"" "$ROOT/list.out" >/dev/null || { echo "::error::list does not show $D1"; exit 1; }
+          META="$SNAP/.store/$D1/template.json"
+          SPEC_SHA="$(bash scripts/build-template.sh templates/python-agent --check | sed -n 's/^spec_sha256=//p')"
+          KSHA="$(sha256sum "$SANDBOX_KERNEL" | cut -d' ' -f1)"
+          grep -F "\"spec_sha256\": \"$SPEC_SHA\"" "$META" >/dev/null || { echo "::error::template.json lacks the spec digest"; cat "$META"; exit 1; }
+          grep -F "\"kernel_sha256\": \"$KSHA\"" "$META" >/dev/null || { echo "::error::template.json lacks the kernel digest"; cat "$META"; exit 1; }
+          cat "$META"
+
+          D2="$(build | tail -1)"
+          [ -n "$D2" ] || { echo "::error::the second build printed no digest"; exit 1; }
+          if [ "$D1" = "$D2" ]; then
+            echo "the two snapshots were byte-identical ($D1): publish deduplicated"
+          else
+            echo "snapshots differ run to run ($D1 vs $D2): expected, memory is not bit-reproducible"
+            tenv "$CLI" template rollback --name python-agent | tee "$ROOT/rb.out"
+            grep -F "$D1" "$ROOT/rb.out" >/dev/null || { echo "::error::rollback did not return to $D1"; exit 1; }
+            [ "$(basename "$(readlink "$SNAP/python-agent")")" = "$D1" ] || { echo "::error::the name does not point at $D1"; exit 1; }
+            tenv "$CLI" template rollback --name python-agent | grep -F "$D2" >/dev/null \
+                || { echo "::error::second rollback did not return to $D2"; exit 1; }
+            tenv "$CLI" template gc --keep 1 --min-age 0 | tee "$ROOT/gc-dry.out"
+            [ -d "$SNAP/.store/$D1" ] || { echo "::error::a dry run removed $D1"; exit 1; }
+            tenv "$CLI" template gc --keep 1 --min-age 0 --apply | tee "$ROOT/gc.out"
+            [ ! -e "$SNAP/.store/$D1" ] || { echo "::error::gc kept the unreferenced $D1"; exit 1; }
+            [ -d "$SNAP/.store/$D2" ] || { echo "::error::gc removed the current template"; exit 1; }
+            tenv "$CLI" template verify --name python-agent
+          fi
+          echo "template pipeline OK"
+
       - name: e2e smoke (root)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo

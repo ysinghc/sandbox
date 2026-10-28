@@ -60,23 +60,26 @@ systemctl restart sandboxd.service
 event fields) captured and rotated by journald.
 
 ### Rebuild a template
-Templates carry a manifest with SHA-256 digests (§10.10); a template built by an
-older engine is rejected. Rebuild with the current binaries:
+A template built by an older engine is rejected (the manifest is format-versioned).
+Rebuild with the current binaries from its spec; the engine can keep serving the
+old template until the new one is published, and the switch is atomic:
 
 ```sh
-sudo systemctl stop sandboxd.service
-# rebuild the "python-agent" template (make_template or your capture tooling),
-# writing into /var/lib/sandbox-engine/snapshots/python-agent
-sandbox-cli verify --template /var/lib/sandbox-engine/snapshots/python-agent
-sudo systemctl start sandboxd.service
+sudo bash scripts/build-template.sh templates/python-agent
+sandbox-cli template verify --name python-agent
 ```
+
+No restart is needed: the daemon notices the new manifest version and drains its
+warm pool. Roll back with `sandbox-cli template rollback --name python-agent`.
+Reclaiming disk: `sandbox-cli template gc` (report) then `--apply`. See
+[TEMPLATES.md](TEMPLATES.md).
 
 ## 4. Failure playbook
 
 ### `/ready` stays 503 after startup
 - Check `/var/log` / journald for `component":"daemon","event":"start` and for
   restore errors from `vmm_*`.
-- Verify the template exists and verifies: `sandbox-cli verify --template <path>`.
+- Verify the template exists and verifies: `sandbox-cli verify --template <name>`.
 - Verify guest assets: `/opt/sandbox-assets/{vmlinux,rootfs.ext4}` and
   `/usr/local/bin/firecracker` are present and executable.
 - Verify `/dev/kvm` and (for UFFD restore) `/dev/userfaultfd` exist and the
@@ -159,7 +162,7 @@ Collect for a bug report:
 | Task | Command |
 |---|---|
 | Validate config + template | `sandboxd --config <file> --validate-config` |
-| Verify a template | `sandbox-cli verify --template <dir>` |
+| Verify a template | `sandbox-cli template verify --name <name\|digest>` |
 | Health / readiness | `curl -sf :9180/health` / `curl -sf :9180/ready` |
 | Metrics | `curl -s :9180/metrics` |
 | Logs (warnings+) | `journalctl -u sandboxd -p warning` |

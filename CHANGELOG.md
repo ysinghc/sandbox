@@ -5,6 +5,28 @@ a phase-based development log; the per-phase implementation record (including
 design deviations) lives in [`docs/IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md)
 and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
+## [Unreleased]
+
+### Template pipeline (#25)
+
+- **Spec-driven builds.** `scripts/build-template.sh templates/<name>` goes from a
+  checked-in `template.conf` (suite, packages, optional pinned archive snapshot,
+  optional provision script, VM shape) to a published template. `--check` validates
+  a spec without root.
+- **Content-addressed, immutable store.** Templates live at `.store/<digest>/`; the
+  name the daemon opens is a symlink repointed atomically. Digests cover memory,
+  vmstate, rootfs, workspace base and kernel. Identical content is stored once.
+- **`sandbox-cli template build|publish|list|verify|rollback|unpublish|gc`.** GC keeps
+  what a name points at plus its previous version, honours a grace period, reports every
+  decision, and does nothing without `--apply`.
+- **Reproducible guest image.** Fixed filesystem identity and timestamps; CI builds the
+  image twice and compares bytes. The captured snapshot itself is not bit-reproducible.
+- `manifest.version` is now derived from the content digest instead of counted, so a
+  rollback is noticed by the daemon. Template names with `.`/`_` no longer produce a VM
+  id Firecracker refuses.
+- `docs/TEMPLATES.md`: the three ways to get a library (already in the image, into
+  `/workspace`, extend the template).
+
 ## [0.14.0] — 2026-10-20
 
 Session workspaces (#23): a sandbox's `/workspace` can now outlive the VM that

@@ -12,7 +12,7 @@ library (`libsandbox.so` / `libsandbox++.so`) to a new engine version.
 
 ```sh
 sandboxd --version
-sandbox-cli verify --template /var/lib/sandbox-engine/snapshots/python-agent
+sandbox-cli template verify --name python-agent
 curl -sf http://127.0.0.1:9180/ready    # note current readiness
 ```
 
@@ -58,12 +58,13 @@ sandboxd --config /var/lib/sandbox-engine/config/engine.conf --validate-config
 ## 4. Rebuild templates (required)
 
 Because the manifest format is version-bound, templates must be rebuilt with the
-new binaries (e.g. via your capture tooling / `make_template`), replacing
-`/var/lib/sandbox-engine/snapshots/<name>` atomically. Then:
+new binaries from their spec (`sudo bash scripts/build-template.sh templates/<name>`,
+see [TEMPLATES.md](TEMPLATES.md)); the new template replaces the old one atomically.
+Then:
 
 ```sh
-sandbox-cli verify --template /var/lib/sandbox-engine/snapshots/python-agent
-# -> "ok" / exit 0
+sandbox-cli template verify --name python-agent
+# -> {"event":"verified",...} / exit 0
 ```
 
 If you skip this step, restores fail the integrity check and `/ready` never
@@ -109,6 +110,7 @@ may also require restoring the **previous templates**, not just the binaries.
 | 0.12.0 | `header_size` + SHA-256 | Templates must be rebuilt from ≤ 0.10.x |
 | 0.13.0 | + `rootfs_sha256` / `rootfs_size` | **Rebuild templates.** A 0.12.0 manifest is refused (`header_size` mismatch); the rootfs is now integrity-checked, so the image and the captured memory state cannot drift apart |
 | 0.14.0 | + `workspace_sha256` / `workspace_size` (only for templates built with a workspace) | Templates gain an optional base workspace image. A 0.13.0 template still loads, but it has no workspace: `sandbox_create` with a `session_key` fails with `INVALID_SPEC` ("rebuild the template to use session_key"). Rebuild to use session volumes. `sandbox_spec_t` also grew two fields — **zero-initialise it** (`= {0}`) or the `session_key` pointer is stack garbage |
+| unreleased (#25) | content-addressed template store (`.store/<digest>`, the name is a symlink); `manifest.version` is derived from the content digest rather than counted | No rebuild needed: a template built by 0.14.0 still loads, and is adopted into the store the first time a new template is published under its name. A pool drain happens on the first publish, as for any new template. `make_template`-style builds that write `<root>/<name>` directly still work |
 
 Environment variables that carry over between versions (all optional):
 `SANDBOX_LOG_LEVEL`, `SANDBOX_VSOCK_SETTLE_MS`, `SANDBOX_VSOCK_CONFIRM_MS`,

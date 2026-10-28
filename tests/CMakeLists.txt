@@ -262,3 +262,7 @@ target_include_directories(test_template_store PRIVATE ../include)
 target_link_libraries(test_template_store sandbox pthread)
 add_test(NAME template_store COMMAND test_template_store)
 set_tests_properties(template_store PROPERTIES TIMEOUT 120)
+
+# #25: the spec format and its validation (build-template.sh --check; no root).
+add_test(NAME template_spec COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/test_template_spec.sh)
+set_tests_properties(template_spec PROPERTIES TIMEOUT 60)

@@ -78,6 +78,10 @@ manifest carries a `header_size` guard so old/foreign manifests are rejected
 rather than misread. `sandbox-cli verify` and `sandboxd --validate-config`
 perform the same check.
 
+Published templates are content-addressed and immutable: `.store/<digest>/` holds the
+files and the template name is a symlink to it, repointed atomically on publish and
+rollback (`src/template_store.c`; see [TEMPLATES.md](TEMPLATES.md)).
+
 ## Observability (§10.12, §10.13)
 
 - **Logs**: structured JSON on stderr — `ts`, `level`, `component`, `event`.

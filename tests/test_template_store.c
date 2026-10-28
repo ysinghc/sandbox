@@ -44,6 +44,7 @@ static void make_template(const char* ref, const char* seed) {
     snprintf(buf, sizeof(buf), "rootfs-%s-", seed);
     put(dir, "rootfs.ext4", buf, 100);
 
+    put(dir, "vmlinux", "kernel-A", 1);
     snprintf(p, sizeof(p), "%s/memory.snap", dir);
     snap_manifest_t* m = build_manifest(p);
     snprintf(p, sizeof(p), "%s/vmstate", dir);
@@ -57,6 +58,12 @@ static void make_template(const char* ref, const char* seed) {
     snprintf(p, sizeof(p), "%s/manifest.bin", dir);
     write_manifest(p, m);
     free(m);
+}
+
+static const char* g_root_build_kern(void) {
+    static char p[1100];
+    snprintf(p, sizeof(p), "%s/.build-kern", g_root);
+    return p;
 }
 
 static int exists(const char* rel) {
@@ -134,6 +141,25 @@ int main(void) {
               store_count() == 2,
           "different content is a different digest");
     CHECK(tstore_resolve("py", got) == 0 && strcmp(got, b) == 0, "the name moved to the new one");
+
+    // ---- the manifest version tracks the content ----
+    CHECK(read_manifest_version("py") != 0 && read_manifest_version("py") != 1,
+          "the version is derived from the digest, not a build counter");
+    CHECK(read_manifest_version("other") != read_manifest_version("py"),
+          "different content has a different version");
+
+    // ---- the kernel is part of the identity ----
+    make_template(".build-kern", "one");  // identical, then swap only the kernel
+    put(g_root_build_kern(), "vmlinux", "kernel-B", 1);
+    char kd[65];
+    CHECK(tstore_publish("kern", ".build-kern", NULL, kd) == 0 && strcmp(kd, a) != 0,
+          "a different kernel is a different template");
+    tstore_unpublish("kern");
+    {
+        tstore_gc_result_t kr;
+        CHECK(tstore_gc(2, 0, 0, NULL, &kr) == 0 && kr.removed == 1,
+              "...and unpublishing it makes exactly its entry collectable");
+    }
 
     // ---- rollback ----
     CHECK(tstore_rollback("py", got) == 0 && strcmp(got, a) == 0, "rollback returns to the previous");
