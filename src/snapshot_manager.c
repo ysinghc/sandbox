@@ -491,14 +491,15 @@ int create_snapshot_template(const char* template_name, const template_config_t*
     // Template jail is ephemeral: capture binds temp_dir at $jail/out, and
     // vmm_destroy below reclaims the whole jail (product stays in temp_dir).
     char tjail[PATH_MAX], tvm_id[128];
-    // Firecracker accepts [A-Za-z0-9-]{1,64} as a VM id. A template name may hold
-    // '.' and '_' (and the store stages builds as ".build-<name>"), so map them
-    // rather than hand the VMM an id it refuses.
-    snprintf(tvm_id, 65, "tpl-%s", template_name);
-    for (char* c = tvm_id; *c; c++)
-        if (!((*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
-              (*c >= '0' && *c <= '9') || *c == '-'))
-            *c = '-';
+    // The VM id has to be a legal Firecracker id ([A-Za-z0-9-]) *and* short: the
+    // template's tap device is "tap-<id>" and an interface name holds 15
+    // characters, so the id holds 11. A template name can hold '.'/'_' and be 64
+    // long (and the store stages builds as ".build-<name>"), so derive the id from
+    // a hash of the name. Two templates being built at once would need a 28-bit
+    // collision to share it.
+    uint32_t h = 2166136261u;  // FNV-1a
+    for (const char* c = template_name; *c; c++) h = (h ^ (uint8_t)*c) * 16777619u;
+    snprintf(tvm_id, sizeof(tvm_id), "tpl-%07x", h & 0x0fffffffu);
     if (vmm_jail_path(tvm_id, tjail, sizeof(tjail)) < 0) {
         rm_rf(temp_dir);
         return -1;

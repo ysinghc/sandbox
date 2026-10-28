@@ -22,8 +22,9 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 - **Reproducible guest image.** Fixed filesystem identity and timestamps; CI builds the
   image twice and compares bytes. The captured snapshot itself is not bit-reproducible.
 - `manifest.version` is now derived from the content digest instead of counted, so a
-  rollback is noticed by the daemon. Template names with `.`/`_` no longer produce a VM
-  id Firecracker refuses.
+  rollback is noticed by the daemon. The template VM's id is now derived from a hash of
+  the name: a name of more than seven characters used to overflow the 15-character tap
+  device name and build a template with no NIC, and `.`/`_` made an id Firecracker refuses.
 - `docs/TEMPLATES.md`: the three ways to get a library (already in the image, into
   `/workspace`, extend the template).
 
