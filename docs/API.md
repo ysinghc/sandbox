@@ -323,9 +323,19 @@ The broker then:
    `credentials.conf`;
 4. proxies to `https://<host><target>` and streams the response back.
 
-Request bodies are decoded (bounded at 8 MiB, re-framed with `Content-Length`);
-responses are streamed. Successful calls and rejections are counted in the
-broker's `/metrics`.
+Both directions are streamed with bounded memory: a request body is relayed a
+buffer at a time and never held whole, so a multi-hundred-MiB upload costs the
+same as a small one. A `Content-Length` body is forwarded with that length; a
+`Transfer-Encoding: chunked` body is decoded as it arrives and re-chunked
+towards the upstream (trailers are dropped, chunk extensions ignored). If a
+request carries both, chunked wins. Any other transfer coding is refused.
 
-Errors: `400` malformed request, `401` missing/invalid token, `403` host not
-allow-listed, `502` upstream failure.
+The body size limit is `SANDBOX_BROKER_MAX_BODY` bytes (default 256 MiB). A
+declared `Content-Length` over it is refused before anything is sent upstream;
+a chunked body is cut off when it crosses it, so the upstream never sees a
+silently truncated request as complete. Successful calls and rejections are
+counted in the broker's `/metrics`.
+
+Errors: `400` malformed request or body (bad chunk framing, short body,
+unsupported transfer coding), `401` missing/invalid token, `403` host not
+allow-listed, `413` request body over the limit, `502` upstream failure.

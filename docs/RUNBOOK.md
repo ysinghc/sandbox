@@ -98,11 +98,12 @@ Clients are requesting faster than restores complete. Raise `pool_size`, or
 reduce per-session concurrency pressure (`max_creates_per_session` /
 `max_creates_per_uid`). Exhaustion is returned as an error code, never a hang.
 
-### Chunked uploads rejected
-Request bodies with `Transfer-Encoding: chunked` are decoded in memory and
-bounded to 8 MiB. Larger or malformed bodies get `400`. Ask clients to send
-`Content-Length`, or raise the limit in `src/broker/core.c`
-(`CHUNKED_MAX_BODY`).
+### Large or chunked uploads rejected
+Request bodies (`Content-Length` or `Transfer-Encoding: chunked`) stream through
+the broker and are not buffered. Anything over `SANDBOX_BROKER_MAX_BODY` bytes
+(default 256 MiB) gets `413`; malformed chunk framing or a short body gets
+`400`. Raise the limit by setting `SANDBOX_BROKER_MAX_BODY` in the broker's
+environment and restarting it.
 
 ### Cleaning up after a hard stop / crash
 

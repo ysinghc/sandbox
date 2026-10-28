@@ -1745,10 +1745,14 @@ authoritative.
   relayed **verbatim** (transfer/content decoding disabled) so the guest sees
   the upstream's own `Transfer-Encoding`/`Content-Encoding` framing.
 - **Body handling:** request headers are read byte-by-byte so the body is never
-  consumed early; a `Content-Length` body is streamed upstream through a libcurl
-  read callback. **Chunked request bodies** are decoded in memory (bounded to
-  8 MiB, `CHUNKED_MAX_BODY`), stripped of `Transfer-Encoding`, re-framed with a
-  `Content-Length`, and forwarded (Phase 13, §15.15); malformed input → `400`.
+  consumed early; both framings are streamed upstream through a libcurl read
+  callback with bounded memory (#7). A `Content-Length` body is forwarded with
+  its length; a **chunked body** is decoded on demand inside the callback
+  (size line, payload read straight into libcurl's buffer, CRLF, trailers
+  dropped) and re-chunked towards the upstream. Nothing is held whole. The limit
+  is `SANDBOX_BROKER_MAX_BODY` (default 256 MiB): a declared length over it is
+  refused up front, a chunked stream is aborted when it crosses it → `413`;
+  malformed framing or a short body → `400`.
   The allow-list and the credential lookup both key on the `Host` value with any
   `:port` stripped and case folded; an allowed host with no credential entry
   gets 403.
@@ -2143,8 +2147,9 @@ authoritative.
   corpora. Without clang they build with a standalone file/stdin driver, so the
   same corpus runs under ASan/UBSan (verified on the Pi). `config_parse_buffer()`
   was extracted so the config parser is fuzzable in memory. The broker now
-  **decodes chunked request bodies** (bounded to 8 MiB), re-frames them with a
-  `Content-Length`, and forwards them; malformed input returns 400.
+  **decodes chunked request bodies**; since #7 this streams with bounded memory
+  and a configurable limit (`SANDBOX_BROKER_MAX_BODY`) instead of buffering up
+  to 8 MiB; malformed input returns 400, oversize 413.
 - **Operations docs (§10.15).** `docs/RUNBOOK.md` (daily checks, failure
   playbook, cleanup), `docs/UPGRADE.md` (drain → install → **rebuild templates**
   → verify → rollback; manifest compatibility table), `docs/BACKUP.md` (what to

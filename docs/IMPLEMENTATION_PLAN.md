@@ -230,8 +230,9 @@ peer, cid 1) and the guest asserts the positive direction
 | M1 ARM timer (#6) | ✅ investigated on real hardware — **not fixed**, documented (§15.7); fix path #30 (modern guest kernel) |
 | M1 aarch64 privileged leg | ✅ live on the Pi 5 (`sandbox-arm64-pi5`), both legs green on `62ae6e5` |
 | #23 session workspaces + TTL | ✅ **0.14.0** — privileged e2e proves in-guest persistence across destroy/re-create |
-| #24 guest RPC | 🔶 guest, host client, IPC, libsandbox, C++, CLI done and unit/full-stack tested; the privileged CI run of the daemon path is outstanding |
-| M2 #7, #25–#28 | ⏳ not started |
+| #24 guest RPC | ✅ guest, host client, IPC, libsandbox, C++, CLI; privileged CI green on busybox and Debian |
+| #7 broker streaming | ✅ chunked and Content-Length bodies stream with bounded memory; `SANDBOX_BROKER_MAX_BODY` (256 MiB) → 413; 64 MiB SHA-256 fidelity + RSS bound tested |
+| M2 #25–#28 | ⏳ not started |
 
 ### What the `jail_cleanup` fix actually became
 

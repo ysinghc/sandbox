@@ -109,16 +109,28 @@ int send_http_error(int fd, int code, const char* message);
 // True if host (":port"-stripped, case-folded) is listed, or the list has "*".
 bool broker_host_allowed(char* const* allowed_services, const char* host);
 
-// Forward an already-credentialed request via libcurl and relay the upstream
-// response to client_fd. body_fd supplies any request body (bounded by the
-// Content-Length the caller left in req). Returns the upstream status code,
-// or -1 on transport failure (an error may already be written to client_fd).
-int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd);
+// Request bodies are streamed, never buffered: libcurl pulls from `body_fd` a
+// buffer at a time, so memory use does not depend on the upload's size. Both
+// framings are proxied -- Content-Length as-is, chunked decoded on the fly and
+// re-chunked towards the upstream.
+//
+// A body bigger than broker_max_body() fails with a clear status instead of
+// being cut or silently accepted: a declared Content-Length over the limit is
+// refused before anything is sent upstream, and a chunked body is cut at the
+// limit. Return values of broker_forward_upstream below.
+#define BROKER_FWD_BAD_BODY (-2)    // malformed chunking, short body, unsupported coding
+#define BROKER_FWD_TOO_LARGE (-3)   // over broker_max_body()
+#define BROKER_DEFAULT_MAX_BODY (256ull * 1024 * 1024)
 
-// §10.14: forward a request whose body has already been buffered in memory
-// (used after decoding a chunked request body). `body` may be NULL when len 0.
-int broker_forward_upstream_mem(const http_request_t* req, int client_fd,
-                                const char* body, size_t body_len);
+// SANDBOX_BROKER_MAX_BODY (bytes), default 256 MiB.
+uint64_t broker_max_body(void);
+
+// Forward an already-credentialed request via libcurl and relay the upstream
+// response to client_fd. body_fd supplies the request body, framed as req's
+// headers say. Returns the upstream status code, BROKER_FWD_BAD_BODY /
+// BROKER_FWD_TOO_LARGE (nothing was relayed to client_fd), or -1 on transport
+// failure (an error may already be written to client_fd).
+int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd);
 
 // Handle one proxied request on client_fd (never closes it). Returns the HTTP
 // status it sent. engine_fd is the validation socket.

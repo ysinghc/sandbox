@@ -229,13 +229,24 @@ bool broker_host_allowed(char* const* allowed_services, const char* host) {
 // Upstream forwarding (libcurl)
 // ---------------------------------------------------------------------------
 
+// How the request body reaches the upstream. Neither mode buffers it: libcurl
+// pulls from the guest socket through fwd_read_cb, a buffer at a time.
+enum { BODY_NONE = 0, BODY_LENGTH, BODY_CHUNKED };
+
 struct fwd_ctx {
     int client_fd;
     int body_fd;
-    uint64_t body_remaining;
-    const char* mem;    // §10.14: in-memory body (chunked decode); NULL otherwise
-    size_t mem_len;
-    size_t mem_off;
+    int body_mode;
+    uint64_t body_remaining;  // BODY_LENGTH: bytes still owed by the guest
+    uint64_t body_total;      // bytes handed to the upstream so far
+    uint64_t body_max;
+    // BODY_CHUNKED decoder state: bytes left in the current chunk, whether the
+    // CRLF that ends the previous chunk is still to be consumed, and EOF.
+    uint64_t ch_left;
+    bool ch_need_crlf;
+    bool ch_done;
+    // Why the body failed, if it did: BROKER_FWD_BAD_BODY or BROKER_FWD_TOO_LARGE.
+    int body_err;
     long status;
 };
 
@@ -270,23 +281,101 @@ static size_t fwd_header_cb(char* buffer, size_t size, size_t nitems, void* ud) 
     return n;
 }
 
+static int recv_crlf_line(int fd, char* line, size_t cap);
+
+static int recv_exact(int fd, void* buf, size_t n) {
+    char* p = buf;
+    while (n) {
+        ssize_t r = recv(fd, p, n, 0);
+        if (r < 0 && errno == EINTR) continue;
+        if (r <= 0) return -1;
+        p += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+// Decode the guest's chunked body on demand: at most `want` bytes of payload per
+// call, so memory is bounded by libcurl's buffer however large the upload is.
+// Returns bytes produced, 0 at the end of the body, or CURL_READFUNC_ABORT after
+// recording why in c->body_err.
+static size_t chunked_read(struct fwd_ctx* c, char* buf, size_t want) {
+    for (;;) {
+        if (c->ch_done) return 0;
+        if (c->ch_left == 0) {
+            if (c->ch_need_crlf) {
+                char crlf[2];
+                if (recv_exact(c->body_fd, crlf, 2) < 0 || crlf[0] != '\r' || crlf[1] != '\n')
+                    goto bad;
+                c->ch_need_crlf = false;
+            }
+            char line[256];
+            if (recv_crlf_line(c->body_fd, line, sizeof(line)) < 0) goto bad;
+            char* semi = strchr(line, ';');  // drop any chunk extension
+            if (semi) *semi = '\0';
+            char* end = NULL;
+            errno = 0;
+            unsigned long long sz = strtoull(line, &end, 16);
+            if (end == line || errno != 0 || line[0] == '-' || line[0] == '+') goto bad;
+            if (sz == 0) {
+                // Final chunk. Trailers are dropped; read to the blank line.
+                for (;;) {
+                    if (recv_crlf_line(c->body_fd, line, sizeof(line)) < 0) goto bad;
+                    if (line[0] == '\r') break;
+                }
+                c->ch_done = true;
+                return 0;
+            }
+            if (sz > c->body_max || c->body_total + sz > c->body_max) {
+                c->body_err = BROKER_FWD_TOO_LARGE;
+                return CURL_READFUNC_ABORT;
+            }
+            c->ch_left = sz;
+        }
+        size_t n = want;
+        if ((uint64_t)n > c->ch_left) n = (size_t)c->ch_left;
+        ssize_t r;
+        do {
+            r = recv(c->body_fd, buf, n, 0);
+        } while (r < 0 && errno == EINTR);
+        if (r <= 0) goto bad;
+        c->ch_left -= (uint64_t)r;
+        c->body_total += (uint64_t)r;
+        if (c->ch_left == 0) c->ch_need_crlf = true;
+        return (size_t)r;
+    }
+bad:
+    c->body_err = BROKER_FWD_BAD_BODY;
+    return CURL_READFUNC_ABORT;
+}
+
 static size_t fwd_read_cb(char* buffer, size_t size, size_t nmemb, void* ud) {
     struct fwd_ctx* c = ud;
     size_t want = size * nmemb;
-    if (c->mem) {  // §10.14: serve a decoded, buffered body
-        size_t left = c->mem_len - c->mem_off;
-        if (want > left) want = left;
-        if (want == 0) return 0;
-        memcpy(buffer, c->mem + c->mem_off, want);
-        c->mem_off += want;
-        return want;
-    }
+    if (c->body_mode == BODY_CHUNKED) return chunked_read(c, buffer, want);
     if ((uint64_t)want > c->body_remaining) want = (size_t)c->body_remaining;
     if (want == 0) return 0;
-    ssize_t r = read(c->body_fd, buffer, want);
-    if (r <= 0) return CURL_READFUNC_ABORT;
+    ssize_t r;
+    do {
+        r = read(c->body_fd, buffer, want);
+    } while (r < 0 && errno == EINTR);
+    if (r <= 0) {  // the guest promised more bytes than it sent
+        c->body_err = BROKER_FWD_BAD_BODY;
+        return CURL_READFUNC_ABORT;
+    }
     c->body_remaining -= (uint64_t)r;
+    c->body_total += (uint64_t)r;
     return (size_t)r;
+}
+
+uint64_t broker_max_body(void) {
+    const char* v = getenv("SANDBOX_BROKER_MAX_BODY");
+    if (v && *v) {
+        char* end = NULL;
+        unsigned long long n = strtoull(v, &end, 10);
+        if (end != v && *end == '\0' && n > 0) return (uint64_t)n;
+    }
+    return BROKER_DEFAULT_MAX_BODY;
 }
 
 static uint64_t request_content_length(const http_request_t* req) {
@@ -298,8 +387,7 @@ static uint64_t request_content_length(const http_request_t* req) {
     return (uint64_t)v;
 }
 
-static int forward_impl(const http_request_t* req, int client_fd, int body_fd,
-                        const char* mem, size_t mem_len) {
+int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd) {
     if (!req || client_fd < 0) return -1;
     const char* host = http_get_header(req, "Host");
     if (!host || !*host) return -1;
@@ -318,6 +406,9 @@ static int forward_impl(const http_request_t* req, int client_fd, int body_fd,
         // would duplicate the header. Expect is suppressed below.
         if (strcasecmp(req->headers[i].name, "Content-Length") == 0) continue;
         if (strcasecmp(req->headers[i].name, "Expect") == 0) continue;
+        // The guest's framing is replaced by ours: for a chunked upload libcurl
+        // re-chunks what the read callback produces.
+        if (strcasecmp(req->headers[i].name, "Transfer-Encoding") == 0) continue;
         char line[HTTP_MAX_NAME + HTTP_MAX_VALUE + 4];
         snprintf(line, sizeof(line), "%s: %s", req->headers[i].name,
                  req->headers[i].value);
@@ -326,14 +417,36 @@ static int forward_impl(const http_request_t* req, int client_fd, int body_fd,
     }
     hdrs = curl_slist_append(hdrs, "Expect:");  // suppress 100-continue
 
-    uint64_t blen = mem ? (uint64_t)mem_len : request_content_length(req);
+    // Framing: chunked wins over Content-Length (RFC 9112 6.1), so a request that
+    // sends both is treated as chunked and its Content-Length is ignored.
+    const char* te = http_get_header(req, "Transfer-Encoding");
+    int mode = BODY_NONE;
+    uint64_t blen = 0;
+    if (te && strcasestr(te, "chunked")) {
+        mode = BODY_CHUNKED;
+        hdrs = curl_slist_append(hdrs, "Transfer-Encoding: chunked");
+    } else if (te && *te) {
+        // Any other transfer coding cannot be relayed faithfully.
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(h);
+        return BROKER_FWD_BAD_BODY;
+    } else if (http_get_header(req, "Content-Length")) {
+        blen = request_content_length(req);
+        if (blen > 0) mode = BODY_LENGTH;
+    }
+    uint64_t max_body = broker_max_body();
+    if (mode == BODY_LENGTH && blen > max_body) {
+        // Refuse before relaying a byte: the declared size is the whole story.
+        curl_slist_free_all(hdrs);
+        curl_easy_cleanup(h);
+        return BROKER_FWD_TOO_LARGE;
+    }
     struct fwd_ctx ctx = {
         .client_fd = client_fd,
         .body_fd = body_fd,
+        .body_mode = mode,
         .body_remaining = blen,
-        .mem = mem,
-        .mem_len = mem_len,
-        .mem_off = 0,
+        .body_max = max_body,
         .status = 0,
     };
 
@@ -359,34 +472,26 @@ static int forward_impl(const http_request_t* req, int client_fd, int body_fd,
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 0L);
         curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 0L);
     }
-    if (blen > 0) {
+    if (mode != BODY_NONE) {
         curl_easy_setopt(h, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(h, CURLOPT_READFUNCTION, fwd_read_cb);
         curl_easy_setopt(h, CURLOPT_READDATA, &ctx);
-        curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)blen);
+        // A known length is sent as Content-Length; an unknown one makes libcurl
+        // chunk-encode, which is what the explicit header above asks for.
+        if (mode == BODY_LENGTH) curl_easy_setopt(h, CURLOPT_INFILESIZE_LARGE, (curl_off_t)blen);
     }
+    // CURLOPT_UPLOAD would turn the verb into PUT; the guest's own method stays.
 
     CURLcode rc = curl_easy_perform(h);
     long status = ctx.status;
     curl_slist_free_all(hdrs);
     curl_easy_cleanup(h);
+    // A body that failed mid-stream is the guest's problem and has a precise
+    // answer; anything else that went wrong is the upstream's.
+    if (ctx.body_err) return ctx.body_err;
     if (rc != CURLE_OK) return -1;
     return (int)status;
 }
-
-int broker_forward_upstream(const http_request_t* req, int client_fd, int body_fd) {
-    return forward_impl(req, client_fd, body_fd, NULL, 0);
-}
-
-int broker_forward_upstream_mem(const http_request_t* req, int client_fd,
-                                const char* body, size_t body_len) {
-    return forward_impl(req, client_fd, -1, body, body_len);
-}
-
-// §10.14: decode a chunked request body into memory. Bounded (8 MiB) so a
-// hostile guest cannot exhaust the broker. Returns 0 with a malloc'd buffer in
-// *out (NUL-terminate not required; caller frees) or -1 on malformed/oversized.
-#define CHUNKED_MAX_BODY (8u * 1024u * 1024u)
 
 static int recv_crlf_line(int fd, char* line, size_t cap) {
     size_t li = 0;
@@ -404,65 +509,6 @@ static int recv_crlf_line(int fd, char* line, size_t cap) {
     }
     line[li] = '\0';
     return (int)li;
-}
-
-static int read_chunked_body(int fd, char** out, size_t* out_len) {
-    char* buf = NULL;
-    size_t cap = 0, len = 0;
-    char line[256];
-    for (;;) {
-        if (recv_crlf_line(fd, line, sizeof(line)) < 0) goto fail;
-        char* semi = strchr(line, ';');  // drop any chunk extension
-        if (semi) *semi = '\0';
-        char* end = NULL;
-        errno = 0;
-        unsigned long long sz = strtoull(line, &end, 16);
-        if (end == line || errno != 0) goto fail;
-        if (sz == 0) break;  // final chunk; trailers follow
-        if (sz > CHUNKED_MAX_BODY || len + sz > CHUNKED_MAX_BODY) goto fail;
-        if (len + sz > cap) {
-            size_t ncap = cap ? cap : 8192;
-            while (ncap < len + sz) ncap *= 2;
-            char* nb = realloc(buf, ncap);
-            if (!nb) goto fail;
-            buf = nb;
-            cap = ncap;
-        }
-        size_t got = 0;
-        while (got < sz) {
-            ssize_t r = recv(fd, buf + len + got, sz - got, 0);
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                goto fail;
-            }
-            if (r == 0) goto fail;
-            got += (size_t)r;
-        }
-        len += got;
-        char crlf[2];
-        size_t ci = 0;
-        while (ci < 2) {
-            ssize_t r = recv(fd, crlf + ci, 1, 0);
-            if (r < 0) {
-                if (errno == EINTR) continue;
-                goto fail;
-            }
-            if (r == 0) goto fail;
-            ci++;
-        }
-        if (crlf[0] != '\r' || crlf[1] != '\n') goto fail;
-    }
-    // Consume trailer headers up to the terminating empty line.
-    for (;;) {
-        if (recv_crlf_line(fd, line, sizeof(line)) < 0) goto fail;
-        if (line[0] == '\r') break;
-    }
-    *out = buf;
-    *out_len = len;
-    return 0;
-fail:
-    free(buf);
-    return -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -632,33 +678,21 @@ static int broker_handle_request_inner(int client_fd, const credential_store_t* 
     http_remove_header(req, "X-Sandbox-Token");
     http_set_header(req, "Authorization", real_cred);
 
-    // 6. §10.14: decode a chunked request body into memory (bounded) so it can
-    // be re-framed with a Content-Length for the upstream.
-    char* body_mem = NULL;
-    size_t body_len = 0;
-    const char* te = http_get_header(req, "Transfer-Encoding");
-    if (te && strcasestr(te, "chunked")) {
-        if (read_chunked_body(client_fd, &body_mem, &body_len) < 0) {
-            session_info_free(&session);
-            send_http_error(client_fd, 400, "Malformed chunked body");
-            free(req);
-            return 400;
-        }
-        http_remove_header(req, "Transfer-Encoding");
-    }
-
-    // 7. Forward upstream, streaming the response back to the guest.
+    // 6. Forward upstream. The request body (Content-Length or chunked) streams
+    // from the guest socket straight through; nothing is buffered.
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int status = body_mem
-                     ? broker_forward_upstream_mem(req, client_fd, body_mem,
-                                                   body_len)
-                     : broker_forward_upstream(req, client_fd, client_fd);
+    int status = broker_forward_upstream(req, client_fd, client_fd);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = elapsed_ms(&t0, &t1);
-    free(body_mem);
 
-    if (status < 0) {
+    if (status == BROKER_FWD_TOO_LARGE) {
+        send_http_error(client_fd, 413, "Request body too large");
+        status = 413;
+    } else if (status == BROKER_FWD_BAD_BODY) {
+        send_http_error(client_fd, 400, "Malformed request body");
+        status = 400;
+    } else     if (status < 0) {
         // Best-effort: only meaningful if no upstream bytes were relayed yet.
         send_http_error(client_fd, 502, "Upstream unreachable");
         status = 502;

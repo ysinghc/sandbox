@@ -13,11 +13,13 @@
 #define _DEFAULT_SOURCE
 
 #include "broker.h"
+#include "sha256.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -197,6 +199,16 @@ static void read_http_request(int fd, char* out, size_t cap, size_t* out_len) {
         long cl = 0;
         char* clp = strstr(out, "Content-Length:");
         if (clp) cl = strtol(clp + 15, NULL, 10);
+        if (strcasestr(out, "Transfer-Encoding: chunked")) {
+            // No length to wait for: read to the terminating zero chunk.
+            while (!strstr(out + hlen, "\r\n0\r\n\r\n") && len + 1 < cap) {
+                ssize_t r2 = recv(fd, out + len, cap - 1 - len, 0);
+                if (r2 <= 0) break;
+                len += (size_t)r2;
+                out[len] = '\0';
+            }
+            break;
+        }
         while (len < hlen + (size_t)cl && len + 1 < cap) {
             ssize_t r2 = recv(fd, out + len, cap - 1 - len, 0);
             if (r2 <= 0) break;
@@ -429,8 +441,8 @@ static void test_proxy(void) {
     report("proxy", b);
 }
 
-// §10.14: chunked request bodies are decoded, re-framed with Content-Length,
-// and forwarded to the upstream.
+// Chunked request bodies stream through: the broker decodes the guest's chunks
+// and the upstream receives the same payload, chunk-framed by libcurl.
 static void test_chunked(void) {
     int b = g_fail;
     char epath[512];
@@ -475,11 +487,334 @@ static void test_chunked(void) {
     close(eng.listen_fd);
     unlink(epath);
 
-    // The reassembled body must arrive with a Content-Length (no chunked TE).
-    CHECK(strstr(up.request, "hello world") != NULL, "chunked body decoded");
-    CHECK(strstr(up.request, "Transfer-Encoding") == NULL, "TE header removed");
-    CHECK(strstr(up.request, "Content-Length: 11") != NULL, "re-framed length");
+    // The upstream sees chunked framing (never a Content-Length: the total is
+    // unknown) and the decoded payload is exactly what the guest sent.
+    CHECK(strstr(up.request, "Transfer-Encoding: chunked") != NULL, "upstream gets chunked");
+    CHECK(strstr(up.request, "Content-Length") == NULL, "no Content-Length on chunked");
+    const char* body = strstr(up.request, "\r\n\r\n");
+    char dec[256];
+    size_t dn = 0;
+    if (body) {
+        body += 4;
+        while (*body) {
+            char* e = NULL;
+            unsigned long n = strtoul(body, &e, 16);
+            if (e == body || n == 0 || strncmp(e, "\r\n", 2) != 0) break;
+            body = e + 2;
+            if (dn + n >= sizeof(dec) || strlen(body) < n) break;
+            memcpy(dec + dn, body, n);
+            dn += n;
+            body += n + 2;
+        }
+    }
+    dec[dn] = '\0';
+    CHECK(strcmp(dec, "hello world") == 0, "chunked payload intact");
     report("chunked", b);
+}
+
+// ---------------------------------------------------------------------------
+// Streaming fidelity: a body far larger than any buffer, hashed on both sides.
+// The guest side generates it on the fly and the upstream hashes what it
+// receives, so neither end holds the body and a bounded broker is the only
+// place it could pile up.
+
+typedef struct {
+    int listen_fd;
+    int chunked_in;           // upstream saw Transfer-Encoding: chunked
+    int has_cl;               // upstream saw Content-Length
+    uint64_t got;             // body bytes received
+    uint8_t digest[32];
+    int complete;             // reached the end of the body framing
+} stream_up_t;
+
+static int su_getc(int fd, char* buf, size_t* pos, size_t* len) {
+    if (*pos == *len) {
+        ssize_t r;
+        do {
+            r = recv(fd, buf, 65536, 0);
+        } while (r < 0 && errno == EINTR);
+        if (r <= 0) return -1;
+        *pos = 0;
+        *len = (size_t)r;
+    }
+    return (unsigned char)buf[(*pos)++];
+}
+
+static void* stream_up_thread(void* arg) {
+    stream_up_t* u = arg;
+    int fd = accept(u->listen_fd, NULL, NULL);
+    if (fd < 0) return NULL;
+    static char buf[65536];
+    size_t pos = 0, len = 0;
+    char hdr[8192];
+    size_t hl = 0;
+    int c;
+    while (hl + 1 < sizeof(hdr) && (c = su_getc(fd, buf, &pos, &len)) >= 0) {
+        hdr[hl++] = (char)c;
+        hdr[hl] = '\0';
+        if (hl >= 4 && memcmp(hdr + hl - 4, "\r\n\r\n", 4) == 0) break;
+    }
+    u->chunked_in = strcasestr(hdr, "Transfer-Encoding: chunked") != NULL;
+    const char* clp = strcasestr(hdr, "Content-Length:");
+    u->has_cl = clp != NULL;
+    uint64_t cl = clp ? strtoull(clp + 15, NULL, 10) : 0;
+
+    sha256_ctx sc;
+    sha256_init(&sc);
+    uint64_t chunk_left = 0;
+    int ok = 1;
+    if (u->chunked_in) {
+        for (;;) {
+            char line[64];
+            size_t ln = 0;
+            while (ln + 1 < sizeof(line) && (c = su_getc(fd, buf, &pos, &len)) >= 0 && c != '\n')
+                line[ln++] = (char)c;
+            line[ln] = '\0';
+            if (c < 0) { ok = 0; break; }
+            chunk_left = strtoull(line, NULL, 16);
+            if (chunk_left == 0) {
+                // trailing CRLF after the zero chunk
+                su_getc(fd, buf, &pos, &len);
+                su_getc(fd, buf, &pos, &len);
+                break;
+            }
+            while (chunk_left) {
+                if (pos == len) {
+                    int c2 = su_getc(fd, buf, &pos, &len);
+                    if (c2 < 0) { ok = 0; break; }
+                    pos--;  // un-read: su_getc consumed one byte
+                }
+                size_t avail = len - pos;
+                if (avail == 0) continue;
+                size_t take = avail < chunk_left ? avail : (size_t)chunk_left;
+                sha256_update(&sc, buf + pos, take);
+                pos += take;
+                chunk_left -= take;
+                u->got += take;
+            }
+            if (!ok) break;
+            su_getc(fd, buf, &pos, &len);  // CR
+            su_getc(fd, buf, &pos, &len);  // LF
+        }
+        u->complete = ok;
+    } else {
+        while (u->got < cl) {
+            if (pos == len) {
+                int c2 = su_getc(fd, buf, &pos, &len);
+                if (c2 < 0) break;
+                pos--;
+            }
+            size_t avail = len - pos;
+            if (avail == 0) continue;
+            size_t take = avail;
+            if ((uint64_t)take > cl - u->got) take = (size_t)(cl - u->got);
+            sha256_update(&sc, buf + pos, take);
+            pos += take;
+            u->got += take;
+        }
+        u->complete = u->got == cl;
+    }
+    sha256_final(&sc, u->digest);
+    static const char ok_resp[] =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+    write_full(fd, ok_resp, sizeof(ok_resp) - 1);
+    close(fd);
+    return NULL;
+}
+
+typedef struct {
+    int fd;
+    uint64_t total;
+    int chunked;
+    int bad_chunk;            // corrupt the framing after the first chunk
+    int port;
+    uint8_t digest[32];
+    uint64_t sent;
+} guest_w_t;
+
+static void* guest_writer(void* arg) {
+    guest_w_t* g = arg;
+    char hdr[512];
+    int n = snprintf(hdr, sizeof(hdr),
+                     "POST /v1/upload HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+                     "X-Sandbox-Token: " TOKEN_HEX "\r\n",
+                     g->port);
+    if (g->chunked)
+        n += snprintf(hdr + n, sizeof(hdr) - (size_t)n, "Transfer-Encoding: chunked\r\n\r\n");
+    else
+        n += snprintf(hdr + n, sizeof(hdr) - (size_t)n, "Content-Length: %llu\r\n\r\n",
+                      (unsigned long long)g->total);
+    if (write_full(g->fd, hdr, (size_t)n) < 0) return NULL;
+
+    sha256_ctx sc;
+    sha256_init(&sc);
+    static uint8_t blk[48 * 1024 + 7];
+    uint64_t x = 0x9e3779b97f4a7c15ull, left = g->total;
+    unsigned step = 0;
+    while (left) {
+        // Vary the block size so chunk and read boundaries never line up.
+        size_t want = 1 + (size_t)((step++ * 7919u) % (sizeof(blk) - 1));
+        if (want > left) want = (size_t)left;
+        for (size_t i = 0; i < want; i++) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;
+            blk[i] = (uint8_t)x;
+        }
+        sha256_update(&sc, blk, want);
+        if (g->chunked) {
+            char cl[32];
+            int cn = snprintf(cl, sizeof(cl), "%zx\r\n", want);
+            if (write_full(g->fd, cl, (size_t)cn) < 0) goto out;
+        }
+        if (write_full(g->fd, blk, want) < 0) goto out;
+        if (g->chunked) {
+            if (g->bad_chunk && step == 2) {
+                write_full(g->fd, "XX", 2);  // not a CRLF
+                goto out;
+            }
+            if (write_full(g->fd, "\r\n", 2) < 0) goto out;
+        }
+        g->sent += want;
+        left -= want;
+    }
+    if (g->chunked) write_full(g->fd, "0\r\n\r\n", 5);
+out:
+    sha256_final(&sc, g->digest);
+    return NULL;
+}
+
+static long vm_hwm_kb(void) {
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[128];
+    long v = -1;
+    while (fgets(line, sizeof(line), f))
+        if (sscanf(line, "VmHWM: %ld kB", &v) == 1) break;
+    fclose(f);
+    return v;
+}
+
+// Drive one upload through the broker. Returns the guest-visible status line
+// in `resp` and the broker's own return code.
+static int stream_once(const char* tag, uint64_t total, int chunked, int bad_chunk,
+                       stream_up_t* up, guest_w_t* gw, char* resp, size_t cap) {
+    char epath[512];
+    snprintf(epath, sizeof(epath), "%s/engine-%s.sock", g_dir, tag);
+    mock_engine_t eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.expected = TOKEN_BYTES;
+    eng.n_allowed = 1;
+    eng.allowed[0] = "127.0.0.1";
+    eng.listen_fd = engine_listen(epath);
+    CHECK(eng.listen_fd >= 0, "engine listen");
+    pthread_t eth;
+    pthread_create(&eth, NULL, engine_thread, &eng);
+    eng.client_fd_fd = broker_engine_connect(epath);
+    CHECK(eng.client_fd_fd >= 0, "engine connect");
+
+    uint16_t port = 0;
+    memset(up, 0, sizeof(*up));
+    up->listen_fd = upstream_listen(&port);
+    CHECK(up->listen_fd >= 0, "upstream listen");
+    pthread_t uth;
+    pthread_create(&uth, NULL, stream_up_thread, up);
+
+    int sv[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0, "socketpair");
+    memset(gw, 0, sizeof(*gw));
+    gw->fd = sv[1];
+    gw->total = total;
+    gw->chunked = chunked;
+    gw->bad_chunk = bad_chunk;
+    gw->port = port;
+    pthread_t wth;
+    pthread_create(&wth, NULL, guest_writer, gw);
+
+    credential_store_t* creds = credentials_load(g_creds);
+    CHECK(creds != NULL, "load creds");
+    int st = broker_handle_request(sv[0], creds, eng.client_fd_fd);
+    read_response(sv[1], resp, cap, "\r\n\r\n");
+
+    // Closing both ends unblocks whichever thread is still mid-transfer.
+    close(sv[0]);
+    close(sv[1]);
+    shutdown(up->listen_fd, SHUT_RDWR);  // wakes accept() if nothing ever connected
+    pthread_join(wth, NULL);
+    pthread_join(uth, NULL);
+    close(up->listen_fd);
+    credentials_free(creds);
+    close(eng.client_fd_fd);
+    pthread_join(eth, NULL);
+    close(eng.listen_fd);
+    unlink(epath);
+    return st;
+}
+
+static void check_stream(const char* what, int chunked) {
+    int b = g_fail;
+    const uint64_t total = 64ull * 1024 * 1024 + 12345;  // not a multiple of anything
+    stream_up_t up;
+    guest_w_t gw;
+    char resp[1024];
+    long before = vm_hwm_kb();
+    int st = stream_once(chunked ? "big-chunked" : "big-cl", total, chunked, 0, &up, &gw,
+                         resp, sizeof(resp));
+    long after = vm_hwm_kb();
+    CHECK(st == 200, "large upload returns upstream 200");
+    CHECK(strstr(resp, "200 OK") != NULL, "response relayed to guest");
+    CHECK(up.complete, "upstream saw the whole body");
+    CHECK(up.got == total, "byte count identical");
+    CHECK(gw.sent == total, "guest sent everything");
+    CHECK(memcmp(up.digest, gw.digest, 32) == 0, "SHA-256 identical end to end");
+    CHECK(up.chunked_in == chunked, "framing towards upstream follows the guest's");
+    CHECK(chunked ? !up.has_cl : up.has_cl, "Content-Length only when the guest gave one");
+    // 64 MiB went through; memory may grow by socket/curl buffers, never by the body.
+    CHECK(before > 0 && after > 0 && after - before < 16 * 1024, "peak RSS stays bounded");
+    if (g_fail != b)
+        fprintf(stderr, "  (%s: status %d, got %llu/%llu, hwm %ld -> %ld kB)\n", what, st,
+                (unsigned long long)up.got, (unsigned long long)total, before, after);
+    report(what, b);
+}
+
+static void test_stream_large(void) {
+    check_stream("stream_content_length", 0);
+    check_stream("stream_chunked", 1);
+}
+
+// Oversize bodies fail predictably and are never silently truncated.
+static void test_body_limits(void) {
+    int b = g_fail;
+    setenv("SANDBOX_BROKER_MAX_BODY", "1048576", 1);  // 1 MiB
+    CHECK(broker_max_body() == 1048576, "limit read from the environment");
+
+    stream_up_t up;
+    guest_w_t gw;
+    char resp[1024];
+
+    // Declared Content-Length over the limit: refused before anything is sent.
+    int st = stream_once("cl-big", 4 * 1024 * 1024, 0, 0, &up, &gw, resp, sizeof(resp));
+    CHECK(st == 413, "oversize Content-Length -> 413");
+    CHECK(strstr(resp, "413") != NULL, "guest sees 413");
+    CHECK(up.got == 0, "nothing reached the upstream");
+
+    // Chunked stream that crosses the limit: cut off, 413, upstream never completes.
+    st = stream_once("chunk-big", 4 * 1024 * 1024, 1, 0, &up, &gw, resp, sizeof(resp));
+    CHECK(st == 413, "oversize chunked stream -> 413");
+    CHECK(strstr(resp, "413") != NULL, "guest sees 413 for chunked");
+    CHECK(!up.complete || up.got < 4u * 1024 * 1024, "upstream did not get the whole body");
+
+    // Exactly at the limit is fine (Content-Length framing).
+    st = stream_once("cl-edge", 1048576, 0, 0, &up, &gw, resp, sizeof(resp));
+    CHECK(st == 200, "body exactly at the limit passes");
+    CHECK(up.got == 1048576 && memcmp(up.digest, gw.digest, 32) == 0, "edge body intact");
+
+    // Malformed chunk framing -> 400.
+    st = stream_once("chunk-bad", 512 * 1024, 1, 1, &up, &gw, resp, sizeof(resp));
+    CHECK(st == 400, "malformed chunking -> 400");
+    CHECK(strstr(resp, "400") != NULL, "guest sees 400");
+
+    unsetenv("SANDBOX_BROKER_MAX_BODY");
+    CHECK(broker_max_body() == BROKER_DEFAULT_MAX_BODY, "default limit restored");
+    report("body_limits", b);
 }
 
 static void test_denied(void) {
@@ -597,6 +932,7 @@ static void test_bad_request(void) {
 }
 
 int main(void) {
+    signal(SIGPIPE, SIG_IGN);
     setenv("SANDBOX_BROKER_UPSTREAM_SCHEME", "http", 1);
 
     char tmpl[] = "/tmp/sbtest-broker-XXXXXX";
@@ -615,6 +951,8 @@ int main(void) {
     test_allowlist();
     test_proxy();
     test_chunked();
+    test_stream_large();
+    test_body_limits();
     test_denied();
     test_bad_token();
     test_missing_token();

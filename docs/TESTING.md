@@ -45,7 +45,7 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `tmpl_setup` | yes | yes | Builds the `e2e` template (fixture setup). |
 | `vmm` | yes | yes | Restore, env inject, readiness/confirm, cgroup placement; the `/snapshot/load` body (clock/tap/vsock) is asserted even without root. |
 | `uffd` | no | no | Lazy-restore page-fault handling (SKIPs if userfaultfd denied). |
-| `broker` | no | no | Request pipeline against an in-process mock engine + upstream. |
+| `broker` | no | no | Request pipeline against an in-process mock engine + upstream. #7: 64 MiB bodies (Content-Length and chunked) hashed end to end with a peak-RSS bound, 413 for oversize (declared and chunked), exact-limit pass, 400 for bad chunk framing. |
 | `ipc` | yes | yes | Daemon IPC, async `Create`, client API, broker-control; #24 exec/file ops against a *restored* guest, and a session workspace that carries a command's file from one sandbox to the next. |
 | `guest_rpc` | no | no | #24 guest server against the host client over socketpairs: exec (streaming, timeout, output cap, process-group kill, cancel on disconnect), file ops, path-escape and malformed-frame cases, concurrency. 82 checks. |
 | `ipc_guest` | no | no | #24 through the whole IPC stack (libsandbox → daemon → worker pool → a hybrid-vsock-style UDS → the real guest server); only the VM is faked. Ownership, per-session cap, chunked 4 MiB transfers, reply-frame budgets, error mapping. 40 checks. |
