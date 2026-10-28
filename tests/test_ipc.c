@@ -219,7 +219,7 @@ static void* conc_create(void* p) {
 
 // ---------------------------------------------------------------------------
 // #26 end to end: a real guest reaches an allow-listed host through the real
-// broker, and nothing else. The upstream is a mock on 192.0.2.1 (TEST-NET-1,
+// broker, and nothing else. The upstream is a mock on 198.51.100.1 (TEST-NET-2,
 // aliased onto the host's loopback for the test): an address the guest has no
 // route to and the host does, so a request can only get there via the broker.
 // Needs an image with curl (the Debian one); the busybox fixture skips.
@@ -229,7 +229,7 @@ static void* conc_create(void* p) {
 #include <netinet/in.h>
 #include <sys/socket.h>
 
-#define UP_ADDR "192.0.2.1"
+#define UP_ADDR "198.51.100.1"
 
 static pthread_mutex_t g_up_mu = PTHREAD_MUTEX_INITIALIZER;
 static char g_up_last[4096];     // the last request the mock upstream received
@@ -530,10 +530,10 @@ int main(void) {
     }
     ipc_server_set_pool(&g_pool);
     ipc_server_set_template("e2e");
-    // 192.0.2.1 / 127.0.0.1 are what the guest-network test names; the pypi names
+    // 198.51.100.1 / 127.0.0.1 are what the guest-network test names; the pypi names
     // are for its optional real-internet leg. The first entry stays what the
     // token checks below expect.
-    ipc_server_set_allowed_services("api.example.com,*.internal,192.0.2.1,127.0.0.1,pypi.org,*.pythonhosted.org");
+    ipc_server_set_allowed_services("api.example.com,*.internal,198.51.100.1,127.0.0.1,pypi.org,*.pythonhosted.org");
 
     CHECK(ipc_server_start_broker_control(g_bc_sock) == 0, "broker-control start");
 
