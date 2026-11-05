@@ -196,6 +196,13 @@ func (s *Store) SaveGrant(g *Grant) error {
 	return s.saveLocked()
 }
 
+func (s *Store) Grant(id string) (*Grant, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.db.Grants[id]
+	return g, ok
+}
+
 // RevokeGrant marks the grant revoked and drops every code and token issued
 // under it. Refresh reuse calls this.
 func (s *Store) RevokeGrant(id string) error {

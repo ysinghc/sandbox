@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
 	"strings"
 )
 
@@ -22,6 +23,16 @@ type Config struct {
 	// StorePath is the JSON state file for OAuth clients, codes and
 	// tokens. It is created mode 0600 and refused if more open than that.
 	StorePath string
+	// APIBase is the #27 sandbox-api base URL: http(s)://host:port or
+	// unix:///path/to/api.sock. Tools and consent-token checks call it.
+	APIBase string
+	// APITokenFile holds the sandbox-api bearer token (one line) the
+	// gateway acts with. M2 serves a single operator principal; per-user
+	// principals arrive with multi-tenancy (#17).
+	APITokenFile string
+	// TestClient enables the client_credentials grant for self-host and
+	// e2e testing, as "id:secret". Empty disables the grant entirely.
+	TestClient string
 }
 
 func parseFlags(args []string) (Config, error) {
@@ -30,6 +41,9 @@ func parseFlags(args []string) (Config, error) {
 	fs.StringVar(&c.Listen, "listen", "127.0.0.1:8090", "local bind address")
 	fs.StringVar(&c.PublicURL, "public-url", "", "canonical public base URL (required)")
 	fs.StringVar(&c.StorePath, "store", "", "OAuth state file (required)")
+	fs.StringVar(&c.APIBase, "api", "", "#27 sandbox-api base URL, http(s):// or unix:// (required)")
+	fs.StringVar(&c.APITokenFile, "api-token-file", "", "file holding the sandbox-api bearer token (required)")
+	fs.StringVar(&c.TestClient, "test-client", "", "enable client_credentials as id:secret (testing only)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
@@ -58,7 +72,45 @@ func (c Config) validate() error {
 	if c.StorePath == "" {
 		return errors.New("--store is required")
 	}
+	if c.APIBase == "" {
+		return errors.New("--api is required")
+	}
+	if !(strings.HasPrefix(c.APIBase, "http://") || strings.HasPrefix(c.APIBase, "https://") ||
+		strings.HasPrefix(c.APIBase, "unix://")) {
+		return fmt.Errorf("bad --api %q: want http(s):// or unix://", c.APIBase)
+	}
+	if c.APITokenFile == "" {
+		return errors.New("--api-token-file is required")
+	}
+	if c.TestClient != "" {
+		id, secret, ok := strings.Cut(c.TestClient, ":")
+		if !ok || id == "" || secret == "" {
+			return fmt.Errorf("bad --test-client: want id:secret")
+		}
+	}
 	return nil
+}
+
+// LoadAPIToken reads the bearer token from APITokenFile (first line). The
+// file must not be readable beyond its owner: it is a live credential.
+func (c Config) LoadAPIToken() (string, error) {
+	fi, err := os.Stat(c.APITokenFile)
+	if err != nil {
+		return "", err
+	}
+	if fi.Mode().Perm()&0077 != 0 {
+		return "", fmt.Errorf("refusing unsafe token file %s: mode %04o", c.APITokenFile, fi.Mode().Perm())
+	}
+	raw, err := os.ReadFile(c.APITokenFile)
+	if err != nil {
+		return "", err
+	}
+	tok, _, _ := strings.Cut(string(raw), "\n")
+	tok = strings.TrimSpace(tok)
+	if tok == "" {
+		return "", fmt.Errorf("token file %s is empty", c.APITokenFile)
+	}
+	return tok, nil
 }
 
 func isLoopbackHost(host string) bool {

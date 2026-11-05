@@ -9,8 +9,8 @@ import (
 )
 
 func TestHealth(t *testing.T) {
-	st, _ := testStore(t)
-	srv := httptest.NewServer(newMux(Config{PublicURL: "https://m.example.org"}, st))
+	s := testServer(t)
+	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/health")
 	if err != nil {
@@ -30,8 +30,8 @@ func TestHealth(t *testing.T) {
 }
 
 func TestHealthMethodNotAllowed(t *testing.T) {
-	st, _ := testStore(t)
-	srv := httptest.NewServer(newMux(Config{}, st))
+	s := testServer(t)
+	srv := httptest.NewServer(s.Handler())
 	defer srv.Close()
 	resp, err := http.Post(srv.URL+"/health", "text/plain", nil)
 	if err != nil {

@@ -6,7 +6,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -33,22 +32,19 @@ func run(args []string) error {
 		return fmt.Errorf("open store: %w", err)
 	}
 	st.Sweep()
-	srv := &http.Server{Addr: cfg.Listen, Handler: newMux(cfg, st)}
+	srv, err := NewServer(cfg, st)
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(os.Stderr, "mcp-gateway %s listening on %s (public %s)\n",
 		version, cfg.Listen, cfg.PublicURL)
-	return srv.ListenAndServe()
+	return (&http.Server{Addr: cfg.Listen, Handler: srv.Handler()}).ListenAndServe()
 }
 
-func newMux(cfg Config, st *Store) *http.ServeMux {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]string{
-			"status":  "ok",
-			"service": "mcp-gateway",
-			"version": version,
-		})
+func (s *Server) health(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"service": "mcp-gateway",
+		"version": version,
 	})
-	_ = st // the OAuth and MCP routes register here as they land.
-	return mux
 }

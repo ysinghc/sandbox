@@ -235,7 +235,8 @@ peer, cid 1) and the guest asserts the positive direction
 | #25 template pipeline | ✅ x86_64: spec-driven build, content-addressed store, rollback, GC, byte-reproducible image, docs; privileged CI builds the image twice (identical), publishes, rolls back and collects on a real template. The aarch64 leg is deferred with the ARM milestone |
 | #26 egress policy | ✅ policy model, per-session plumbing, broker as a forward proxy (absolute-form + CONNECT), public-address guard, threaded broker, guest NIC + proxy env hand-off, exec inherits the spec env; unit/in-process tests and the privileged Debian e2e (incl. a real package index through the broker) green in CI |
 | #27 control-plane HTTP API | 🔄 `sandbox-api`: sessions with persistent workspaces, exec (+SSE at completion), files, bearer-token/uid auth, isolation, idempotency; unit tests (fake engine, ASan/UBSan/TSan clean) + privileged e2e. Live output streaming is not done (needs a guest-RPC streaming op) |
-| M2 #28 | ⏳ not started |
+| M2 #28 | 🔄 remote MCP gateway in progress: stdlib-only Go module, OAuth 2.1 (DCR + CIMD, PKCE S256, refresh rotation) done; MCP transport + tools next |
+| #34 (#27 follow-up) | ⏳ live exec streaming (daemon already buffers; guest leg streams) + engine volume delete; sequenced after #28 |
 
 ### What the `jail_cleanup` fix actually became
 

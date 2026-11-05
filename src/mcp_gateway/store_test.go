@@ -59,6 +59,20 @@ func TestStoreClientRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStoreGrantLookup(t *testing.T) {
+	st, _ := testStore(t)
+	if err := st.SaveGrant(&Grant{ID: "g9", ClientID: "c", Principal: "operator", Scopes: []string{"a"}}); err != nil {
+		t.Fatal(err)
+	}
+	g, ok := st.Grant("g9")
+	if !ok || g.Principal != "operator" || len(g.Scopes) != 1 {
+		t.Fatalf("Grant = %+v, %v", g, ok)
+	}
+	if _, ok := st.Grant("nope"); ok {
+		t.Fatal("unknown grant returned ok")
+	}
+}
+
 func TestStoreCodeSingleUse(t *testing.T) {
 	st, _ := testStore(t)
 	if err := st.SaveGrant(&Grant{ID: "g1", ClientID: "c", Principal: "alice"}); err != nil {
