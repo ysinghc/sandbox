@@ -99,6 +99,21 @@ jobs:
       - name: Build
         run: cmake --build build -j
 
+      - name: Set up Go
+        # The MCP gateway (#28) is Go. setup-go downloads a toolchain even on a
+        # self-hosted runner; the module is dependency-free, so no downloads
+        # beyond the toolchain itself.
+        if: ${{ inputs.arch == 'x86_64' }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: Build the MCP gateway (#28)
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          cd src/mcp_gateway
+          go build -o "${{ github.workspace }}/build/mcp-gateway" .
+
       - name: Unit tests that need no privileges
         run: |
           set -euo pipefail
@@ -293,6 +308,20 @@ jobs:
           grep -q 'ALL PASSED' http_api.log
           for p in 'VM is reclaimed; the session stays +PASS' 'workspace is intact +PASS' 'files from before are still there +PASS' 'another principal cannot see the session +PASS'; do
             grep -Eq "$p" http_api.log || { echo "missing PASS line: $p"; exit 1; }
+          done
+
+      - name: MCP gateway e2e (root, #28)
+        # The gateway in front of sandbox-api in front of the real daemon and
+        # guest: OAuth metadata, DCR, consent + PKCE, token + refresh rotation,
+        # all twelve tools against a real guest, SSE framing, scope enforcement.
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
+                bash tests/e2e/mcp_gateway.sh 2>&1 | tee mcp_gateway.log
+          grep -q 'ALL PASSED' mcp_gateway.log
+          for p in 'MCP run reaches the guest +PASS' 'refresh rotates the pair +PASS' 'read-only token cannot run +PASS' 'SSE framing +PASS' 'tools/list shows all 12 tools +PASS'; do
+            grep -Eq "$p" mcp_gateway.log || { echo "missing PASS line: $p"; exit 1; }
           done
 
       - name: Latency assertions (root)

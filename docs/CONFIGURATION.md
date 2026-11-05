@@ -98,6 +98,22 @@ Every flag also reads `SANDBOX_API_<NAME>` from the environment.
 
 `sandbox-api new-token NAME` prints a fresh token (shown once) and its tokens-file entry.
 
+## `mcp-gateway` options (#28)
+
+Every flag also reads `SANDBOX_MCP_<NAME>` from the environment; explicit flags win.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--listen HOST:PORT` | `127.0.0.1:8090` | Local bind address. |
+| `--public-url URL` | none | Canonical public origin (required). The OAuth issuer and token audience; `https` required off loopback. |
+| `--store FILE` | none | OAuth state file (required). Created 0600, refused if more open. |
+| `--api URL` | none | sandbox-api base (required): `http(s)://` or `unix://`. |
+| `--api-token-file FILE` | none | Bearer [REDACTED] the gateway acts with (required). Must not be group/world-readable. M2 serves this one operator principal. |
+| `--test-client ID:SECRET` | off | Enable the `client_credentials` grant (testing only, unadvertised). |
+| `--tls-self-signed` | off | Serve HTTPS with an ephemeral loopback cert (dev only); refuses a non-loopback `--listen`. |
+
+Token lifetimes are fixed: codes 10 min, access 1 h, refresh 30 d with rotation (a replayed refresh revokes its grant). Scopes: `sandbox:read`, `sandbox:write` (see [MCP.md](MCP.md)).
+
 ## Broker environment variables
 
 The broker is configured purely through the environment (its defaults are

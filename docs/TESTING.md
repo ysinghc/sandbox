@@ -61,7 +61,7 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 
 ## CI
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs four jobs on
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs five jobs on
 hosted runners (no KVM/assets/root), excluding the privileged set via
 `CI_TEST_EXCLUDE="pool|network|tmpl_setup|vmm|ipc|cgroup"`:
 
@@ -70,6 +70,9 @@ hosted runners (no KVM/assets/root), excluding the privileged set via
 3. **asan-ubsan** — Debug build with `-DSANDBOX_SANITIZE=address,undefined`.
 4. **fuzz-smoke** — clang + libFuzzer build of `fuzz_http`/`fuzz_config`/
    `fuzz_proto` plus a short smoke run over the corpora.
+5. **go-gateway** — `gofmt`, `go vet`, `go test -count=1 ./...` and a build of
+   the #28 MCP gateway (`src/mcp_gateway/`), whose real-engine half is
+   `tests/e2e/mcp_gateway.sh` (root, privileged CI).
 
 The privileged/end-to-end coverage lives in
 [`.github/workflows/privileged-e2e.yml`](../.github/workflows/privileged-e2e.yml)

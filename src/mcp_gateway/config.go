@@ -33,6 +33,10 @@ type Config struct {
 	// TestClient enables the client_credentials grant for self-host and
 	// e2e testing, as "id:secret". Empty disables the grant entirely.
 	TestClient string
+	// SelfSignedTLS serves HTTPS with an ephemeral loopback certificate
+	// instead of plain HTTP. Development only: clients must pin the
+	// logged fingerprint, and the cert lasts 24 hours.
+	SelfSignedTLS bool
 }
 
 func parseFlags(args []string) (Config, error) {
@@ -44,11 +48,38 @@ func parseFlags(args []string) (Config, error) {
 	fs.StringVar(&c.APIBase, "api", "", "#27 sandbox-api base URL, http(s):// or unix:// (required)")
 	fs.StringVar(&c.APITokenFile, "api-token-file", "", "file holding the sandbox-api bearer token (required)")
 	fs.StringVar(&c.TestClient, "test-client", "", "enable client_credentials as id:secret (testing only)")
+	fs.BoolVar(&c.SelfSignedTLS, "tls-self-signed", false, "serve HTTPS with an ephemeral loopback cert (dev only)")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
 	}
 	if fs.NArg() > 0 {
 		return Config{}, fmt.Errorf("unexpected argument: %q", fs.Arg(0))
+	}
+	// Every flag also reads SANDBOX_MCP_<NAME> from the environment, in the
+	// sandbox-api style. Explicit flags win over the environment.
+	set := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
+	strEnv := func(name, env string, dst *string) {
+		if !set[name] {
+			if v := os.Getenv(env); v != "" {
+				*dst = v
+			}
+		}
+	}
+	strEnv("listen", "SANDBOX_MCP_LISTEN", &c.Listen)
+	strEnv("public-url", "SANDBOX_MCP_PUBLIC_URL", &c.PublicURL)
+	strEnv("store", "SANDBOX_MCP_STORE", &c.StorePath)
+	strEnv("api", "SANDBOX_MCP_API", &c.APIBase)
+	strEnv("api-token-file", "SANDBOX_MCP_API_TOKEN_FILE", &c.APITokenFile)
+	strEnv("test-client", "SANDBOX_MCP_TEST_CLIENT", &c.TestClient)
+	if !set["tls-self-signed"] {
+		switch strings.ToLower(os.Getenv("SANDBOX_MCP_TLS_SELF_SIGNED")) {
+		case "", "0", "false", "no":
+		case "1", "true", "yes":
+			c.SelfSignedTLS = true
+		default:
+			return Config{}, fmt.Errorf("bad SANDBOX_MCP_TLS_SELF_SIGNED: want 1/true/yes or 0/false/no")
+		}
 	}
 	return c, c.validate()
 }
@@ -86,6 +117,13 @@ func (c Config) validate() error {
 		id, secret, ok := strings.Cut(c.TestClient, ":")
 		if !ok || id == "" || secret == "" {
 			return fmt.Errorf("bad --test-client: want id:secret")
+		}
+	}
+	if c.SelfSignedTLS {
+		host, _, _ := net.SplitHostPort(c.Listen)
+		// A dev cert on a public socket would look secure and not be: refuse.
+		if host != "" && !isLoopbackHost(host) {
+			return fmt.Errorf("--tls-self-signed requires a loopback --listen")
 		}
 	}
 	return nil

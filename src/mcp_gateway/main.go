@@ -6,6 +6,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net/http"
 	"os"
@@ -36,9 +37,24 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	httpSrv := &http.Server{Addr: cfg.Listen, Handler: srv.Handler()}
+	if cfg.SelfSignedTLS {
+		cert, fingerprint, err := selfSignedCert()
+		if err != nil {
+			return fmt.Errorf("mint dev certificate: %w", err)
+		}
+		httpSrv.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		fmt.Fprintf(os.Stderr, "mcp-gateway %s listening with a dev certificate on %s (public %s)\n",
+			version, cfg.Listen, cfg.PublicURL)
+		fmt.Fprintf(os.Stderr, "mcp-gateway dev certificate sha256: %s\n", fingerprint)
+		return httpSrv.ListenAndServeTLS("", "")
+	}
 	fmt.Fprintf(os.Stderr, "mcp-gateway %s listening on %s (public %s)\n",
 		version, cfg.Listen, cfg.PublicURL)
-	return (&http.Server{Addr: cfg.Listen, Handler: srv.Handler()}).ListenAndServe()
+	return httpSrv.ListenAndServe()
 }
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {

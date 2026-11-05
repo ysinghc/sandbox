@@ -10,6 +10,7 @@ Operational procedures for a production install. Paths use the CMake defaults
 |---|---|---|
 | `sandboxd.service` | `/usr/local/bin/sandboxd` | `engine.sock` (clients), `broker-control.sock` (broker), `:9180` (metrics/health) |
 | `sandbox-api.service` | `/usr/local/bin/sandbox-api` | `/run/sandbox-api/api.sock`, `127.0.0.1:8088` (see [API.md](API.md#http-control-plane-api-27)); exits 75 if the daemon is lost and is restarted by systemd. Its tokens file lives at `/etc/sandbox-engine/api-tokens.conf`; mint one with `sandbox-api new-token NAME`. Add the service uid (and any unix-socket callers) to `allowed_uids` |
+| `mcp-gateway.service` | `/usr/local/bin/mcp-gateway` | `127.0.0.1:8090` behind the operator's TLS terminator (see [MCP.md](MCP.md)); exits nonzero on bad config or an unsafe store/token file. State (OAuth registry, 0600): the `--store` file |
 | `sandbox-broker` | `/usr/local/bin/sandbox-broker` | `0.0.0.0:8080` (guests), `broker-control.sock` (engine) |
 | Firecracker | `/usr/local/bin/firecracker` | spawned per VM by sandboxd, jailed + cgroup-limited |
 
@@ -108,6 +109,22 @@ the broker and are not buffered. Anything over `SANDBOX_BROKER_MAX_BODY` bytes
 (default 256 MiB) gets `413`; malformed chunk framing or a short body gets
 `400`. Raise the limit by setting `SANDBOX_BROKER_MAX_BODY` in the broker's
 environment and restarting it.
+
+### `mcp-gateway` exits at startup
+
+It fails closed: a bad `--public-url` (must be absolute, `https` off loopback),
+a missing `--store`/`--api`/`--api-token-file`, or a store/token file readable
+beyond its owner all exit nonzero with the reason on stderr. Fix the flags or
+`chmod 600` the file and restart.
+
+### Assistants get `401` from `/mcp`
+
+No token, an expired token, or a token minted for another resource. Clients
+re-run the flow automatically from the `WWW-Authenticate` discovery header. If
+one client loops on `invalid_grant` at refresh time, its refresh token was
+replayed (each is single-use) and the grant is revoked — the user must approve
+again. Mass `401`s right after changing `--public-url` are expected: the URL is
+the token audience.
 
 ### Cleaning up after a hard stop / crash
 

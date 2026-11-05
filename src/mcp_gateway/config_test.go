@@ -73,6 +73,34 @@ func TestParseFlagsAllowsHTTPLoopback(t *testing.T) {
 	}
 }
 
+func TestFlagsReadEnv(t *testing.T) {
+	t.Setenv("SANDBOX_MCP_LISTEN", "127.0.0.1:9999")
+	t.Setenv("SANDBOX_MCP_PUBLIC_URL", "https://mcp.example.org")
+	t.Setenv("SANDBOX_MCP_STORE", "/tmp/s.json")
+	t.Setenv("SANDBOX_MCP_API", "http://127.0.0.1:8088")
+	t.Setenv("SANDBOX_MCP_API_TOKEN_FILE", "/tmp/tok")
+	t.Setenv("SANDBOX_MCP_TLS_SELF_SIGNED", "yes")
+	c, err := parseFlags(nil)
+	if err != nil {
+		t.Fatalf("env-only config rejected: %v", err)
+	}
+	if c.Listen != "127.0.0.1:9999" || !c.SelfSignedTLS {
+		t.Fatalf("env not applied: %+v", c)
+	}
+	// An explicit flag wins over the environment.
+	c, err = parseFlags([]string{"--listen", "127.0.0.1:1111"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Listen != "127.0.0.1:1111" {
+		t.Fatalf("flag did not win: %+v", c)
+	}
+	t.Setenv("SANDBOX_MCP_TLS_SELF_SIGNED", "maybe")
+	if _, err := parseFlags(nil); err == nil {
+		t.Fatal("garbage bool env accepted")
+	}
+}
+
 func TestLoadAPIToken(t *testing.T) {
 	dir := t.TempDir()
 	ok := dir + "/tok"

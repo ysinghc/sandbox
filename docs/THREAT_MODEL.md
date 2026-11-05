@@ -100,7 +100,25 @@ compromise of it yields the engine's per-uid session and quota limits, not root.
 | T25 | Exhausting VMs | per-principal session cap, global running-VM cap with LRU idle eviction, engine quotas | tested |
 | T26 | Credentials in transit | plain HTTP: bind loopback and put TLS in front; `--allow-public-bind` is explicit | documented |
 
+### 4.3b Assistants → MCP gateway (#28)
 
+`mcp-gateway` is the first internet-facing surface: a remote MCP server and a
+built-in OAuth 2.1 authorization server. It runs unprivileged, holds the
+operator's sandbox-api bearer token, and every grant acts as that one
+principal (per-user principals wait for #17).
+
+| # | Threat | Mitigation | Status |
+|---|---|---|---|
+| T31 | Unauthenticated tool use | every `/mcp` call needs a live bearer token bound to this server's `/mcp` URL (RFC 8707 audience check); failures are `401` with the RFC 9728 discovery URL, never tool output | tested (`mcp_*`) |
+| T32 | Authorization-code interception / CSRF | PKCE `S256` is mandatory (`plain` and missing challenges are rejected); codes are single-use, 10-minute, redirect-bound, and consumed even on a failed exchange | tested |
+| T33 | Stolen refresh token | rotation on every use; presenting a spent token revokes the whole grant | tested, incl. end to end |
+| T34 | Rogue client registration (DCR is unauthenticated) | redirect URIs must be https (loopback http excepted) with no fragments; public clients only; registry capped at 128; granted scopes stay within the supported set | tested |
+| T35 | Malicious CIMD document / SSRF through the fetch | client_id must be a fragment-less https URL whose document echoes it; fetch is https-only, no redirects, 64 KiB cap, and a dialer that connects only to public addresses (loopback, RFC 1918, link-local, CGNAT, multicast refused, resolved once and dialed by IP against rebinding) | tested, incl. the address table |
+| T36 | Consent phishing / token harvesting | the consent page lives on the gateway's own origin and states the grant's scopes; the pasted API token is checked live and never stored; pending approvals are server-side, 10-minute, single-consume | tested |
+| T37 | Scope creep (read token driving writes) | every tool declares its scope; `tools/call` refuses with `-32001` unless the token carries it | tested, incl. end to end |
+| T38 | Credentials in transit / dev-cert misuse | `https` public URL enforced off loopback; `--tls-self-signed` mints a 24 h loopback-only cert, logs its fingerprint, and refuses a non-loopback listen | tested |
+| T39 | Token/code hashes at rest | the store file is created 0600 and refused if more open; writes are atomic (temp + fsync + rename); codes and tokens are keyed by SHA-256, never plaintext | tested |
+| T40 | One operator principal for all grants | documented M2 limit: every OAuth user shares the `--api-token-file` principal's session namespace (keys still isolate conversations). Real per-user identity is #17 | documented |
 
 | # | Threat | Mitigation | Status |
 |---|---|---|---|

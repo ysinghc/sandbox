@@ -7,6 +7,22 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## [Unreleased]
 
+### Remote MCP server (#28)
+
+- **`mcp-gateway`**, a dependency-free Go process that exposes the engine to
+  web assistants over Streamable HTTP: twelve tools mapping 1:1 onto the #27
+  API (sessions, run, files, stat/ls/mkdir, renew, destroy), with
+  read/destructive annotations, JSON or SSE answers, and per-token scope
+  enforcement.
+- **Built-in OAuth 2.1 authorization server**: discovery metadata (RFC 9728 +
+  RFC 8414), Dynamic Client Registration and Client ID Metadata Documents,
+  authorization code with mandatory PKCE S256, refresh rotation (a replayed
+  refresh revokes its grant), consent login via a live sandbox-api token
+  check, and a config-gated client-credentials grant for testing.
+- M2 serves a single operator principal; per-user principals arrive with #17.
+  TLS is terminated by the operator's proxy (loopback `http` and a
+  `--tls-self-signed` dev mode excepted). See `docs/MCP.md`.
+
 ### Control-plane HTTP API (#27)
 
 - **`sandbox-api`**, an unprivileged process that exposes sessions over HTTP

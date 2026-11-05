@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: GPL-2.0-only
+[Unit]
+Description=Sandbox Engine remote MCP server for web assistants
+After=sandbox-api.service
+Requires=sandbox-api.service
+
+[Service]
+Type=simple
+Environment=SANDBOX_MCP_PUBLIC_URL=https://mcp.example.org
+Environment=SANDBOX_MCP_STORE=/var/lib/mcp-gateway/state.json
+Environment=SANDBOX_MCP_API=http://127.0.0.1:8088
+ExecStart=/usr/local/bin/mcp-gateway --api-token-file /etc/sandbox-engine/mcp-api-token
+Restart=on-failure
+RestartSec=3s
+StandardError=journal
+
+# Unprivileged: it only needs to reach sandbox-api over loopback TCP and to
+# read/write its own state directory and token file (both 0600, owned here).
+User=mcp-gateway
+Group=mcp-gateway
+StateDirectory=mcp-gateway
+StateDirectoryMode=0700
+NoNewPrivileges=true
+CapabilityBoundingSet=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
