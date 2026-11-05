@@ -1636,10 +1636,16 @@ authoritative.
   the §11 gauges/counters were wired there too.
 - **per-VM environment injection** (§6.1 `env_vars`) was implemented in
   **Phase 9b** (§15.11).
-- Still not implemented: a *hierarchical* config layer — `config/` ships
-  `engine.conf` + `credentials.conf.example`, and the parser is flat (section
-  headers are accepted but ignored; keys are matched by name). Defaults are
-  supplied in code, so a partial file is valid.
+- The *hierarchical* config layer (#4) is implemented in
+  `src/daemon/config.c`: `config/` ships `engine.conf` (+ `engine.conf.d/`
+  drop-ins) and `credentials.conf.example`. The parser reads the base file,
+  then `<base>.d/*.conf` in byte order, then applies the `[template "<name>"]`
+  block matching the effective template; bare `[section]` headers stay
+  cosmetic and keys are matched by name, so a partial file is valid and
+  existing single-file configurations behave identically. Defaults are
+  supplied in code. Precedence is CLI > env > template block > drop-ins >
+  base file > defaults. `[service]`/`[tenant]` blocks parse for #9/#17 but
+  are not applied yet.
 
 ### 15.7 aarch64 / Test Environment (§9)
 - Ground truth was verified on a **Raspberry Pi 5** (Ubuntu 24.04 aarch64,
@@ -1808,10 +1814,11 @@ authoritative.
 - **Ownership of `g.tok_lock`:** the registry is read by the broker-control
   thread and written by the IPC thread; `token_lookup` copies service strings
   under the lock and the socket I/O happens outside it.
-- **Config:** flat `key = value` file (no hierarchy) with precedence
-  CLI > env > file > defaults. The parser now lives in
-  `src/daemon/config.c` + `include/engine_config.h` (extracted for unit
-  testing); `[section]` headers are skipped. Keys: `socket(_path)`,
+- **Config:** `key = value` file with drop-ins and template overlays (#4);
+  precedence CLI > env > matching `[template]` block > `<base>.d/*.conf` >
+  base file > defaults. The parser lives in `src/daemon/config.c` +
+  `include/engine_config.h` (extracted for unit testing); bare `[section]`
+  headers are skipped. Keys: `socket(_path)`,
   `broker_control_socket`, `template(_name)`, `pool_size`/`target_size`,
   `max_queue_depth`, `pool_wait_timeout_ms`, `allowed_services`,
   `allowed_uids`, `jailer_uid`, `jailer_gid`, `jail_root`, `snapshot_root`,

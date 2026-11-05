@@ -193,6 +193,9 @@ install(DIRECTORY DESTINATION ${SANDBOX_RUN_DIR})
 
 # Config (§10.2 step 5). credentials.conf is 0600 and installed separately.
 install(FILES config/engine.conf DESTINATION ${SANDBOX_STATE_DIR}/config)
+install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/config/engine.conf.d)
+install(FILES config/engine.conf.d/README
+        DESTINATION ${SANDBOX_STATE_DIR}/config/engine.conf.d)
 install(FILES config/credentials.conf.example DESTINATION ${SANDBOX_ETC_DIR})
 
 # systemd unit (§10.3).

@@ -7,6 +7,18 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## [Unreleased]
 
+### Hierarchical configuration (#4)
+
+- **Drop-in directory.** `sandboxd` reads `<config>.d/*.conf` after the base
+  file, in byte order; later files win, every drop-in beats the base file and
+  loses to template blocks, the environment, and the command line.
+- **`[template "<name>"]` overlays.** A named block whose name matches the
+  effective template overrides the merged file values; bare `[section]`
+  headers stay cosmetic. `[service]`/`[tenant]` blocks parse and are
+  queryable for #9/#17 but are not applied yet.
+- Precedence is now CLI > env > matching template block > drop-ins > base
+  file > defaults. Existing single-file configurations behave identically.
+
 ### Remote MCP server (#28)
 
 - **`mcp-gateway`**, a dependency-free Go process that exposes the engine to

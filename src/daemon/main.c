@@ -3,9 +3,10 @@
 // manager and the IPC server, and runs the engine-side broker-control socket
 // that the credential broker validates session tokens against.
 //
-// Config precedence: CLI flags > environment > config file > built-in defaults.
-// There is no YAML/std::variant config layer (see SYSTEM DESIGN.md §15.9); the
-// file is a flat "key = value" list.
+// Config precedence (#4): CLI flags > environment > the [template "N"] overlay
+// matching the effective template > <base>.d/*.conf drop-ins > base file >
+// built-in defaults. There is no YAML/std::variant config layer (see SYSTEM
+// DESIGN.md §15.9); files are "key = value" lists with [section] headers.
 
 #include "engine_config.h"
 #include "cgroup.h"
@@ -119,6 +120,7 @@ static int validate_config(const engine_config_t* c, const char* config_file) {
     printf("sandboxd %s config validation\n", SANDBOX_VERSION);
     printf("  config file:   %s\n",
            config_file ? config_file : "<built-in defaults>");
+    if (config_file) printf("  config dir:    %s.d\n", config_file);
     printf("  socket:        %s\n", c->socket_path);
     printf("  broker-control:%s\n", c->broker_control_socket);
     printf("  template:      %s\n", c->template_name);
@@ -248,33 +250,44 @@ int main(int argc, char** argv) {
         static const char* def = "/var/lib/sandbox-engine/config/engine.conf";
         if (access(def, R_OK) == 0) config_file = def;
     }
-    if (config_file) config_load_file(&cfg, config_file);
+    if (config_file) {
+        config_load_file(&cfg, config_file);
+        config_load_conf_d(&cfg, config_file);
+    }
     config_apply_env(&cfg);
 
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         const char* v = (i + 1 < argc) ? argv[i + 1] : NULL;
-        if ((strcmp(a, "--socket") == 0) && v) config_set_key(&cfg, "socket", argv[++i]);
+        // Every branch marks CONFIG_LAYER_CLI so template overlays yield to it.
+        if ((strcmp(a, "--socket") == 0) && v)
+            config_set_key_layer(&cfg, "socket", argv[++i], CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--broker-control") == 0) && v)
-            config_set_key(&cfg, "broker_control", argv[++i]);
+            config_set_key_layer(&cfg, "broker_control", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--template") == 0) && v)
-            config_set_key(&cfg, "template", argv[++i]);
+            config_set_key_layer(&cfg, "template", argv[++i], CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--pool-size") == 0) && v)
-            config_set_key(&cfg, "pool_size", argv[++i]);
+            config_set_key_layer(&cfg, "pool_size", argv[++i], CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--allowed-services") == 0) && v)
-            config_set_key(&cfg, "allowed_services", argv[++i]);
+            config_set_key_layer(&cfg, "allowed_services", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--allowed-uids") == 0) && v)
-            config_set_key(&cfg, "allowed_uids", argv[++i]);
+            config_set_key_layer(&cfg, "allowed_uids", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--metrics-port") == 0) && v)
-            config_set_key(&cfg, "metrics_port", argv[++i]);
+            config_set_key_layer(&cfg, "metrics_port", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--metrics-bind") == 0) && v)
-            config_set_key(&cfg, "metrics_bind", argv[++i]);
+            config_set_key_layer(&cfg, "metrics_bind", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--jail-root") == 0) && v)
-            config_set_key(&cfg, "jail_root", argv[++i]);
+            config_set_key_layer(&cfg, "jail_root", argv[++i], CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--snapshot-root") == 0) && v)
-            config_set_key(&cfg, "snapshot_root", argv[++i]);
+            config_set_key_layer(&cfg, "snapshot_root", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--log-level") == 0) && v)
-            config_set_key(&cfg, "log_level", argv[++i]);
+            config_set_key_layer(&cfg, "log_level", argv[++i], CONFIG_LAYER_CLI);
         else if (strcmp(a, "--validate-config") == 0) do_validate = true;
         else if (strcmp(a, "--version") == 0) {
             printf("sandboxd %s\n", SANDBOX_VERSION);
@@ -291,6 +304,10 @@ int main(int argc, char** argv) {
             return 0;
         }
     }
+
+    // #4: the template name is final now that CLI ran; apply the matching
+    // overlay (env/CLI-set keys are left alone by provenance).
+    config_apply_template_overlays(&cfg);
 
     // §10.12: apply the resolved level before anything logs.
     {

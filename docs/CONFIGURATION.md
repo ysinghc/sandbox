@@ -1,15 +1,33 @@
 # Configuration
 
-`sandboxd` reads a flat `key = value` file. `[section]` headers are cosmetic —
-the parser ignores them and matches keys by name, so **key names must be
-unique**. Lines starting with `#` or `;` are comments.
+`sandboxd` reads `key = value` files. Lines starting with `#` or `;` are
+comments. Bare `[name]` headers are cosmetic — the parser ignores them and
+matches keys by name, so **key names must be unique**. A `[kind "name"]`
+header opens a named overlay instead; see below.
 
 **Precedence (highest first):**
 
 1. Command-line flags (`sandboxd --socket ...`)
 2. Environment variables (`SANDBOX_*`)
-3. The config file
-4. Built-in defaults
+3. The `[template "<name>"]` block matching the effective template (#4)
+4. Drop-in files `<base>.d/*.conf`, in C-locale byte order (#4)
+5. The base config file
+6. Built-in defaults
+
+## Drop-ins and overlays (#4)
+
+Next to the base file, `sandboxd` also reads `<base>.d/*.conf` (for the
+packaged file, `config/engine.conf.d/*.conf`): later files win, and every
+drop-in wins over the base file but loses to the `[template]` block, the
+environment, and the command line. A missing directory is fine; dotfiles,
+non-`.conf` names, and non-regular files are skipped.
+
+A `[template "<name>"]` block in the base file or any drop-in applies when its
+name equals the effective template (after environment and CLI overrides).
+Keys before any `[template]` header stay global. `[service "…"]` and
+`[tenant "…"]` blocks parse today but are not applied — their storage
+(`config_overlay_get()`) is reserved for #9 and #17. Unknown kinds are
+ignored. A malformed header is a warning and resets to global scope.
 
 **Default config path:** `/var/lib/sandbox-engine/config/engine.conf`
 (override with `sandboxd --config FILE`). The packaged file is

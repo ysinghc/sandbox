@@ -1,0 +1,13 @@
+# engine.conf.d — drop-in overrides (#4)
+
+Files ending in `.conf` in this directory load after `engine.conf`, in byte
+order; later files win. Dotfiles, non-`.conf` names and non-regular files are
+skipped. This file exists only to explain the directory and is itself skipped.
+
+Example: `/var/lib/sandbox-engine/config/engine.conf.d/10-pool.conf`
+
+    # Local pool tuning; survives package upgrades of engine.conf.
+    pool_size = 8
+
+`[template "NAME"]` sections in any layer apply only when NAME is the
+effective template (see docs/CONFIGURATION.md).
