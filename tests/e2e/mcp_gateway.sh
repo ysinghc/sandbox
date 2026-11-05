@@ -300,6 +300,7 @@ check $([ "$HTTP_STATUS" = 200 ]; echo $?) "the rotated access token works"
 HTTP_STATUS="$(curl -s -o "$WORK/body" -w '%{http_code}' -X POST "$PUBLIC/oauth/token" \
     --data-urlencode "grant_type=refresh_token" --data-urlencode "client_id=$CID" \
     --data-urlencode "refresh_token=$REFRESH")"
+HTTP_BODY="$(cat "$WORK/body")"
 check $([ "$HTTP_STATUS" = 400 ] && [ "$(jget error)" = "invalid_grant" ]; echo $?) "replaying the spent refresh fails"
 mcp "$ACCESS2" '{"jsonrpc":"2.0","id":9,"method":"ping"}'
 check $([ "$HTTP_STATUS" = 401 ]; echo $?) "the replay revoked the whole grant"
