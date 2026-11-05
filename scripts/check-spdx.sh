@@ -3,9 +3,10 @@
 #
 # check-spdx — fail if any tracked source file lacks an SPDX licence tag.
 #
-# Scans src/, include/, tests/ and scripts/ for .c .h .hpp .cpp and .sh files
-# and asserts each carries an SPDX-License-Identifier within its first three
-# lines (three, not one, so a `#!/usr/bin/env bash` shebang may precede it).
+# Scans src/, include/, tests/ and scripts/ for .c .h .hpp .cpp, .go and .sh
+# files and asserts each carries an SPDX-License-Identifier within its first
+# three lines (three, not one, so a `#!/usr/bin/env bash` shebang may precede
+# it).
 
 set -uo pipefail
 
@@ -20,7 +21,7 @@ while IFS= read -r f; do
         missing=1
     fi
 done < <(find src include tests scripts -type f \
-             \( -name '*.c' -o -name '*.h' -o -name '*.hpp' -o -name '*.cpp' -o -name '*.sh' \) \
+             \( -name '*.c' -o -name '*.h' -o -name '*.hpp' -o -name '*.cpp' -o -name '*.go' -o -name '*.sh' \) \
            | sort)
 
 if [ "$missing" -ne 0 ]; then

@@ -77,3 +77,19 @@ jobs:
             echo "=== fuzz_$t ==="
             ./build-fuzz/fuzz/fuzz_$t -max_total_time=20 -runs=200000 fuzz/corpus/$t
           done
+
+  go-gateway:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Format, vet, test and build the MCP gateway (#28)
+        run: |
+          cd src/mcp_gateway
+          gofmt -l . | tee /tmp/gofmt.out
+          test ! -s /tmp/gofmt.out
+          go vet ./...
+          go test -count=1 ./...
+          go build -o /tmp/mcp-gateway .
