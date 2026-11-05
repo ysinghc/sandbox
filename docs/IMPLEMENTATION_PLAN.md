@@ -234,8 +234,8 @@ peer, cid 1) and the guest asserts the positive direction
 | #7 broker streaming | ✅ chunked and Content-Length bodies stream with bounded memory; `SANDBOX_BROKER_MAX_BODY` (256 MiB) → 413; 64 MiB SHA-256 fidelity + RSS bound tested |
 | #25 template pipeline | ✅ x86_64: spec-driven build, content-addressed store, rollback, GC, byte-reproducible image, docs; privileged CI builds the image twice (identical), publishes, rolls back and collects on a real template. The aarch64 leg is deferred with the ARM milestone |
 | #26 egress policy | ✅ policy model, per-session plumbing, broker as a forward proxy (absolute-form + CONNECT), public-address guard, threaded broker, guest NIC + proxy env hand-off, exec inherits the spec env; unit/in-process tests and the privileged Debian e2e (incl. a real package index through the broker) green in CI |
-| #27 control-plane HTTP API | 🔄 `sandbox-api`: sessions with persistent workspaces, exec (+SSE at completion), files, bearer-token/uid auth, isolation, idempotency; unit tests (fake engine, ASan/UBSan/TSan clean) + privileged e2e. Live output streaming is not done (needs a guest-RPC streaming op) |
-| M2 #28 | 🔄 remote MCP gateway in progress: stdlib-only Go module, OAuth 2.1 (DCR + CIMD, PKCE S256, refresh rotation) done; MCP transport + tools next |
+| #27 control-plane HTTP API | ✅ `sandbox-api` closed: sessions with persistent workspaces, exec (+SSE at completion), files, bearer-token/uid auth, isolation, idempotency; unit tests (fake engine, ASan/UBSan/TSan clean) + privileged e2e. Streaming + volume delete tracked in #34 (the guest leg already streams; the daemon buffers) |
+| M2 #28 | ✅ `mcp-gateway` closed: stdlib-only Go, Streamable HTTP + OAuth 2.1 (CIMD+DCR, PKCE S256, refresh rotation), 12 tools 1:1, 57 unit + 33 e2e checks green; live vendor connection is operator acceptance #35 |
 | #34 (#27 follow-up) | ⏳ live exec streaming (daemon already buffers; guest leg streams) + engine volume delete; sequenced after #28 |
 
 ### What the `jail_cleanup` fix actually became
@@ -521,9 +521,10 @@ alternative). Endpoints under `/v1/sessions`. Auth: Unix-socket owner check
 locally; bearer token when bound to TCP for #28.
 
 ### #28 — Remote MCP server (Go, D6)
-New `src/mcp_gateway/` (Go): Streamable HTTP + OAuth 2.1 (PKCE, refresh, RFC 7591
-DCR) + SSE. Tools map 1:1 onto #27. Verified: Claude/ChatGPT/Gemini web all
-connect via remote MCP over HTTPS with OAuth + DCR.
+Shipped as `src/mcp_gateway/` (Go): Streamable HTTP + OAuth 2.1 (PKCE, refresh,
+CIMD + RFC 7591 DCR) + SSE. Twelve tools map 1:1 onto #27. Protocol-verified by
+unit + privileged e2e; a live Claude/ChatGPT/Gemini connection is operator
+acceptance (#35).
 
 ---
 
