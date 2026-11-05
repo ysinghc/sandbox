@@ -214,6 +214,13 @@ sudo ctest --test-dir build -V -R "^(pool|network|network_cleanup|tmpl_setup|vmm
 Each host needs:
 
 - `/dev/kvm` and `/dev/net/tun`, and `nftables` on the host;
+- the `vsock`, `vsock_loopback` and `vhost_vsock` kernel modules: a fresh boot
+  has the transports unloaded and AF_VSOCK autoload pulls in only the core
+  `vsock` module, so without an explicit `modprobe` cid 1 has no device, the
+  `vsock_peer` integration check skips (which the privileged job fails on),
+  and Firecracker has no `/dev/vhost-vsock`. The workflow loads them with
+  `modprobe` and asserts they stuck; a hand-run needs
+  `sudo modprobe vsock vsock_loopback vhost_vsock` first;
 - Firecracker at `${FIRECRACKER_BIN:-/usr/local/bin/firecracker}`;
 - guest assets at `${SANDBOX_KERNEL:-/opt/sandbox-assets/vmlinux}` and
   `${SANDBOX_ROOTFS:-/opt/sandbox-assets/rootfs.ext4}`.

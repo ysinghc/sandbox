@@ -39,6 +39,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Load the VM kernel modules the suite needs
+        # A fresh boot has none of these loaded, and nothing before the tests
+        # triggers an autoload (AF_VSOCK's net-pf-40 alias pulls in only the core
+        # vsock module, not the loopback transport): cid 1 then has no device,
+        # the vsock_peer integration check SKIPs, and the no-unexpected-skip gate
+        # below rightly fails the job. Firecracker needs /dev/vhost-vsock later
+        # for the same reason. The load is asserted rather than assumed: a silent
+        # modprobe no-op must fail here, with its cause attached, not surface
+        # pages later as an unexpected SKIP. (A module built into the kernel has
+        # no lsmod row but owns /sys/module/<name>, so either counts as present.)
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO modprobe vsock vsock_loopback vhost_vsock
+          lsmod | grep -E '^(vsock|vhost_vsock)' || true
+          for m in vsock vsock_loopback vhost_vsock; do
+            lsmod | grep -q "^${m} " || [ -e "/sys/module/${m}" ] || {
+              echo "::error::kernel module ${m} is not loaded after modprobe"
+              exit 1
+            }
+          done
+
       - name: Fetch the pinned guest kernel
         run: |
           bash scripts/fetch-guest-kernel.sh --arch "${{ inputs.arch }}" \

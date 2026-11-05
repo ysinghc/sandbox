@@ -115,7 +115,18 @@ int main(void) {
 
     int r = loopback_peer_refused();
     if (r < 0) {
-        printf("SKIP integration: no usable vsock loopback on this host\n");
+        // Say which half is missing: a bare "no loopback" cost a CI round-trip
+        // to attribute to unloaded modules after a fresh boot.
+        int s2 = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        if (s2 >= 0) {
+            printf("SKIP integration: no usable vsock loopback on this host"
+                   " (AF_VSOCK socket ok; bind/connect to cid 1 failed)\n");
+            close(s2);
+        } else {
+            printf("SKIP integration: no usable vsock loopback on this host"
+                   " (socket: errno=%d %s; is vsock_loopback loaded?)\n",
+                   errno, strerror(errno));
+        }
     } else {
         check(r == 1, "a real loopback (cid 1) peer is refused");
     }
