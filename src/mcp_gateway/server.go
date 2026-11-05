@@ -94,6 +94,9 @@ func (s *Server) Handler() *http.ServeMux {
 	mux.HandleFunc("GET /oauth/authorize", s.authorizeForm)
 	mux.HandleFunc("POST /oauth/authorize", s.authorizeSubmit)
 	mux.HandleFunc("POST /oauth/token", s.token)
+	mux.HandleFunc("POST /mcp", s.mcpPOST)
+	mux.HandleFunc("GET /mcp", s.mcpGET)
+	mux.HandleFunc("DELETE /mcp", s.mcpDELETE)
 	return mux
 }
 
