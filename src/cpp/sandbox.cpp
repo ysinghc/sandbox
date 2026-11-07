@@ -23,6 +23,7 @@ const char* SandboxError::error_string(sandbox_error_t code) {
         case SANDBOX_ERR_TOO_LARGE: return "Too large";
         case SANDBOX_ERR_GUEST_IO: return "Guest I/O error";
         case SANDBOX_ERR_TIMEOUT: return "Timed out";
+        case SANDBOX_ERR_SESSION_BUSY: return "Session has a running sandbox";
         default: return "Unknown error";
     }
 }
@@ -133,6 +134,51 @@ ExecResult Sandbox::shell(const std::string& script, ExecOptions opt) {
     return exec({script}, opt);
 }
 
+namespace {
+void stream_trampoline(int is_err, const uint8_t* d, size_t n, void* ud) {
+    const auto& fn = *static_cast<const std::function<void(bool, const char*, size_t)>*>(ud);
+    fn(is_err != 0, reinterpret_cast<const char*>(d), n);
+}
+}  // namespace
+
+ExecResult Sandbox::exec_stream(
+    const std::vector<std::string>& argv,
+    const std::function<void(bool, const char*, size_t)>& on_chunk,
+    const ExecOptions& opt) {
+    std::vector<const char*> av;
+    for (const auto& a : argv) av.push_back(a.c_str());
+    av.push_back(nullptr);
+    std::vector<const char*> ev;
+    for (const auto& e : opt.env) ev.push_back(e.c_str());
+    ev.push_back(nullptr);
+
+    sandbox_exec_spec_t sp = {};
+    sp.argv = av.data();
+    sp.shell = opt.shell;
+    sp.cwd = opt.cwd.empty() ? nullptr : opt.cwd.c_str();
+    sp.env = opt.env.empty() ? nullptr : ev.data();
+    sp.timeout_ms = opt.timeout_ms;
+    sp.max_output = opt.max_output;
+    sp.stdin_data = reinterpret_cast<const uint8_t*>(opt.stdin_data.data());
+    sp.stdin_len = opt.stdin_data.size();
+
+    sandbox_exec_result_t r;
+    sandbox_error_t rc =
+        sandbox_exec_stream(handle_, &sp, stream_trampoline, (void*)&on_chunk, &r);
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
+    ExecResult out;
+    out.exit_code = r.exit_code;
+    out.term_signal = r.term_signal;
+    out.timed_out = r.timed_out;
+    out.output_truncated = r.output_truncated;
+    if (r.out_len) out.out.assign(reinterpret_cast<const char*>(r.out), r.out_len);
+    if (r.err_len) out.err.assign(reinterpret_cast<const char*>(r.err), r.err_len);
+    out.out_total = r.out_total;
+    out.err_total = r.err_total;
+    sandbox_exec_result_free(&r);
+    return out;
+}
+
 std::string Sandbox::read_file(const std::string& path) {
     uint8_t* d = nullptr;
     size_t n = 0;
@@ -208,6 +254,11 @@ uint64_t renew_session(const std::string& session_key, uint32_t extra_seconds) {
         sandbox_session_renew(session_key.c_str(), extra_seconds, &expires_at);
     if (rc != SANDBOX_OK) throw SandboxError(rc);
     return expires_at;
+}
+
+void delete_session(const std::string& session_key) {
+    sandbox_error_t rc = sandbox_session_delete(session_key.c_str());
+    if (rc != SANDBOX_OK) throw SandboxError(rc);
 }
 
 } // namespace sandbox

@@ -99,6 +99,9 @@ compromise of it yields the engine's per-uid session and quota limits, not root.
 | T24 | Path escape through the file API | paths must be under `/workspace`, `%00` rejected, enforced again by the guest agent | tested |
 | T25 | Exhausting VMs | per-principal session cap, global running-VM cap with LRU idle eviction, engine quotas | tested |
 | T26 | Credentials in transit | plain HTTP: bind loopback and put TLS in front; `--allow-public-bind` is explicit | documented |
+| T26a | One principal deletes another's volume (#34) | the API resolves the engine key from (id, principal) after the T22 check, so a foreign session is 404 before any delete; at the engine the key is the capability, as with renew (API keys carry 192 bits) | tested |
+| T26b | Deleting a volume out from under a running VM (#34) | refused with `SESSION_BUSY` (`409`); the lease check and the removal are atomic with respect to new creates, so a racing create either pins the old volume or starts a fresh one | tested |
+| T26c | A stalled SSE consumer stalls the daemon or grows memory (#34) | the client's reader thread never blocks on a stream; a stream 2 MiB behind its consumer dies alone (`TOO_LARGE`), and a dead HTTP connection is dropped while the exec runs out unobserved | tested |
 
 ### 4.3b Assistants → MCP gateway (#28)
 

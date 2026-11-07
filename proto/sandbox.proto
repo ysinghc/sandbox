@@ -19,7 +19,15 @@ message ClientMessage {
     InspectRequest inspect = 5;
     RenewRequest   renew   = 6;
     GuestRequest   guest   = 7;
+    SessionDeleteRequest session_delete = 8;
   }
+}
+
+// #34: delete a session volume by key. Like renew, this is keyed by the session
+// key rather than a sandbox id: the caller that wants the data gone may have
+// nothing running to name. Refused while a sandbox of that session runs.
+message SessionDeleteRequest {
+  string session_key = 1;
 }
 
 // #23/D5: extend a session volume's deadline. Keyed by the session key, not by
@@ -77,7 +85,12 @@ message ServerMessage {
     ResumeResponse  resume  = 6;
     RenewResponse   renew   = 7;
     GuestResponse   guest   = 8;
+    SessionDeleteResponse session_delete = 9;
   }
+}
+
+// #34: the volume is gone. Empty: gone is gone; there is nothing to report.
+message SessionDeleteResponse {
 }
 
 message RenewResponse {
@@ -140,6 +153,11 @@ message GuestRequest {
   bool exclusive = 14;     // write_file: fail if it exists
   bool parents = 15;       // write_file, mkdir
   bool recursive = 16;     // remove
+  // #34: exec only. The daemon answers with one GuestResponse per output
+  // chunk (stream_chunk set) and a final one without it. Ignored for other
+  // ops; ignored by older daemons, which answer with the single terminal
+  // reply as before.
+  bool stream = 17;
 }
 
 message DirEntry {
@@ -165,4 +183,10 @@ message GuestResponse {
   uint32 type = 13;        // stat
   uint32 mode = 14;        // stat
   int64 mtime = 15;        // stat
+  // #34: this frame is one live output chunk of a streaming exec: exactly one
+  // of out/err carries the bytes, and every other field is zero. The terminal
+  // frame has this clear and is shaped exactly like the #24 reply (heads,
+  // totals, exit status), so a client that never asked for chunks sees what
+  // it always saw.
+  bool stream_chunk = 17;
 }

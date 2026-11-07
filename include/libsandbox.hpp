@@ -3,6 +3,7 @@
 #define LIBSANDBOX_HPP
 
 #include "libsandbox.h"
+#include <functional>
 #include <string>
 #include <vector>
 #include <memory>
@@ -122,6 +123,12 @@ public:
     // absolute and under /workspace (see libsandbox.h).
     ExecResult exec(const std::vector<std::string>& argv, const ExecOptions& opt = {});
     ExecResult shell(const std::string& script, ExecOptions opt = {});
+    // #34: like exec(), but `on_chunk(is_stderr, data, n)` runs on the
+    // caller's thread for every output chunk while the command runs. The
+    // returned result is the same terminal ExecResult exec() would return.
+    ExecResult exec_stream(const std::vector<std::string>& argv,
+                           const std::function<void(bool, const char*, size_t)>& on_chunk,
+                           const ExecOptions& opt = {});
     std::string read_file(const std::string& path);
     void write_file(const std::string& path, const std::string& data,
                     uint32_t mode = 0, uint32_t flags = 0);
@@ -152,6 +159,10 @@ private:
 // Returns the resulting deadline in unix seconds; throws SandboxError on refusal
 // (expired, unknown, or already at the platform maximum).
 uint64_t renew_session(const std::string& session_key, uint32_t extra_seconds = 0);
+
+// Delete a session volume by key (#34). Throws SESSION_UNKNOWN when the key
+// has no volume, SESSION_BUSY while one of its sandboxes runs.
+void delete_session(const std::string& session_key);
 
 } // namespace sandbox
 

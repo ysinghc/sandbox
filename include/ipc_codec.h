@@ -24,6 +24,7 @@ typedef enum {
     IPC_REQ_INSPECT = 5,
     IPC_REQ_RENEW = 6,
     IPC_REQ_GUEST = 7,  // #24: exec / file ops; the op is in `guest_op`
+    IPC_REQ_SESSION_DELETE = 8,  // #34: delete a session volume by key
 } ipc_req_kind_t;
 
 #define IPC_MAX_ENV 64
@@ -47,6 +48,7 @@ enum {  // flag bits in ipc_request_t.guest_flags (mirror proto GuestRequest boo
     IPC_GF_EXCL = 4,
     IPC_GF_PARENTS = 8,
     IPC_GF_RECURSIVE = 16,
+    IPC_GF_STREAM = 32,  // #34: exec answers with chunk frames + a terminal frame
 };
 
 typedef struct {
@@ -128,6 +130,9 @@ typedef struct {
     int32_t term_signal;
     bool timed_out;
     bool output_truncated;
+    // #34: this reply is one live chunk of a streaming exec (exactly one of
+    // `out`/`err` carries bytes; the rest is zero), not the terminal result.
+    bool is_chunk;
     uint8_t* out;           // exec stdout head, or read_file data
     size_t out_len;
     uint8_t* err;           // exec stderr head

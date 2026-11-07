@@ -7,6 +7,24 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## [Unreleased]
 
+### Live exec streaming + volume delete (#34)
+
+- **Streaming exec.** `GuestRequest.stream` asks the daemon for one
+  `GuestResponse` chunk frame per output chunk plus the usual terminal reply;
+  `sandbox_exec_stream()` delivers chunks on the caller's thread (bounded 2
+  MiB queue; a slow consumer fails its own stream, never the shared
+  connection), and `sandbox-api` forwards them as live SSE `stdout`/`stderr`
+  events with the same `started`/`exit`/`error` shape. C++ wrapper gains
+  `exec_stream`; against an older engine the API falls back to at-completion
+  output.
+- **Volume delete.** New `SessionDelete` IPC op + `sandbox_session_delete()`,
+  refused with `SESSION_BUSY` while a sandbox of the session runs (atomic
+  with new creates). `DELETE /v1/sessions/{id}` now reclaims the VM, deletes
+  the volume, and only then forgets the record; re-creating the key starts
+  empty. The TTL reaper is unchanged for abandoned sessions.
+- Also fixed: `sandbox_session_renew()` refuses an over-long key instead of
+  silently truncating it onto a different volume.
+
 ### Hierarchical configuration (#4)
 
 - **Drop-in directory.** `sandboxd` reads `<config>.d/*.conf` after the base

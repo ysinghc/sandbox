@@ -72,6 +72,24 @@ Restore readiness is detected from the guest agent's post-restore markers
 (`SANDBOX-TICK` / `SANDBOX-VSOCK-`), with a tunable fallback settle
 (`vsock_settle_ms`); env delivery is confirmed by `SANDBOX-ENV-END` (§15).
 
+## Live exec streaming and volume delete (#34)
+
+A streaming exec (`GuestRequest.stream`) answers with one `GuestResponse` chunk
+frame per output chunk plus the usual terminal reply. The guest worker posts
+chunks through the existing result queue, so the IPC loop thread still owns
+every send and the per-session slot frees only on the terminal frame.
+libsandbox delivers chunks on the caller's thread with a bounded (2 MiB)
+queue: a slow consumer kills its own stream instead of stalling the shared
+connection. `sandbox-api` forwards chunks as SSE `stdout`/`stderr` events
+(UTF-8 sequences split across chunks are held back and emitted whole).
+
+Session volumes are deleted by key (`SessionDelete`), refused with
+`SESSION_BUSY` while a sandbox of the session runs. The lease check and the
+removal are atomic with respect to new creates (creates lease before touching
+the image), so a racing create either pins the old volume or starts a fresh
+one. `DELETE /v1/sessions/{id}` reclaims the VM, deletes the volume, and only
+then forgets the record, so a failed delete leaves the session usable.
+
 ## Snapshot integrity (§10.10)
 
 Each template directory holds the memory snapshot, rootfs, and a manifest built

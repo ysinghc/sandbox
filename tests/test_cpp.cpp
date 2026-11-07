@@ -24,6 +24,13 @@ int main() {
         }
     }
 
+    // #34: pin the new wrappers' linkage (address-taken, never called: there
+    // is no daemon here).
+    auto stream = &sandbox::Sandbox::exec_stream;
+    auto del = &sandbox::delete_session;
+    (void)stream;
+    (void)del;
+
     std::printf("cpp_wrap: PASS\n");
     return 0;
 }

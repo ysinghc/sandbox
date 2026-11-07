@@ -295,7 +295,7 @@ All bodies are JSON unless stated. Unknown request fields are rejected (400).
 | `POST /v1/sessions` | create or attach. Fields: `key`, `template`, `memory_mib`, `vcpus`, `ttl_seconds`, `env`, `egress_allow` (≤16 hosts), `egress_deny_all`. `201` new, `200` attached, `409` if an existing session has different resources |
 | `GET /v1/sessions` | the caller's sessions |
 | `GET /v1/sessions/{id}` | one session |
-| `DELETE /v1/sessions/{id}` | release the VM and forget the session (`204`). The workspace remains until its TTL: the engine has no volume delete |
+| `DELETE /v1/sessions/{id}` | reclaim the VM, delete the workspace volume, forget the session (`204`). Re-creating the key starts empty; a volume the reaper already took is still `204`; `409 session_busy` while a VM of the session runs elsewhere |
 | `POST /v1/sessions/{id}/renew` | `{"ttl_seconds": N}`; returns the new `expires_at` |
 | `POST /v1/sessions/{id}/exec` | `command` (shell) **or** `argv`; `cwd`, `env`, `timeout_ms`, `max_output`, `stdin` / `stdin_base64`, `output_encoding`, `stream` |
 | `PUT/GET/DELETE /v1/sessions/{id}/files?path=` | raw bytes in and out; `PUT` takes `append=1` / `exclusive=1`; limit `SANDBOX_MAX_FILE` (4 MiB) → `413` |
@@ -309,10 +309,12 @@ All bodies are JSON unless stated. Unknown request fields are rejected (400).
 ### Streaming
 
 `"stream": true` answers `text/event-stream` with `started`, `stdout`, `stderr`,
-`exit` (and `error`) events plus `: keepalive` comments. **Output is delivered when
-the command finishes**: the engine returns a command's output at completion, so this
-is a transport for long commands (the connection stays alive), not live tailing. Live
-streaming needs a streaming operation in the guest RPC and is not done.
+`exit` (and `error`) events plus `: keepalive` comments. **Output is live** (#34):
+each `stdout`/`stderr` event carries one chunk as the command writes it, and the
+`exit` event carries the totals without re-sending the output. A client that
+stops reading does not stall the server: its stream is dropped once 2 MiB of
+output goes unconsumed. (Against an engine that predates streaming, the same
+shape is emitted at completion.)
 
 ### Authentication and isolation
 

@@ -70,10 +70,15 @@ typedef struct {
     uint8_t *out, *err;
     size_t out_len, err_len;
     uint64_t out_total, err_total;
+    ipc_guest_chunk_cb sink;  // #34: NULL collects heads only
+    void* sink_ud;
 } collect_t;
 
 static void on_chunk(int is_err, const uint8_t* d, size_t n, void* ud) {
     collect_t* c = ud;
+    // The sink sees every byte whole; the heads below are only for the
+    // terminal reply, which keeps its #24 shape whether streaming or not.
+    if (c->sink) c->sink(is_err, d, n, c->sink_ud);
     uint8_t** buf = is_err ? &c->err : &c->out;
     size_t* len = is_err ? &c->err_len : &c->out_len;
     uint64_t* total = is_err ? &c->err_total : &c->out_total;
@@ -86,7 +91,8 @@ static void on_chunk(int is_err, const uint8_t* d, size_t n, void* ud) {
     *len += take;
 }
 
-static void do_exec(const char* uds, const ipc_request_t* q, ipc_response_t* r) {
+static void do_exec(const char* uds, const ipc_request_t* q, ipc_response_t* r,
+                    ipc_guest_chunk_cb sink, void* sink_ud) {
     if (q->n_argv < 1 || ((q->guest_flags & IPC_GF_SHELL) && q->n_argv != 1)) {
         return fail(r, q, SANDBOX_ERR_INVALID_SPEC, "exec needs argv (one script with shell)");
     }
@@ -116,6 +122,8 @@ static void do_exec(const char* uds, const ipc_request_t* q, ipc_response_t* r) 
     if (own > GRPC_MAX_TIMEOUT_MS) own = GRPC_MAX_TIMEOUT_MS;
     collect_t c;
     memset(&c, 0, sizeof(c));
+    c.sink = sink;
+    c.sink_ud = sink_ud;
     grpc_exec_res_t res;
     char msg[IPC_MAX_ERRMSG] = "";
     int rc = grpc_exec(fd, &g, on_chunk, &c, (int)(own + EXEC_MARGIN_MS), &res, msg, sizeof(msg));
@@ -220,7 +228,8 @@ static void do_simple(const char* uds, const ipc_request_t* q, ipc_response_t* r
     settle(rc, e, msg, r, q);
 }
 
-void ipc_guest_execute(const char* uds_path, const ipc_request_t* q, ipc_response_t* r) {
+static void execute_inner(const char* uds_path, const ipc_request_t* q,
+                          ipc_response_t* r, ipc_guest_chunk_cb sink, void* sink_ud) {
     memset(r, 0, sizeof(*r));
     r->request_id = q->request_id;
     r->kind = IPC_REQ_GUEST;
@@ -232,8 +241,12 @@ void ipc_guest_execute(const char* uds_path, const ipc_request_t* q, ipc_respons
     if (op != GRPC_OP_EXEC && !q->path[0]) {
         return fail(r, q, SANDBOX_ERR_INVALID_SPEC, "a path is required");
     }
+    // Streaming is an exec affair; any other op runs to its single reply and
+    // the sink never fires, even if the caller passed one.
+    if (op != GRPC_OP_EXEC) sink = NULL;
+    else if (!(q->guest_flags & IPC_GF_STREAM)) sink = NULL;
     switch (op) {
-    case GRPC_OP_EXEC: do_exec(uds_path, q, r); break;
+    case GRPC_OP_EXEC: do_exec(uds_path, q, r, sink, sink_ud); break;
     case GRPC_OP_READ_FILE: do_read(uds_path, q, r); break;
     case GRPC_OP_WRITE_FILE: do_write(uds_path, q, r); break;
     case GRPC_OP_LIST_DIR: do_list(uds_path, q, r); break;
@@ -242,4 +255,14 @@ void ipc_guest_execute(const char* uds_path, const ipc_request_t* q, ipc_respons
     case GRPC_OP_REMOVE: do_simple(uds_path, q, r, op); break;
     default: fail(r, q, SANDBOX_ERR_INVALID_SPEC, "unknown guest operation");
     }
+}
+
+void ipc_guest_execute(const char* uds_path, const ipc_request_t* q, ipc_response_t* r) {
+    execute_inner(uds_path, q, r, NULL, NULL);
+}
+
+void ipc_guest_execute_stream(const char* uds_path, const ipc_request_t* q,
+                              ipc_guest_chunk_cb on_chunk, void* ud,
+                              ipc_response_t* resp) {
+    execute_inner(uds_path, q, resp, on_chunk, ud);
 }

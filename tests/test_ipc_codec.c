@@ -320,6 +320,82 @@ int main(void) {
         ipc_response_clear(&ch);
     }
 
+    // --- #34 live exec streaming + volume delete -------------------------------
+    {
+        // The stream ask survives; without it the bytes are what #24 wrote --
+        // the field costs exactly its tag when set and nothing when clear.
+        ipc_request_t sq;
+        ipc_request_init(&sq);
+        sq.kind = IPC_REQ_GUEST;
+        sq.request_id = 78;
+        sq.sandbox_id = 12;
+        sq.guest_op = 1;
+        sq.guest_flags = IPC_GF_SHELL | IPC_GF_STREAM;
+        uint8_t sb[IPC_FRAME_MAX];
+        size_t sn = 0;
+        CHECK(ipc_encode_request(&sq, sb, sizeof(sb), &sn) == 0, "stream: encode request");
+        ipc_request_t sr;
+        CHECK(ipc_decode_request(sb, sn, &sr) == 0 &&
+                  sr.guest_flags == (IPC_GF_SHELL | IPC_GF_STREAM),
+              "stream: the stream bit survives the round trip");
+        ipc_request_clear(&sr);
+        size_t sn_stream = sn;
+        sq.guest_flags = IPC_GF_SHELL;
+        CHECK(ipc_encode_request(&sq, sb, sizeof(sb), &sn) == 0, "stream: encode plain request");
+        CHECK(sn + 3 == sn_stream, "stream: an unset bit adds no bytes");
+        ipc_request_clear(&sq);
+
+        // A chunk frame: the flag plus exactly one stream's bytes.
+        ipc_response_t ck;
+        memset(&ck, 0, sizeof(ck));
+        ck.kind = IPC_REQ_GUEST; ck.request_id = 78; ck.sandbox_id = 12;
+        ck.is_chunk = true;
+        ck.err = malloc(3); memcpy(ck.err, "e\n\0", 3); ck.err_len = 3;
+        CHECK(ipc_encode_response(&ck, sb, sizeof(sb), &sn) == 0, "stream: encode chunk");
+        ipc_response_t kr;
+        CHECK(ipc_decode_response(sb, sn, &kr) == 0 && kr.is_chunk && kr.out == NULL &&
+                  kr.err_len == 3 && !memcmp(kr.err, "e\n\0", 3) &&
+                  kr.exit_code == 0 && !kr.timed_out,
+              "stream: chunk flag, bytes and zeroed result fields survive");
+        ipc_response_clear(&kr);
+        ipc_response_clear(&ck);
+
+        // A terminal frame decodes with the flag clear: what #24 clients saw.
+        ipc_response_t tm;
+        memset(&tm, 0, sizeof(tm));
+        tm.kind = IPC_REQ_GUEST; tm.request_id = 78; tm.exit_code = 3;
+        CHECK(ipc_encode_response(&tm, sb, sizeof(sb), &sn) == 0, "stream: encode terminal");
+        ipc_response_t tr;
+        CHECK(ipc_decode_response(sb, sn, &tr) == 0 && !tr.is_chunk && tr.exit_code == 3,
+              "stream: a terminal reply is not a chunk");
+        ipc_response_clear(&tr);
+        ipc_response_clear(&tm);
+
+        // Volume delete, both directions.
+        ipc_request_t dq;
+        ipc_request_init(&dq);
+        dq.kind = IPC_REQ_SESSION_DELETE;
+        dq.request_id = 79;
+        snprintf(dq.session_key, sizeof(dq.session_key), "api-deadbeef");
+        CHECK(ipc_encode_request(&dq, sb, sizeof(sb), &sn) == 0, "delete: encode request");
+        ipc_request_t dr;
+        CHECK(ipc_decode_request(sb, sn, &dr) == 0 && dr.kind == IPC_REQ_SESSION_DELETE &&
+                  dr.request_id == 79 && !strcmp(dr.session_key, "api-deadbeef"),
+              "delete: kind, id and key survive");
+        ipc_request_clear(&dr);
+        ipc_request_clear(&dq);
+        ipc_response_t dp;
+        memset(&dp, 0, sizeof(dp));
+        dp.kind = IPC_REQ_SESSION_DELETE; dp.request_id = 79;
+        CHECK(ipc_encode_response(&dp, sb, sizeof(sb), &sn) == 0, "delete: encode response");
+        ipc_response_t dpr;
+        CHECK(ipc_decode_response(sb, sn, &dpr) == 0 && dpr.kind == IPC_REQ_SESSION_DELETE &&
+                  dpr.request_id == 79 && !dpr.is_error,
+              "delete: empty success reply survives");
+        ipc_response_clear(&dpr);
+        ipc_response_clear(&dp);
+    }
+
     ipc_request_clear(&req);
     ipc_request_clear(&back);
     ipc_request_clear(&legacy_back);

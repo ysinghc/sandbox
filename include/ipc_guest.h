@@ -22,6 +22,19 @@ extern "C" {
 void ipc_guest_execute(const char* uds_path, const ipc_request_t* req,
                        ipc_response_t* resp);
 
+// Streaming exec (#34). Behaves like ipc_guest_execute, except a request with
+// IPC_GF_STREAM (exec only; other ops ignore the sink) also invokes
+// `on_chunk(is_stderr, data, n, ud)` for every output chunk while the command
+// runs, and `resp` receives the terminal reply. Chunks are whole guest frames
+// (at most GRPC_CHUNK bytes each); the terminal keeps the #24 shape (heads,
+// totals, exit status). The sink runs on the caller's thread and must not
+// block for long: while it runs, the guest's output waits.
+typedef void (*ipc_guest_chunk_cb)(int is_stderr, const uint8_t* data,
+                                  size_t n, void* ud);
+void ipc_guest_execute_stream(const char* uds_path, const ipc_request_t* req,
+                              ipc_guest_chunk_cb on_chunk, void* ud,
+                              ipc_response_t* resp);
+
 #ifdef __cplusplus
 }
 #endif

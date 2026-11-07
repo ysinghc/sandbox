@@ -91,6 +91,14 @@ int workspace_renew(const char* session_key, uint32_t extra_seconds, int64_t now
 // Delete the image and its registry row (idempotent).
 int workspace_destroy(const char* session_key);
 
+// Delete a live session's volume (#34): -1/EINVAL for a bad key, -1/ENOENT
+// when the key has no volume, -1/EBUSY while a sandbox of that session runs.
+// The lease check and the removal are atomic with respect to lease acquisition,
+// so a create racing the delete either binds the old volume first (and the
+// delete is refused) or fails its lease while the removal runs (and retries
+// onto a fresh volume) -- a new sandbox can never wake on a deleted image.
+int workspace_delete(const char* session_key);
+
 // Reap every session whose expiry is <= `now`, plus abandoned staging dirs.
 // Idempotent and crash-safe: a partial create lives in a staging directory and
 // is never visible as a session. Returns the number reaped in *expired_out.

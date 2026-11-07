@@ -37,6 +37,7 @@
 #include "ipc_server.h"
 #include "libsandbox.h"
 #include "lifecycle.h"
+#include "workspace.h"
 
 static int g_fail, g_total;
 
@@ -333,6 +334,171 @@ static void test_concurrency_and_limits(void) {
     check(served + refused == 20 && refused >= 1 && served >= 8, "limits: ops beyond the per-session cap get a retryable refusal");
 }
 
+// ── #34 live exec streaming + volume delete ─────────────────────────────────
+
+typedef struct {
+    uint8_t* out;
+    uint8_t* err;
+    size_t out_len, err_len;
+    int chunks;
+    int64_t first_ms;
+} stream_cap_t;
+
+static void stream_cb(int is_err, const uint8_t* d, size_t n, void* ud) {
+    stream_cap_t* c = ud;
+    if (!c->chunks) c->first_ms = now_ms();
+    c->chunks++;
+    uint8_t** buf = is_err ? &c->err : &c->out;
+    size_t* len = is_err ? &c->err_len : &c->out_len;
+    uint8_t* nb = realloc(*buf, *len + n + 1);
+    if (!nb) return;  // the byte counts below catch the loss
+    memcpy(nb + *len, d, n);
+    *buf = nb;
+    *len += n;
+}
+
+static int sh_stream(const char* script, uint32_t timeout_ms, stream_cap_t* c,
+                     sandbox_exec_result_t* r) {
+    const char* av[2] = { script, NULL };
+    sandbox_exec_spec_t sp = { .argv = av, .shell = true, .timeout_ms = timeout_ms };
+    return sandbox_exec_stream(g_h, &sp, stream_cb, c, r);
+}
+
+static void test_stream(void) {
+    // Print, sleep, print: the first chunk must arrive while the command
+    // still sleeps, a full second before the exit -- timing, not just order.
+    stream_cap_t c;
+    memset(&c, 0, sizeof(c));
+    sandbox_exec_result_t r;
+    int64_t t0 = now_ms();
+    int rc = sh_stream("echo first; sleep 2; echo second", 15000, &c, &r);
+    int64_t took = now_ms() - t0;
+    check(rc == SANDBOX_OK, "stream: a print/sleep/print command runs");
+    check(c.chunks >= 2, "stream: output arrives as chunks, not one blob");
+    check(c.chunks >= 2 && c.first_ms - t0 < took - 1000,
+          "stream: the first chunk arrives before the command exits");
+    check(c.out_len == 13 && !memcmp(c.out, "first\nsecond\n", 13),
+          "stream: chunk bytes reassemble to the full stdout");
+    check(rc == SANDBOX_OK && r.exit_code == 0 && r.out_total == 13,
+          "stream: the terminal result still carries exit code and totals");
+    sandbox_exec_result_free(&r);
+    free(c.out);
+    free(c.err);
+
+    // Both pipes, flagged.
+    memset(&c, 0, sizeof(c));
+    rc = sh_stream("echo out; echo err >&2", 5000, &c, &r);
+    check(rc == SANDBOX_OK && c.out_len == 4 && !memcmp(c.out, "out\n", 4) &&
+              c.err_len == 4 && !memcmp(c.err, "err\n", 4),
+          "stream: stdout and stderr chunks arrive on their own pipe");
+    sandbox_exec_result_free(&r);
+    free(c.out);
+    free(c.err);
+
+    // Chunks are not head-capped (220 KiB arrives whole); the terminal keeps
+    // the #24 heads so an at-completion fallback still has something to show.
+    memset(&c, 0, sizeof(c));
+    rc = sh_stream("awk 'BEGIN{for(i=0;i<20000;i++) printf \"line-%05d\\n\", i}'", 20000, &c, &r);
+    check(rc == SANDBOX_OK && c.out_len == 20000u * 11,
+          "stream: every byte crosses in chunks, nothing head-capped");
+    check(rc == SANDBOX_OK && r.out_len == IPC_EXEC_OUT_KEEP && r.out_total == 20000u * 11,
+          "stream: the terminal still carries the 32 KiB head and the total");
+    sandbox_exec_result_free(&r);
+    free(c.out);
+    free(c.err);
+
+    // No result wanted: NULL is fine, the chunks still arrive.
+    memset(&c, 0, sizeof(c));
+    const char* av[2] = { "echo noroot", NULL };
+    sandbox_exec_spec_t sp = { .argv = av, .shell = true, .timeout_ms = 5000 };
+    check(sandbox_exec_stream(g_h, &sp, stream_cb, &c, NULL) == SANDBOX_OK &&
+              c.out_len == 7,
+          "stream: a NULL result still streams");
+    free(c.out);
+    free(c.err);
+
+    // A refusal before the run ends the stream with no callbacks.
+    memset(&c, 0, sizeof(c));
+    uint8_t big_in[GRPC_MAX_STDIN + 1];
+    memset(big_in, 'x', sizeof(big_in));
+    const char* cav[2] = { "cat", NULL };
+    sandbox_exec_spec_t over = { .argv = cav, .shell = true, .timeout_ms = 5000,
+                                 .stdin_data = big_in, .stdin_len = sizeof(big_in) };
+    check(sandbox_exec_stream(g_h, &over, stream_cb, &c, &r) == SANDBOX_ERR_INVALID_SPEC &&
+              c.chunks == 0,
+          "stream: stdin that cannot fit one frame is refused, never sent");
+    const char* none[] = { NULL };
+    sandbox_exec_spec_t bad = { .argv = none };
+    check(sandbox_exec_stream(g_h, &bad, stream_cb, &c, &r) == SANDBOX_ERR_INVALID_SPEC,
+          "stream: empty argv refused client-side");
+    check(sandbox_exec_stream(NULL, &bad, stream_cb, &c, &r) == SANDBOX_ERR_INVALID_SPEC &&
+              sandbox_exec_stream(g_h, &bad, NULL, &c, &r) == SANDBOX_ERR_INVALID_SPEC,
+          "stream: NULL handle and NULL callback refused");
+
+    // A silent command: no chunks, just the terminal. This is also the shape
+    // an older daemon answers with (it ignores the stream bit), so it pins
+    // the graceful fallback: no callbacks, still a result.
+    memset(&c, 0, sizeof(c));
+    rc = sh_stream("true", 5000, &c, &r);
+    check(rc == SANDBOX_OK && c.chunks == 0 && r.exit_code == 0 && r.out_total == 0,
+          "stream: a silent command ends with no callbacks and a terminal");
+    sandbox_exec_result_free(&r);
+
+    // The one-shot call is untouched by the streaming waiter next door.
+    rc = sh("echo still-oneshot", 5000, 0, NULL, &r);
+    check(rc == SANDBOX_OK && r.out_len == 14 && !memcmp(r.out, "still-oneshot\n", 14),
+          "stream: plain sandbox_exec still answers in one reply");
+    sandbox_exec_result_free(&r);
+}
+
+static void test_session_delete(void) {
+    char root[PATH_MAX];
+    snprintf(root, sizeof(root), "%s/wsroot", g_dir);
+    setenv("SANDBOX_WORKSPACE_ROOT", root, 1);
+
+    // Unknown and invalid keys, through the daemon.
+    check(sandbox_session_delete("no-such-session") == SANDBOX_ERR_SESSION_UNKNOWN,
+          "delete: an unknown key -> SESSION_UNKNOWN");
+    check(sandbox_session_delete("has \" quote") == SANDBOX_ERR_INVALID_SPEC,
+          "delete: an invalid key -> INVALID_SPEC");
+    char long_key[IPC_MAX_SESSION_KEY + 8];
+    memset(long_key, 'k', sizeof(long_key) - 1);
+    long_key[sizeof(long_key) - 1] = 0;
+    check(sandbox_session_delete(long_key) == SANDBOX_ERR_INVALID_SPEC,
+          "delete: an over-long key is refused, never truncated");
+    uint64_t exp = 0;
+    check(sandbox_session_renew(long_key, 0, &exp) == SANDBOX_ERR_INVALID_SPEC,
+          "renew: an over-long key is refused, never truncated");
+
+    // A live volume: refused while leased, gone once freed.
+    char base[PATH_MAX];
+    snprintf(base, sizeof(base), "%s/fakebase.img", g_dir);
+    int fd = open(base, O_WRONLY | O_CREAT, 0600);
+    if (fd >= 0) {
+        ssize_t nw = write(fd, "base", 4);
+        close(fd);
+        if (nw != 4) { check(0, "delete: test base image written"); return; }
+    }
+    workspace_meta_t meta;
+    check(workspace_ensure("del-me", (uid_t)getuid(), 0, 3600, base, &meta) == 0,
+          "delete: test volume created");
+    check(workspace_lease("del-me") == 0, "delete: test volume leased");
+    check(sandbox_session_delete("del-me") == SANDBOX_ERR_SESSION_BUSY,
+          "delete: refused while a sandbox of the session runs");
+    workspace_release("del-me");
+    check(sandbox_session_delete("del-me") == SANDBOX_OK,
+          "delete: removes the volume once nothing runs");
+    char dir[PATH_MAX];
+    workspace_paths("del-me", dir, sizeof(dir), NULL, 0);
+    struct stat st;
+    check(stat(dir, &st) != 0, "delete: the volume directory is gone");
+    check(sandbox_session_delete("del-me") == SANDBOX_ERR_SESSION_UNKNOWN,
+          "delete: deleting twice -> SESSION_UNKNOWN the second time");
+    check(workspace_ensure("del-me", (uid_t)getuid(), 0, 3600, base, &meta) == 0,
+          "delete: re-creating the key starts a fresh volume");
+    check(workspace_destroy("del-me") == 0, "delete: test volume cleaned up");
+}
+
 static void test_ownership_and_protocol(void) {
     int fd = raw_connect();
     check(fd >= 0 && raw_guest(fd, 5, 7, GRPC_OP_STAT, g_ws) == SANDBOX_ERR_PERMISSION_DENIED,
@@ -482,6 +648,7 @@ int main(void) {
     for (int i = 0; i < 100 && sandbox_stat(g_h, g_ws, &probe) != SANDBOX_OK; i++) usleep(20000);
 
     test_exec();
+    test_stream();
     test_files();
     test_paths_denied();
     test_list();
@@ -489,6 +656,7 @@ int main(void) {
     test_ownership_and_protocol();
     test_egress_policy();
     test_broker_control();
+    test_session_delete();
 
     // Take the fake VM out of the registry *before* the session drops: the server
     // tears a dropped session's VMs down with the real vmm_destroy(), which must

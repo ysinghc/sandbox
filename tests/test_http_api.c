@@ -36,6 +36,7 @@ struct sandbox_handle_t { vol_t* vol; };
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static vol_t* g_vols;
 static int g_creates, g_destroys, g_live, g_execs;
+static sandbox_error_t g_fail_delete_with = SANDBOX_OK;  // injector for DELETE error paths
 static char g_last_template[64], g_last_env0[96], g_last_egress0[96];
 static uint64_t g_last_mem;
 static int g_last_deny;
@@ -108,11 +109,7 @@ static void put_out(sandbox_exec_result_t* r, const void* d, size_t n) {
     r->out_total = n;
 }
 
-static sandbox_error_t f_exec(sandbox_handle_t* h, const sandbox_exec_spec_t* sp, sandbox_exec_result_t* r) {
-    (void)h;
-    pthread_mutex_lock(&g_mu);
-    g_execs++;
-    pthread_mutex_unlock(&g_mu);
+static sandbox_error_t fake_run(const sandbox_exec_spec_t* sp, sandbox_exec_result_t* r) {
     memset(r, 0, sizeof(*r));
     char cmd[512] = "";
     for (const char* const* a = sp->argv; *a; a++) { if (*cmd) strcat(cmd, " "); strncat(cmd, *a, sizeof(cmd) - strlen(cmd) - 1); }
@@ -133,7 +130,56 @@ static sandbox_error_t f_exec(sandbox_handle_t* h, const sandbox_exec_spec_t* sp
     else if (!strcmp(cmd, "timeout")) { r->timed_out = true; r->exit_code = -1; }
     else if (!strncmp(cmd, "fail ", 5)) return (sandbox_error_t)(-atoi(cmd + 5));
     else if (!strcmp(cmd, "multi")) { put_out(r, "line1\nline2\n", 12); r->err = malloc(5); memcpy(r->err, "oops\n", 5); r->err_len = r->err_total = 5; }
+    else if (!strcmp(cmd, "utf8")) put_out(r, "a\xc3\xa9" "b\n", 5);  // streamed as "a\xc3" | "\xa9b\n"
     usleep(1000);
+    return SANDBOX_OK;
+}
+
+static sandbox_error_t f_exec(sandbox_handle_t* h, const sandbox_exec_spec_t* sp, sandbox_exec_result_t* r) {
+    (void)h;
+    pthread_mutex_lock(&g_mu);
+    g_execs++;
+    pthread_mutex_unlock(&g_mu);
+    return fake_run(sp, r);
+}
+
+// #34: the same answers as f_exec, but stdout arrives as two live chunks and
+// stderr as one; a refusal streams nothing, like the engine.
+static sandbox_error_t f_exec_stream(sandbox_handle_t* h, const sandbox_exec_spec_t* sp,
+                                     sandbox_exec_chunk_cb cb, void* ud,
+                                     sandbox_exec_result_t* r) {
+    (void)h;
+    pthread_mutex_lock(&g_mu);
+    g_execs++;
+    pthread_mutex_unlock(&g_mu);
+    sandbox_error_t rc = fake_run(sp, r);
+    if (rc != SANDBOX_OK) return rc;
+    if (r->out_len) {
+        size_t half = r->out_len / 2;
+        usleep(1000);
+        cb(0, r->out, half, ud);
+        usleep(1000);
+        cb(0, r->out + half, r->out_len - half, ud);
+    }
+    if (r->err_len) {
+        usleep(1000);
+        cb(1, r->err, r->err_len, ud);
+    }
+    return SANDBOX_OK;
+}
+
+static sandbox_error_t f_session_delete(const char* key) {
+    if (g_fail_delete_with != SANDBOX_OK) return g_fail_delete_with;
+    pthread_mutex_lock(&g_mu);
+    vol_t** pp = &g_vols;
+    while (*pp && strcmp((*pp)->key, key)) pp = &(*pp)->next;
+    if (!*pp) { pthread_mutex_unlock(&g_mu); return SANDBOX_ERR_SESSION_UNKNOWN; }
+    vol_t* dead = *pp;
+    *pp = dead->next;
+    file_t* f = dead->files;
+    while (f) { file_t* nx = f->next; free(f->d); free(f); f = nx; }
+    free(dead);
+    pthread_mutex_unlock(&g_mu);
     return SANDBOX_OK;
 }
 
@@ -250,6 +296,7 @@ static sandbox_error_t f_remove(sandbox_handle_t* h, const char* p, bool rec) {
 
 static const api_engine_ops_t FAKE = {
     .create = f_create, .destroy = f_destroy, .renew = f_renew, .exec = f_exec, .exec_free = f_exec_free,
+    .exec_stream = f_exec_stream, .session_delete = f_session_delete,
     .read_file = f_read, .write_file = f_write, .list_dir = f_list, .stat = f_stat, .mkdir = f_mkdir, .remove = f_remove,
 };
 
@@ -639,7 +686,14 @@ int main(void) {
                    *c = strstr(s.body, "event: stderr"), *d = strstr(s.body, "event: exit");
         CHECK(s.status == 200 && hdr(&s, "Content-Type") && strstr(hdr(&s, "Content-Type"), "text/event-stream"), "stream: 200 text/event-stream");
         CHECK(a && b && c && d && a < b && b < c && c < d, "stream: started, stdout, stderr, exit, in that order");
-        CHECK(b && strstr(b, "line1\\nline2\\n") && strstr(s.body, "\"exit_code\":0"), "stream: the output and the exit code arrive");
+        // #34: the fake emits stdout as two live chunks and stderr as one --
+        // the bytes arrive as chunk events, in order, and reassemble.
+        const char* b2 = b ? strstr(b + 1, "event: stdout") : NULL;
+        const char *l1 = strstr(s.body, "line1\\n"), *l2 = strstr(s.body, "line2\\n");
+        CHECK(b && b2 && b2 < c, "stream: stdout arrives as live chunk events, before stderr");
+        CHECK(l1 && l2 && l1 < l2 && l1 > b && l2 < c, "stream: the chunk bytes reassemble to the full output");
+        CHECK(strstr(s.body, "\"exit_code\":0") && strstr(s.body, "\"stdout_bytes\":12"), "stream: the exit event still carries code and totals");
+        CHECK(strstr(s.body, "oops\\n") != NULL, "stream: the stderr chunk arrives");
         rfree(&s);
         fd = tcp_connect(g_port);
         body = "{\"command\":\"sleep 2500\"}";
@@ -647,6 +701,20 @@ int main(void) {
         read_resp(fd, &s);
         close(fd);
         CHECK(strstr(s.body, ": keepalive") != NULL && strstr(s.body, "event: exit") != NULL, "stream: keepalives while a command runs (Accept header selects SSE)");
+        rfree(&s);
+        fd = tcp_connect(g_port);
+        body = "{\"command\":\"fail 9\",\"stream\":true}";
+        send_req(fd, "POST", sp(id1, "/exec"), TA, "Content-Type: application/json\r\n", body, strlen(body), 1);
+        read_resp(fd, &s);
+        close(fd);
+        CHECK(strstr(s.body, "event: error") != NULL && strstr(s.body, "guest_unavailable") != NULL, "stream: an engine failure is an error event, not a hang");
+        rfree(&s);
+        fd = tcp_connect(g_port);
+        body = "{\"command\":\"utf8\",\"stream\":true}";
+        send_req(fd, "POST", sp(id1, "/exec"), TA, "Content-Type: application/json\r\n", body, strlen(body), 1);
+        read_resp(fd, &s);
+        close(fd);
+        CHECK(strstr(s.body, "\xc3\xa9") != NULL, "stream: a multi-byte sequence split across chunks is emitted whole");
         rfree(&s);
     }
 
@@ -830,7 +898,7 @@ int main(void) {
         free(uid_sess);
     }
 
-    // ---- delete, and the workspace outliving the session ----
+    // ---- delete purges the volume (#34) ----
     int d0 = g_destroys;
     r = R("DELETE", sp(id1, ""), TA, NULL, NULL);
     CHECK(r.status == 204 && g_destroys == d0 + 1, "delete: 204, and the VM is destroyed");
@@ -847,9 +915,23 @@ int main(void) {
         send_req(fd, "GET", sp(id1b, "/files?path=/workspace/data.bin"), TA, NULL, NULL, 0, 1);
         read_resp(fd, &r);
         close(fd);
-        CHECK(r.status == 200 && r.len == 7, "...and the files the first incarnation wrote are still there");
+        CHECK(r.status == 404, "...but the workspace is empty: DELETE purged the volume");
         rfree(&r);
     }
+    // A volume that refuses to go: 409, and the failed DELETE changes nothing.
+    g_fail_delete_with = SANDBOX_ERR_SESSION_BUSY;
+    r = R("DELETE", sp(id1b, ""), TA, NULL, NULL);
+    CHECK(r.status == 409 && jeq(&r, "error.code", "session_busy"), "a busy volume -> 409 session_busy");
+    rfree(&r);
+    g_fail_delete_with = SANDBOX_OK;
+    r = R("GET", sp(id1b, ""), TA, NULL, NULL);
+    CHECK(r.status == 200, "...and the session is still there, usable, afterwards");
+    rfree(&r);
+    g_fail_delete_with = SANDBOX_ERR_SESSION_UNKNOWN;
+    r = R("DELETE", sp(id1b, ""), TA, NULL, NULL);
+    CHECK(r.status == 204, "a volume the reaper already took still deletes 204");
+    rfree(&r);
+    g_fail_delete_with = SANDBOX_OK;
 
     // ---- shutdown reclaims everything ----
     api_server_stop(srv);

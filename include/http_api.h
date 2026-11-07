@@ -23,6 +23,13 @@ typedef struct {
     sandbox_error_t (*renew)(const char* session_key, uint32_t extra, uint64_t* expires_at);
     sandbox_error_t (*exec)(sandbox_handle_t*, const sandbox_exec_spec_t*, sandbox_exec_result_t*);
     void (*exec_free)(sandbox_exec_result_t*);
+    // #34: live exec for the SSE path; NULL means the engine predates
+    // streaming and the API falls back to at-completion output.
+    sandbox_error_t (*exec_stream)(sandbox_handle_t*, const sandbox_exec_spec_t*,
+                                   sandbox_exec_chunk_cb, void*, sandbox_exec_result_t*);
+    // #34: delete a session volume by key; NULL means the engine predates it
+    // and DELETE keeps its old TTL-linger behaviour.
+    sandbox_error_t (*session_delete)(const char* session_key);
     sandbox_error_t (*read_file)(sandbox_handle_t*, const char*, uint8_t**, size_t*);
     sandbox_error_t (*write_file)(sandbox_handle_t*, const char*, const uint8_t*, size_t, uint32_t, uint32_t);
     sandbox_error_t (*list_dir)(sandbox_handle_t*, const char*, sandbox_dirent_t**, size_t*, bool*);

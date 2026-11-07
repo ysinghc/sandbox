@@ -492,6 +492,35 @@ int workspace_lease(const char* session_key) {
     return 0;
 }
 
+int workspace_delete(const char* session_key) {
+    if (!key_valid(session_key)) { errno = EINVAL; return -1; }
+    workspace_meta_t m;
+    if (workspace_load_meta(session_key, &m) < 0) return -1;  // ENOENT: unknown
+    char id[65];
+    session_id(session_key, id);
+    char dir[PATH_MAX];
+    workspace_paths(session_key, dir, sizeof(dir), NULL, 0);
+    // The check and the removal hold the lease lock together. Creates take the
+    // lease *before* touching the image (session_provision), so a racing
+    // create either holds the lease already (refused here) or blocks until
+    // the removal is done and then re-creates a fresh volume -- it can never
+    // bind a half-deleted one. The removal itself is quick (a sparse image
+    // plus meta.json), so the hold is milliseconds.
+    pthread_mutex_lock(&g_lease_lock);
+    for (size_t i = 0; i < g_lease_count; i++) {
+        if (strcmp(g_leases[i], id) == 0) {
+            pthread_mutex_unlock(&g_lease_lock);
+            errno = EBUSY;
+            return -1;
+        }
+    }
+    int rc = sandbox_rm_rf(dir);
+    int e = errno;
+    pthread_mutex_unlock(&g_lease_lock);
+    errno = e;
+    return rc;
+}
+
 void workspace_release(const char* session_key) {    if (!key_valid(session_key)) return;
     char id[65];
     session_id(session_key, id);

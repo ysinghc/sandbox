@@ -64,9 +64,13 @@ typedef enum {
     SANDBOX_ERR_PATH_DENIED        = -10,  // outside /workspace, or not a plain absolute path
     SANDBOX_ERR_NOT_FOUND          = -11,
     SANDBOX_ERR_EXISTS             = -12,
-    SANDBOX_ERR_TOO_LARGE          = -13,  // file, chunk or stdin over its limit
+    SANDBOX_ERR_TOO_LARGE          = -13,  // file, chunk or stdin over its limit;
+                                             // also a live stream whose consumer fell behind
+                                             // (see sandbox_exec_stream)
     SANDBOX_ERR_GUEST_IO           = -14,  // the guest's filesystem failed the operation
     SANDBOX_ERR_TIMEOUT            = -15,  // the host-side deadline expired
+    // #34: the session has a running sandbox, so its volume cannot be deleted.
+    SANDBOX_ERR_SESSION_BUSY       = -16,
 } sandbox_error_t;
 
 // Initialize client connection to daemon
@@ -170,6 +174,40 @@ typedef struct {
 sandbox_error_t sandbox_exec(sandbox_handle_t* handle, const sandbox_exec_spec_t* spec,
                              sandbox_exec_result_t* out);
 void sandbox_exec_result_free(sandbox_exec_result_t* result);
+
+// Run a command, delivering its output while it runs (#34).
+//
+// `cb(is_stderr, data, n, ud)` is invoked on the *caller's* thread, in stream
+// order per pipe, for every byte the command writes (nothing is head-capped:
+// the daemon forwards whole chunks). When the command ends, `out_result` (may
+// be NULL) receives the same terminal result `sandbox_exec` would return, and
+// the call returns SANDBOX_OK. A failure before the first chunk (bad spec,
+// lost daemon, guest refusal) invokes no callback; if the connection dies
+// mid-stream the callbacks stop and the call returns the transport error.
+//
+// Backpressure: the connection's reader thread never blocks on this call, so a
+// slow callback cannot stall other calls sharing the connection -- but only a
+// bounded amount of unconsumed output is queued (2 MiB). A callback that falls
+// further behind kills its own stream: the call returns SANDBOX_ERR_TOO_LARGE,
+// later chunks are dropped, and the command runs to completion unobserved.
+//
+// Against an older daemon (which ignores the stream request) this degrades to
+// `sandbox_exec`: no callbacks, just the terminal result.
+typedef void (*sandbox_exec_chunk_cb)(int is_stderr, const uint8_t* data,
+                                     size_t n, void* ud);
+sandbox_error_t sandbox_exec_stream(sandbox_handle_t* handle,
+                                    const sandbox_exec_spec_t* spec,
+                                    sandbox_exec_chunk_cb cb, void* ud,
+                                    sandbox_exec_result_t* out_result);
+
+// Delete a session volume by key (#34). The volume must exist and must have no
+// running sandbox: returns SANDBOX_ERR_SESSION_UNKNOWN for a key with no
+// volume, SANDBOX_ERR_SESSION_BUSY while one of its sandboxes runs (destroy it
+// first), SANDBOX_ERR_INVALID_SPEC for a key the registry cannot accept. Like
+// renew, the key is the capability -- it names the volume, not a sandbox -- so
+// the caller that wants the data gone needs nothing running to name. A later
+// create with the same key starts an empty volume.
+sandbox_error_t sandbox_session_delete(const char* session_key);
 
 // Read a whole file (up to SANDBOX_MAX_FILE) into a malloc'd buffer; free() it.
 // SANDBOX_ERR_TOO_LARGE if the file is bigger.

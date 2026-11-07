@@ -106,14 +106,15 @@ clients can confirm writes.
 | `make_directory` | write | mkdir with `parents` and `mode` |
 | `delete_file` | write | remove a path (`recursive` for directories) |
 | `renew` | write | extend the workspace deadline |
-| `destroy_session` | write | release the VM; the workspace stays until its TTL |
+| `destroy_session` | write | reclaim the VM and delete the workspace volume (#34); re-creating the key starts empty |
 
 Runtime failures (unknown session, engine error) come back as failed results
 (`isError: true`) so the model reads them; bad arguments are JSON-RPC
 `-32602`; a token without the tool's scope is `-32001`.
 
-Output arrives when the command finishes, like the API underneath it — live
-tailing is #34.
+`run` answers at completion: the stateless JSON-RPC shape has no streaming
+channel, so it does not use the API's live events (#34 streams over SSE, which
+the gateway does not forward).
 
 ## Protocol notes
 

@@ -190,6 +190,20 @@ curl -s -m 60 -N -X POST -H "Authorization: Bearer $TOKA" -H 'Content-Type: appl
 check $(grep -q '^event: started' "$WORK/sse" && grep -q '^event: stdout' "$WORK/sse" && grep -q '^event: exit' "$WORK/sse"; echo $?) "SSE: started, stdout and exit events"
 check $(grep -q 'streamed' "$WORK/sse" && grep -q '"exit_code":0' "$WORK/sse"; echo $?) "SSE: the output and exit code arrive"
 
+# ── streaming is live, not at-completion (#34) ───────────────────────────────
+# Print, sleep, print: the first stdout event must arrive while the command
+# still sleeps. Timestamps, not just order: curl -N does not buffer, and the
+# read loop stamps each line as it lands.
+curl -s -m 60 -N -X POST -H "Authorization: Bearer $TOKA" -H 'Content-Type: application/json' \
+    -d '{"command":"echo first; sleep 3; echo second","stream":true}' "$BASE/v1/sessions/$SID/exec" | \
+    while IFS= read -r line; do printf '%s %s\n' "$(date +%s%N)" "$line"; done >"$WORK/sse-timed"
+T1="$(awk '/event: stdout/{print $1; exit}' "$WORK/sse-timed")"
+TX="$(awk '/event: exit/{print $1; exit}' "$WORK/sse-timed")"
+GAP_MS="0"
+[ -n "$T1" ] && [ -n "$TX" ] && GAP_MS="$(( (TX - T1) / 1000000 ))"
+echo "[e2e] first stdout event arrived ${GAP_MS} ms before the exit event"
+check $(grep -q 'first' "$WORK/sse-timed" && grep -q 'second' "$WORK/sse-timed" && [ "$GAP_MS" -ge 1500 ]; echo $?) "SSE: output streams live, seconds before the exit"
+
 # ── idempotency ──────────────────────────────────────────────────────────────
 req "$TOKA" POST "/v1/sessions/$SID/exec" '{"command":"echo n >> /workspace/count; cat /workspace/count | wc -l"}' -H 'Idempotency-Key: once'
 FIRST="$(jget stdout)"
@@ -227,15 +241,17 @@ check $([ "$HTTP_STATUS" = 200 ] && [ "$(jget stdout)" = "written over HTTP" ]; 
 req "$TOKA" GET "/v1/sessions/$SID"
 check $([ "$(jget state)" = ready ]; echo $?) "...and the session is ready again"
 
-# ── delete, then the same key finds the same files ───────────────────────────
+# ── delete purges the volume; the same key starts empty (#34) ────────────────
 req "$TOKA" DELETE "/v1/sessions/$SID"
 check $([ "$HTTP_STATUS" = 204 ]; echo $?) "delete the session"
 req "$TOKA" GET "/v1/sessions/$SID"
 check $([ "$HTTP_STATUS" = 404 ]; echo $?) "it is gone"
 req "$TOKA" POST /v1/sessions '{"key":"e2e-1"}'
 check $([ "$HTTP_STATUS" = 201 ] && [ "$(jget id)" = "$SID" ]; echo $?) "re-creating with the same key gives the same id"
-req "$TOKA" POST "/v1/sessions/$SID/exec" '{"command":"cat /workspace/up.txt /workspace/down.txt"}'
-check $([ "$HTTP_STATUS" = 200 ] && jget stdout | grep -q 'written over HTTP' && jget stdout | grep -q 'made by the guest'; echo $?) "...and the files from before are still there"
+req "$TOKA" GET "/v1/sessions/$SID/files?path=/workspace/up.txt"
+check $([ "$HTTP_STATUS" = 404 ]; echo $?) "...but the old files are gone: DELETE purged the volume"
+req "$TOKA" POST "/v1/sessions/$SID/exec" '{"command":"echo fresh > /workspace/up.txt; cat /workspace/up.txt"}'
+check $([ "$HTTP_STATUS" = 200 ] && [ "$(jget stdout)" = "fresh" ]; echo $?) "...and the re-created workspace is writable"
 
 if kill -0 "$API_PID" 2>/dev/null; then ok "the API process is still alive"; else bad "the API process died"; tail -20 "$WORK/api.log" >&2; fi
 if [ "$fails" -eq 0 ]; then echo "[e2e] ALL PASSED"; exit 0; fi

@@ -234,9 +234,9 @@ peer, cid 1) and the guest asserts the positive direction
 | #7 broker streaming | ✅ chunked and Content-Length bodies stream with bounded memory; `SANDBOX_BROKER_MAX_BODY` (256 MiB) → 413; 64 MiB SHA-256 fidelity + RSS bound tested |
 | #25 template pipeline | ✅ x86_64: spec-driven build, content-addressed store, rollback, GC, byte-reproducible image, docs; privileged CI builds the image twice (identical), publishes, rolls back and collects on a real template. The aarch64 leg is deferred with the ARM milestone |
 | #26 egress policy | ✅ policy model, per-session plumbing, broker as a forward proxy (absolute-form + CONNECT), public-address guard, threaded broker, guest NIC + proxy env hand-off, exec inherits the spec env; unit/in-process tests and the privileged Debian e2e (incl. a real package index through the broker) green in CI |
-| #27 control-plane HTTP API | ✅ `sandbox-api` closed: sessions with persistent workspaces, exec (+SSE at completion), files, bearer-token/uid auth, isolation, idempotency; unit tests (fake engine, ASan/UBSan/TSan clean) + privileged e2e. Streaming + volume delete tracked in #34 (the guest leg already streams; the daemon buffers) |
+| #27 control-plane HTTP API | ✅ `sandbox-api` closed: sessions with persistent workspaces, exec (+SSE), files, bearer-token/uid auth, isolation, idempotency; unit tests (fake engine, ASan/UBSan/TSan clean) + privileged e2e. Live streaming + volume delete shipped in #34 |
 | M2 #28 | ✅ `mcp-gateway` closed: stdlib-only Go, Streamable HTTP + OAuth 2.1 (CIMD+DCR, PKCE S256, refresh rotation), 12 tools 1:1, 57 unit + 33 e2e checks green; live vendor connection is operator acceptance #35 |
-| #34 (#27 follow-up) | ⏳ live exec streaming (daemon already buffers; guest leg streams) + engine volume delete; sequenced after #28 |
+| #34 (#27 follow-up) | ✅ live exec streaming (streaming IPC op + `sandbox_exec_stream` + live SSE) and engine volume delete (`SessionDelete`, lease-atomic; DELETE purges); unit + privileged e2e incl. a timestamped live-stream assertion |
 
 ### What the `jail_cleanup` fix actually became
 

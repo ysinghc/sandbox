@@ -236,9 +236,10 @@ static void unlink_session(struct api_server* s, api_session_t* x) {
     if (dead) sess_free(x);
 }
 
-// Tear a session down: refuse new work, wait for what is running, reclaim the VM,
-// forget the record. The caller holds a reference. `wait_s` bounds the wait.
-void sess_close(struct api_server* s, api_session_t* x, int wait_s) {
+// #34: h_delete's order -- quiesce and reclaim the VM but keep the record, so
+// the volume can be deleted before the session is forgotten. A caller that
+// then decides not to forget must sess_resume() to reopen the session.
+void sess_halt_vm(struct api_server* s, api_session_t* x, int wait_s) {
     struct timespec dl;
     clock_gettime(CLOCK_REALTIME, &dl);
     dl.tv_sec += wait_s;
@@ -247,7 +248,25 @@ void sess_close(struct api_server* s, api_session_t* x, int wait_s) {
     while (x->inflight > 0 && pthread_cond_timedwait(&x->cv, &x->mu, &dl) == 0) {}
     sess_destroy_vm_locked(s, x);
     pthread_mutex_unlock(&x->mu);
+}
+
+void sess_forget(struct api_server* s, api_session_t* x) {
     unlink_session(s, x);
+}
+
+void sess_resume(struct api_server* s, api_session_t* x) {
+    (void)s;
+    pthread_mutex_lock(&x->mu);
+    x->closing = false;  // no VM and no inflight: exactly an idle session
+    pthread_cond_broadcast(&x->cv);
+    pthread_mutex_unlock(&x->mu);
+}
+
+// Tear a session down: refuse new work, wait for what is running, reclaim the VM,
+// forget the record. The caller holds a reference. `wait_s` bounds the wait.
+void sess_close(struct api_server* s, api_session_t* x, int wait_s) {
+    sess_halt_vm(s, x, wait_s);
+    sess_forget(s, x);
 }
 
 void sess_reap_once(struct api_server* s) {

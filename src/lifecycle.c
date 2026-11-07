@@ -107,10 +107,29 @@ struct sandbox_handle_t {
 // connection fails calls instead of hanging them.
 // ---------------------------------------------------------------------------
 
+typedef struct c_chunk {
+    uint8_t* data;
+    size_t len;
+    int is_err;
+    struct c_chunk* next;
+} c_chunk_t;
+
+// Unconsumed live output queued per streaming call. The reader thread never
+// blocks on a slow consumer (that would stall every call sharing this
+// connection), so the queue is bounded instead: a stream that outruns its
+// callback by more than this dies with SANDBOX_ERR_TOO_LARGE.
+#define STREAM_MAX_QUEUE_BYTES (2u * 1024u * 1024u)
+
 typedef struct c_waiter {
     uint64_t rid;
     ipc_response_t resp;
     bool done;
+    bool streaming;  // set by the caller before sending; stays registered
+                     // across chunk frames until a terminal frame arrives
+    c_chunk_t* chead;
+    c_chunk_t* ctail;
+    size_t cbytes;
+    sandbox_error_t stream_err;  // local stream death (overflow/OOM); SANDBOX_OK alive
     struct c_waiter* next;
 } c_waiter_t;
 
@@ -167,22 +186,75 @@ static void* client_reader(void* arg) {
         }
         bool matched = false;
         for (c_waiter_t* w = c.waiters; w; w = w->next) {
-            if (w->rid == resp.request_id) {
-                w->resp = resp;  // ownership of any buffers moves with it
-                w->done = true;
+            if (w->rid != resp.request_id) continue;
+            // #34: a chunk frame belongs to a live streaming waiter only.
+            // Anything else (a chunk for a one-shot call, a chunk after the
+            // stream died) is dropped: misdelivering it as a reply would be
+            // a lie. Either way the frame is consumed here, never stored as
+            // the waiter's reply.
+            if (resp.kind == IPC_REQ_GUEST && !resp.is_error && resp.is_chunk) {
+                size_t n = resp.out_len + resp.err_len;
+                if (w->streaming && !w->done && w->stream_err == SANDBOX_OK && n > 0) {
+                    // Bounded: the reader never blocks on a slow consumer, so
+                    // a stream that outruns its callback dies instead of
+                    // growing without limit or stalling the connection.
+                    c_chunk_t* k = n <= STREAM_MAX_QUEUE_BYTES - w->cbytes
+                                       ? calloc(1, sizeof(*k))
+                                       : NULL;
+                    if (k && resp.out_len) {
+                        k->len = resp.out_len;
+                        k->data = resp.out;
+                        resp.out = NULL;
+                    }
+                    if (k && resp.err_len) {
+                        // The daemon sends exactly one stream per chunk; take
+                        // the second half too if a sloppy sender sets both.
+                        c_chunk_t* half = k->data ? calloc(1, sizeof(*half)) : k;
+                        if (!half) {
+                            free(k->data);
+                            free(k);
+                            k = NULL;
+                        } else {
+                            half->len = resp.err_len;
+                            half->data = resp.err;
+                            half->is_err = 1;
+                            resp.err = NULL;
+                            if (half != k) k->next = half;
+                        }
+                    }
+                    if (k) {
+                        if (w->ctail) w->ctail->next = k;
+                        else w->chead = k;
+                        w->ctail = k->next ? k->next : k;
+                        w->cbytes += n;
+                    } else {
+                        w->stream_err = w->cbytes + n > STREAM_MAX_QUEUE_BYTES
+                                           ? SANDBOX_ERR_TOO_LARGE
+                                           : SANDBOX_ERR_INTERNAL;
+                        w->done = true;
+                    }
+                }
+                ipc_response_clear(&resp);  // queued halves were NULLed above
                 matched = true;
                 pthread_cond_broadcast(&c.cv);
                 break;
             }
+            w->resp = resp;  // ownership of any buffers moves with it
+            w->done = true;
+            matched = true;
+            pthread_cond_broadcast(&c.cv);
+            break;
         }
         pthread_mutex_unlock(&c.mu);
         if (!matched) ipc_response_clear(&resp);  // nobody is waiting: do not leak
     }
 }
 
-// Send one request and wait for the reply carrying its id.
-static sandbox_error_t client_roundtrip(ipc_request_t* req,
-                                        ipc_response_t* resp) {
+// Assign an id, encode, register the waiter and send. The waiter is the
+// caller's stack slot (zeroed, `streaming` set as needed, before the call: a
+// fast daemon may answer before send() returns). c.mu is held on success --
+// the caller waits, unregisters, then releases it -- and released on failure.
+static sandbox_error_t client_send_locked(ipc_request_t* req, c_waiter_t* w) {
     uint8_t buf[IPC_FRAME_MAX];
     size_t n = 0;
 
@@ -205,31 +277,44 @@ static sandbox_error_t client_roundtrip(ipc_request_t* req,
         return SANDBOX_ERR_INVALID_SPEC;
     }
 
-    // Register before sending: a fast daemon may answer before send() returns.
-    c_waiter_t w;
-    memset(&w, 0, sizeof(w));
-    w.rid = rid;
-    w.next = c.waiters;
-    c.waiters = &w;
+    w->rid = rid;
+    w->next = c.waiters;
+    c.waiters = w;
 
     if (ipc_send_frame(c.fd, buf, n) < 0) {
-        c.waiters = w.next;
+        c.waiters = w->next;
         client_fail(SANDBOX_ERR_DAEMON_UNREACHABLE);
         sandbox_error_t rc = c.dead;
         pthread_mutex_unlock(&c.mu);
         return rc;
     }
+    return SANDBOX_OK;  // locked
+}
+
+// Caller holds c.mu.
+static void client_unregister_locked(c_waiter_t* w) {
+    for (c_waiter_t** pp = &c.waiters; *pp; pp = &(*pp)->next) {
+        if (*pp == w) {
+            *pp = w->next;
+            break;
+        }
+    }
+}
+
+// Send one request and wait for the reply carrying its id.
+static sandbox_error_t client_roundtrip(ipc_request_t* req,
+                                        ipc_response_t* resp) {
+    c_waiter_t w;
+    memset(&w, 0, sizeof(w));
+    sandbox_error_t rc = client_send_locked(req, &w);
+    if (rc != SANDBOX_OK) return rc;
+    uint64_t rid = req->request_id;
 
     while (!w.done && c.dead == SANDBOX_OK)
         pthread_cond_wait(&c.cv, &c.mu);
 
-    sandbox_error_t rc = c.dead;
-    for (c_waiter_t** pp = &c.waiters; *pp; pp = &(*pp)->next) {
-        if (*pp == &w) {
-            *pp = w.next;
-            break;
-        }
-    }
+    rc = c.dead;
+    client_unregister_locked(&w);
     if (rc == SANDBOX_OK) {
         if (!w.done || w.resp.request_id != rid) {
             rc = SANDBOX_ERR_INTERNAL;  // protocol invariant broken
@@ -237,6 +322,65 @@ static sandbox_error_t client_roundtrip(ipc_request_t* req,
             *resp = w.resp;
         }
     }
+    pthread_mutex_unlock(&c.mu);
+    return rc;
+}
+
+// Send one streaming exec and deliver its chunks to `cb` until the terminal
+// frame arrives. The callbacks run on the caller's thread (never the reader
+// thread, which must stay free to drain the connection), without c.mu held,
+// so a callback may call back into libsandbox. Queued chunks are drained
+// before the terminal result is returned, so the caller sees every byte in
+// order; on `*terminal` the ownership moves to the caller like client_roundtrip.
+static sandbox_error_t client_stream(ipc_request_t* req, sandbox_exec_chunk_cb cb,
+                                     void* ud, ipc_response_t* terminal) {
+    c_waiter_t w;
+    memset(&w, 0, sizeof(w));
+    w.streaming = true;
+    sandbox_error_t rc = client_send_locked(req, &w);
+    if (rc != SANDBOX_OK) return rc;
+
+    for (;;) {
+        // Queued chunks are delivered even after the stream died, so the
+        // caller loses only the bytes past the overflow, not the earlier
+        // ones; only a dead connection discards (like client_roundtrip).
+        while (w.chead && c.dead == SANDBOX_OK) {
+            c_chunk_t* k = w.chead;
+            w.chead = k->next;
+            if (!w.chead) w.ctail = NULL;
+            w.cbytes -= k->len;
+            pthread_mutex_unlock(&c.mu);
+            cb(k->is_err, k->data, k->len, ud);
+            free(k->data);
+            free(k);
+            pthread_mutex_lock(&c.mu);
+        }
+        if (c.dead != SANDBOX_OK) {
+            rc = c.dead;
+            break;
+        }
+        if (w.done && !w.chead) break;
+        pthread_cond_wait(&c.cv, &c.mu);
+    }
+
+    client_unregister_locked(&w);
+    if (rc == SANDBOX_OK) {
+        if (w.stream_err != SANDBOX_OK) {
+            rc = w.stream_err;
+        } else if (!w.done || w.resp.is_chunk || w.resp.request_id != req->request_id) {
+            rc = SANDBOX_ERR_INTERNAL;  // protocol invariant broken
+        } else {
+            *terminal = w.resp;
+            memset(&w.resp, 0, sizeof(w.resp));
+        }
+    }
+    while (w.chead) {  // undelivered on the error paths; do not leak
+        c_chunk_t* k = w.chead;
+        w.chead = k->next;
+        free(k->data);
+        free(k);
+    }
+    ipc_response_clear(&w.resp);
     pthread_mutex_unlock(&c.mu);
     return rc;
 }
@@ -378,7 +522,9 @@ sandbox_error_t sandbox_inspect(sandbox_handle_t* handle,
 sandbox_error_t sandbox_session_renew(const char* session_key,
                                       uint32_t extra_seconds,
                                       uint64_t* out_expires_at) {
-    if (!session_key || !*session_key) return SANDBOX_ERR_INVALID_SPEC;
+    // Refused, never truncated: a clipped key would renew a different volume.
+    if (!session_key || !*session_key || strlen(session_key) >= IPC_MAX_SESSION_KEY)
+        return SANDBOX_ERR_INVALID_SPEC;
     ipc_request_t req;
     ipc_request_init(&req);
     req.kind = IPC_REQ_RENEW;
@@ -421,48 +567,116 @@ static bool set_path(ipc_request_t* req, const char* path) {
     return true;
 }
 
+// Validate an exec spec into a request. The request is initialised here and
+// owned by the caller (clear it); on error it owns nothing.
+static sandbox_error_t build_exec_req(const sandbox_exec_spec_t* spec,
+                                      ipc_request_t* req, bool stream) {
+    ipc_request_init(req);
+    if (!spec || !spec->argv || !spec->argv[0]) return SANDBOX_ERR_INVALID_SPEC;
+    req->guest_op = 1;  // GRPC_OP_EXEC
+    if (spec->cwd && !set_path(req, spec->cwd)) return SANDBOX_ERR_INVALID_SPEC;
+    for (int i = 0; spec->argv[i]; i++) {
+        if (req->n_argv >= IPC_MAX_ARGV) { ipc_request_clear(req); return SANDBOX_ERR_INVALID_SPEC; }
+        req->argv[req->n_argv] = strdup(spec->argv[i]);
+        if (!req->argv[req->n_argv]) { ipc_request_clear(req); return SANDBOX_ERR_INTERNAL; }
+        req->n_argv++;
+    }
+    for (int i = 0; spec->env && spec->env[i]; i++) {
+        if (req->n_env >= IPC_MAX_ENV) { ipc_request_clear(req); return SANDBOX_ERR_INVALID_SPEC; }
+        req->env_vars[req->n_env] = strdup(spec->env[i]);
+        if (!req->env_vars[req->n_env]) { ipc_request_clear(req); return SANDBOX_ERR_INTERNAL; }
+        req->n_env++;
+    }
+    if (spec->stdin_len) {
+        req->data = malloc(spec->stdin_len);
+        if (!req->data) { ipc_request_clear(req); return SANDBOX_ERR_INTERNAL; }
+        memcpy(req->data, spec->stdin_data, spec->stdin_len);
+        req->data_len = spec->stdin_len;
+    }
+    req->timeout_ms = spec->timeout_ms;
+    req->max_output = spec->max_output;
+    req->guest_flags = spec->shell ? IPC_GF_SHELL : 0;
+    if (stream) req->guest_flags |= IPC_GF_STREAM;
+    return SANDBOX_OK;
+}
+
+static void move_exec_result(ipc_response_t* resp, sandbox_exec_result_t* out) {
+    out->exit_code = resp->exit_code;
+    out->term_signal = resp->term_signal;
+    out->timed_out = resp->timed_out;
+    out->output_truncated = resp->output_truncated;
+    out->out = resp->out; out->out_len = resp->out_len; out->out_total = resp->out_total;
+    out->err = resp->err; out->err_len = resp->err_len; out->err_total = resp->err_total;
+    resp->out = resp->err = NULL;  // moved into `out`
+    ipc_response_clear(resp);
+}
+
 sandbox_error_t sandbox_exec(sandbox_handle_t* handle, const sandbox_exec_spec_t* spec,
                              sandbox_exec_result_t* out) {
     if (!out) return SANDBOX_ERR_INVALID_SPEC;
     memset(out, 0, sizeof(*out));
-    if (!handle || !spec || !spec->argv || !spec->argv[0]) return SANDBOX_ERR_INVALID_SPEC;
+    if (!handle) return SANDBOX_ERR_INVALID_SPEC;
     ipc_request_t req;
-    ipc_request_init(&req);
-    req.guest_op = 1;  // GRPC_OP_EXEC
-    if (spec->cwd && !set_path(&req, spec->cwd)) return SANDBOX_ERR_INVALID_SPEC;
-    for (int i = 0; spec->argv[i]; i++) {
-        if (req.n_argv >= IPC_MAX_ARGV) { ipc_request_clear(&req); return SANDBOX_ERR_INVALID_SPEC; }
-        req.argv[req.n_argv] = strdup(spec->argv[i]);
-        if (!req.argv[req.n_argv]) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
-        req.n_argv++;
-    }
-    for (int i = 0; spec->env && spec->env[i]; i++) {
-        if (req.n_env >= IPC_MAX_ENV) { ipc_request_clear(&req); return SANDBOX_ERR_INVALID_SPEC; }
-        req.env_vars[req.n_env] = strdup(spec->env[i]);
-        if (!req.env_vars[req.n_env]) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
-        req.n_env++;
-    }
-    if (spec->stdin_len) {
-        req.data = malloc(spec->stdin_len);
-        if (!req.data) { ipc_request_clear(&req); return SANDBOX_ERR_INTERNAL; }
-        memcpy(req.data, spec->stdin_data, spec->stdin_len);
-        req.data_len = spec->stdin_len;
-    }
-    req.timeout_ms = spec->timeout_ms;
-    req.max_output = spec->max_output;
-    req.guest_flags = spec->shell ? IPC_GF_SHELL : 0;
+    sandbox_error_t rc = build_exec_req(spec, &req, false);
+    if (rc != SANDBOX_OK) return rc;
 
     ipc_response_t resp;
-    sandbox_error_t rc = guest_call(handle, &req, &resp);
+    rc = guest_call(handle, &req, &resp);
     ipc_request_clear(&req);
     if (rc != SANDBOX_OK) return rc;
-    out->exit_code = resp.exit_code;
-    out->term_signal = resp.term_signal;
-    out->timed_out = resp.timed_out;
-    out->output_truncated = resp.output_truncated;
-    out->out = resp.out; out->out_len = resp.out_len; out->out_total = resp.out_total;
-    out->err = resp.err; out->err_len = resp.err_len; out->err_total = resp.err_total;
-    resp.out = resp.err = NULL;  // moved into `out`
+    move_exec_result(&resp, out);
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_exec_stream(sandbox_handle_t* handle,
+                                    const sandbox_exec_spec_t* spec,
+                                    sandbox_exec_chunk_cb cb, void* ud,
+                                    sandbox_exec_result_t* out_result) {
+    if (out_result) memset(out_result, 0, sizeof(*out_result));
+    if (!handle || !cb) return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    sandbox_error_t rc = build_exec_req(spec, &req, true);
+    if (rc != SANDBOX_OK) return rc;
+    req.kind = IPC_REQ_GUEST;
+    req.sandbox_id = handle->sandbox_id;
+
+    ipc_response_t terminal;
+    rc = client_stream(&req, cb, ud, &terminal);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    if (terminal.is_error) {
+        sandbox_error_t e = (sandbox_error_t)terminal.error_code;
+        ipc_response_clear(&terminal);
+        return e;
+    }
+    if (terminal.kind != IPC_REQ_GUEST) {
+        ipc_response_clear(&terminal);
+        return SANDBOX_ERR_INTERNAL;
+    }
+    if (out_result) move_exec_result(&terminal, out_result);
+    else ipc_response_clear(&terminal);
+    return SANDBOX_OK;
+}
+
+sandbox_error_t sandbox_session_delete(const char* session_key) {
+    // A key that does not fit is refused, never truncated: a clipped key
+    // names a different volume, and this call destroys what it names.
+    if (!session_key || !*session_key || strlen(session_key) >= IPC_MAX_SESSION_KEY)
+        return SANDBOX_ERR_INVALID_SPEC;
+    ipc_request_t req;
+    ipc_request_init(&req);
+    req.kind = IPC_REQ_SESSION_DELETE;
+    snprintf(req.session_key, sizeof(req.session_key), "%s", session_key);
+
+    ipc_response_t resp;
+    sandbox_error_t rc = client_roundtrip(&req, &resp);
+    ipc_request_clear(&req);
+    if (rc != SANDBOX_OK) return rc;
+    if (resp.is_error) {
+        sandbox_error_t e = (sandbox_error_t)resp.error_code;
+        ipc_response_clear(&resp);
+        return e;
+    }
     ipc_response_clear(&resp);
     return SANDBOX_OK;
 }
@@ -675,6 +889,7 @@ const char* sandbox_error_string(sandbox_error_t code) {
         case SANDBOX_ERR_TOO_LARGE: return "too large";
         case SANDBOX_ERR_GUEST_IO: return "guest I/O error";
         case SANDBOX_ERR_TIMEOUT: return "timed out";
+        case SANDBOX_ERR_SESSION_BUSY: return "session has a running sandbox";
         default: return "unknown error";
     }
 }

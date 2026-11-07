@@ -109,6 +109,9 @@ void sess_release(struct api_server* s, api_session_t* x);
 // Refuse new work, wait up to wait_s for what is running, reclaim the VM and
 // forget the session. The caller holds its own reference.
 void sess_close(struct api_server* s, api_session_t* x, int wait_s);
+void sess_halt_vm(struct api_server* s, api_session_t* x, int wait_s);
+void sess_forget(struct api_server* s, api_session_t* x);
+void sess_resume(struct api_server* s, api_session_t* x);
 void sess_destroy_vm_locked(struct api_server* s, api_session_t* x);
 void sess_free_fields(api_session_t* x);
 void sess_reap_once(struct api_server* s);

@@ -123,6 +123,9 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
             if (req->extra_seconds) r->set_extra_seconds(req->extra_seconds);
             break;
         }
+        case IPC_REQ_SESSION_DELETE:  // #34: the key names the volume
+            msg.mutable_session_delete()->set_session_key(req->session_key);
+            break;
         case IPC_REQ_GUEST: {
             auto* g = msg.mutable_guest();
             g->set_sandbox_id(req->sandbox_id);
@@ -145,6 +148,7 @@ int ipc_encode_request(const ipc_request_t* req, uint8_t* buf, size_t cap,
             g->set_exclusive(req->guest_flags & IPC_GF_EXCL);
             g->set_parents(req->guest_flags & IPC_GF_PARENTS);
             g->set_recursive(req->guest_flags & IPC_GF_RECURSIVE);
+            if (req->guest_flags & IPC_GF_STREAM) g->set_stream(true);
             break;
         }
         default:
@@ -218,6 +222,11 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
                     msg.renew().session_key());
             out->extra_seconds = msg.renew().extra_seconds();
             break;
+        case sandbox::ClientMessage::kSessionDelete:
+            out->kind = IPC_REQ_SESSION_DELETE;
+            set_str(out->session_key, sizeof(out->session_key),
+                    msg.session_delete().session_key());
+            break;
         case sandbox::ClientMessage::kGuest: {
             const auto& g = msg.guest();
             out->kind = IPC_REQ_GUEST;
@@ -251,7 +260,8 @@ int ipc_decode_request(const uint8_t* buf, size_t len, ipc_request_t* out) {
                                (g.append() ? IPC_GF_APPEND : 0) |
                                (g.exclusive() ? IPC_GF_EXCL : 0) |
                                (g.parents() ? IPC_GF_PARENTS : 0) |
-                               (g.recursive() ? IPC_GF_RECURSIVE : 0);
+                               (g.recursive() ? IPC_GF_RECURSIVE : 0) |
+                               (g.stream() ? IPC_GF_STREAM : 0);
             break;
         }
         default:
@@ -297,6 +307,9 @@ int ipc_encode_response(const ipc_response_t* resp, uint8_t* buf, size_t cap,
             case IPC_REQ_RENEW:
                 msg.mutable_renew()->set_expires_at(resp->expires_at);
                 break;
+            case IPC_REQ_SESSION_DELETE:  // #34: empty body, the kind is the answer
+                msg.mutable_session_delete();
+                break;
             case IPC_REQ_GUEST: {
                 auto* g = msg.mutable_guest();
                 g->set_sandbox_id(resp->sandbox_id);
@@ -320,6 +333,7 @@ int ipc_encode_response(const ipc_response_t* resp, uint8_t* buf, size_t cap,
                 g->set_type(resp->ftype);
                 g->set_mode(resp->fmode);
                 g->set_mtime(resp->mtime);
+                if (resp->is_chunk) g->set_stream_chunk(true);
                 break;
             }
             default:
@@ -384,6 +398,9 @@ int ipc_decode_response(const uint8_t* buf, size_t len, ipc_response_t* out) {
             out->kind = IPC_REQ_RENEW;
             out->expires_at = msg.renew().expires_at();
             return 0;
+        case sandbox::ServerMessage::kSessionDelete:
+            out->kind = IPC_REQ_SESSION_DELETE;
+            return 0;
         case sandbox::ServerMessage::kGuest: {
             const auto& g = msg.guest();
             out->kind = IPC_REQ_GUEST;
@@ -392,6 +409,7 @@ int ipc_decode_response(const uint8_t* buf, size_t len, ipc_response_t* out) {
             out->term_signal = g.term_signal();
             out->timed_out = g.timed_out();
             out->output_truncated = g.output_truncated();
+            out->is_chunk = g.stream_chunk();
             out->out = dup_bytes(g.out());
             out->out_len = out->out ? g.out().size() : 0;
             out->err = dup_bytes(g.err());

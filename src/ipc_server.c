@@ -1003,6 +1003,45 @@ static void stop_create_workers(void) {
 // #24 guest operations
 // ---------------------------------------------------------------------------
 
+// #34: a streaming exec's live chunks travel the same result queue as the
+// terminal reply, so the loop thread still owns every send. Only the terminal
+// frees the per-session slot; chunks are just bytes on the way.
+typedef struct {
+    int session_fd;
+    uint64_t session_epoch;
+    uint64_t request_id;
+    uint32_t sandbox_id;
+} stream_sink_t;
+
+static void stream_post_chunk(int is_err, const uint8_t* d, size_t n, void* ud) {
+    stream_sink_t* t = ud;
+    if (!n) return;
+    gop_result_t* r = calloc(1, sizeof(*r));
+    uint8_t* copy = n ? malloc(n) : NULL;
+    if (!r || !copy) {
+        free(r);
+        free(copy);
+        return;  // OOM mid-stream: the terminal still reports the true totals
+    }
+    memcpy(copy, d, n);
+    r->session_fd = t->session_fd;
+    r->session_epoch = t->session_epoch;
+    r->resp.kind = IPC_REQ_GUEST;
+    r->resp.request_id = t->request_id;
+    r->resp.sandbox_id = t->sandbox_id;
+    r->resp.is_chunk = true;
+    if (is_err) { r->resp.err = copy; r->resp.err_len = n; }
+    else { r->resp.out = copy; r->resp.out_len = n; }
+    pthread_mutex_lock(&g.gr_lock);
+    if (g.gr_tail) g.gr_tail->next = r;
+    else g.gr_head = r;
+    g.gr_tail = r;
+    pthread_mutex_unlock(&g.gr_lock);
+    uint64_t one = 1;
+    ssize_t w = write(g.wake_fd, &one, sizeof(one));
+    (void)w;
+}
+
 static void* guest_worker_fn(void* arg) {
     (void)arg;
     for (;;) {
@@ -1025,7 +1064,12 @@ static void* guest_worker_fn(void* arg) {
             r->session_epoch = job->session_epoch;
             // May block for as long as the command runs: that is why this is
             // not the loop thread.
-            ipc_guest_execute(job->uds, &job->req, &r->resp);
+            stream_sink_t t = { .session_fd = job->session_fd,
+                                .session_epoch = job->session_epoch,
+                                .request_id = job->req.request_id,
+                                .sandbox_id = job->req.sandbox_id };
+            ipc_guest_execute_stream(job->uds, &job->req, stream_post_chunk, &t,
+                                     &r->resp);
         }
         ipc_request_clear(&job->req);
         free(job);
@@ -1057,7 +1101,9 @@ static void drain_guest_results(void) {
         gop_result_t* next = r->next;
         session_t* s = session_find(r->session_fd);
         if (s && s->epoch == r->session_epoch) {
-            if (s->n_gop > 0) s->n_gop--;
+            // A chunk borrows the in-flight slot; only the terminal frees it.
+            // Error replies are terminal too (the worker sends nothing after).
+            if (!r->resp.is_chunk && s->n_gop > 0) s->n_gop--;
             send_response(s->fd, &r->resp);
         }  // else: the client left while it ran; nobody to tell
         ipc_response_clear(&r->resp);
@@ -1280,6 +1326,41 @@ static void handle_renew(int fd, const ipc_request_t* req) {
     send_response(fd, &resp);
 }
 
+// #34: delete a session volume by key. Like renew, keyed by the session key
+// rather than a sandbox id: the volume outlives every VM, so the caller that
+// wants it gone may have nothing running to name. The key is the capability,
+// as with renew; the workspace layer refuses a volume that still has a live
+// sandbox, atomically with respect to new creates.
+static void handle_session_delete(int fd, const ipc_request_t* req) {
+    uint64_t rid = req->request_id;
+    if (workspace_delete(req->session_key) < 0) {
+        switch (errno) {
+            case ENOENT:
+                reply_error(fd, rid, SANDBOX_ERR_SESSION_UNKNOWN,
+                            "no such session");
+                break;
+            case EBUSY:
+                reply_error(fd, rid, SANDBOX_ERR_SESSION_BUSY,
+                            "session has a running sandbox; destroy it first");
+                break;
+            case EINVAL:
+                reply_error(fd, rid, SANDBOX_ERR_INVALID_SPEC,
+                            "invalid session key");
+                break;
+            default:
+                reply_error(fd, rid, SANDBOX_ERR_INTERNAL,
+                            "cannot delete session");
+                break;
+        }
+        return;
+    }
+    ipc_response_t resp;
+    memset(&resp, 0, sizeof(resp));
+    resp.request_id = rid;
+    resp.kind = IPC_REQ_SESSION_DELETE;
+    send_response(fd, &resp);
+}
+
 static void handle_message(int fd, session_t* s, const uint8_t* payload,
                            size_t len) {
     ipc_request_t req;
@@ -1300,6 +1381,7 @@ static void handle_message(int fd, session_t* s, const uint8_t* payload,
             handle_pause_resume(fd, rid, s, req.sandbox_id, false); break;
         case IPC_REQ_INSPECT: handle_inspect(fd, rid, s, req.sandbox_id); break;
         case IPC_REQ_RENEW:   handle_renew(fd, &req); break;
+        case IPC_REQ_SESSION_DELETE: handle_session_delete(fd, &req); break;
         case IPC_REQ_GUEST:   handle_guest(fd, s, &req); break;
         default:
             reply_error(fd, rid, SANDBOX_ERR_INVALID_SPEC, "unknown op");

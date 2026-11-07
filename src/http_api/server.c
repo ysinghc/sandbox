@@ -163,6 +163,7 @@ static void map_err(sandbox_error_t e, int* status, const char** code) {
     case SANDBOX_ERR_TOO_LARGE: *status = 413; *code = "too_large"; break;
     case SANDBOX_ERR_GUEST_IO: *status = 502; *code = "guest_io"; break;
     case SANDBOX_ERR_TIMEOUT: *status = 504; *code = "timeout"; break;
+    case SANDBOX_ERR_SESSION_BUSY: *status = 409; *code = "session_busy"; break;
     default: *status = 500; *code = "internal"; break;
     }
 }
@@ -587,9 +588,22 @@ static void h_get(rq_t* r, api_session_t* x) {
 }
 
 static void h_delete(rq_t* r, api_session_t* x) {
-    // The workspace volume is not touched: it lives out its ttl, so the same key
-    // reattaches to the same files. The engine has no "delete volume" call.
-    sess_close(r->c->srv, x, 30);
+    // #34: delete means delete. The VM is reclaimed first (the engine refuses
+    // to delete a volume that still has one), then the volume, and only then
+    // is the record forgotten -- so a failed delete leaves the session usable
+    // and a retry can finish the job. A volume the reaper already took is
+    // still 204: the end state the caller asked for holds.
+    struct api_server* s = r->c->srv;
+    sess_halt_vm(s, x, 30);
+    if (s->eng->session_delete) {
+        sandbox_error_t er = s->eng->session_delete(x->engine_key);
+        if (er != SANDBOX_OK && er != SANDBOX_ERR_SESSION_UNKNOWN) {
+            sess_resume(s, x);
+            respond_engine_error(r, er);
+            return;
+        }
+    }
+    sess_forget(s, x);
     LOGF(LOG_INFO, "http_api", "session_deleted", "\"rid\":\"%s\",\"principal\":\"%s\",\"session\":\"%s\"", r->rid, r->who, x->id);
     respond(r, 204, NULL, NULL, 0, NULL);
 }
@@ -672,17 +686,43 @@ static void jb_exec_result(jbuf_t* b, const exec_job_t* j, bool b64) {
            b64 ? "base64" : "utf8");
 }
 
-static void sse_event(rq_t* r, const char* ev, const char* data) {
+// ---- live SSE (#34) ----
+//
+// A streaming exec has two writers on one connection: the exec_stream
+// callback (request thread) emits chunk events as output arrives, and a
+// keepalive thread comments the quiet stretches. Every write below runs under
+// L->wmu; the first failure marks the stream dead and the rest is skipped
+// (the exec itself still runs to completion, unobserved).
+typedef struct {
+    rq_t* r;
+    bool b64;
+    pthread_mutex_t wmu;
+    pthread_cond_t wcv;
+    pthread_t kat;
+    int kat_started;
+    int stop;
+    int emitted;  // a chunk went out since the keepalive thread last looked
+    int dead;     // an SSE write failed; skip the rest
+    unsigned keepalive_s;
+    uint8_t tail[2][3];  // trailing incomplete UTF-8 sequence, per stream
+    size_t tail_len[2];
+} sse_live_t;
+
+static void sse_event_locked(sse_live_t* L, const char* ev, const char* data) {
+    rq_t* r = L->r;
     char head[96];
     int n = snprintf(head, sizeof(head), "event: %s\ndata: ", ev);
     if (write_all(r->c->fd, head, (size_t)n) < 0 || write_all(r->c->fd, data, strlen(data)) < 0 ||
-        write_all(r->c->fd, "\n\n", 2) < 0)
+        write_all(r->c->fd, "\n\n", 2) < 0) {
         r->keepalive = 0;
+        L->dead = 1;
+    }
 }
 
-static void sse_stream(rq_t* r, const char* ev, const uint8_t* d, size_t n, bool b64) {
+static void sse_stream_locked(sse_live_t* L, const char* ev, const uint8_t* d, size_t n) {
+    bool b64 = L->b64;
     size_t off = 0;
-    while (off < n) {
+    while (off < n && !L->dead) {
         size_t len = n - off < STREAM_CHUNK ? n - off : STREAM_CHUNK;
         if (!b64 && off + len < n)  // do not split a UTF-8 sequence across events
             for (int back = 0; back < 3 && len > 1 && (d[off + len] & 0xC0) == 0x80; back++) len--;
@@ -691,10 +731,90 @@ static void sse_stream(rq_t* r, const char* ev, const uint8_t* d, size_t n, bool
         jb_raw(&b, "{\"data\":");
         jb_stream_text(&b, d + off, len, b64);
         jb_fmt(&b, ",\"encoding\":\"%s\"}", b64 ? "base64" : "utf8");
-        if (!b.oom) sse_event(r, ev, b.p);
+        if (!b.oom) sse_event_locked(L, ev, b.p);
         jb_free(&b);
         off += len;
     }
+}
+
+// Length of the trailing incomplete UTF-8 sequence in d[0..n], or 0 when the
+// buffer ends on a boundary (or in invalid bytes, which jb_str replaces with
+// U+FFFD per the documented encoding contract).
+static size_t utf8_tail_len(const uint8_t* d, size_t n) {
+    if (!n) return 0;
+    size_t cont = 0;
+    while (cont < n && cont < 3 && (d[n - 1 - cont] & 0xC0) == 0x80) cont++;
+    if (cont == n) return 0;  // stray continuations; jb_str replaces them
+    uint8_t lead = d[n - 1 - cont];
+    size_t want = 0;
+    if (lead < 0x80) want = 1;
+    else if (lead >= 0xC2 && lead < 0xE0) want = 2;
+    else if (lead >= 0xE0 && lead < 0xF0) want = 3;
+    else if (lead >= 0xF0 && lead < 0xF5) want = 4;
+    else return 0;  // invalid lead; jb_str replaces it
+    return (cont + 1 < want) ? cont + 1 : 0;
+}
+
+// Emit one live chunk. Chunks are arbitrary guest-frame splits, so in utf8
+// mode a multi-byte sequence can straddle two chunks: the trailing incomplete
+// sequence is held back and prepended to the next chunk.
+static void sse_live_emit(sse_live_t* L, int is_err, const uint8_t* d, size_t n) {
+    const char* ev = is_err ? "stderr" : "stdout";
+    if (L->b64 || !n) {
+        if (n) sse_stream_locked(L, ev, d, n);
+        return;
+    }
+    size_t t = L->tail_len[is_err != 0];
+    size_t total = t + n;
+    uint8_t* tmp = malloc(total ? total : 1);
+    if (!tmp) return;  // OOM: drop the chunk; the exit totals stay true
+    memcpy(tmp, L->tail[is_err != 0], t);
+    memcpy(tmp + t, d, n);
+    size_t tail = utf8_tail_len(tmp, total);
+    if (total > tail) sse_stream_locked(L, ev, tmp, total - tail);
+    L->tail_len[is_err != 0] = tail;
+    memcpy(L->tail[is_err != 0], tmp + total - tail, tail);
+    free(tmp);
+}
+
+static void sse_live_flush(sse_live_t* L) {
+    for (int s = 0; s < 2; s++) {
+        if (L->tail_len[s] && !L->dead)
+            sse_stream_locked(L, s ? "stderr" : "stdout", L->tail[s], L->tail_len[s]);
+        L->tail_len[s] = 0;
+    }
+}
+
+static void sse_chunk_cb(int is_err, const uint8_t* d, size_t n, void* ud) {
+    sse_live_t* L = ud;
+    pthread_mutex_lock(&L->wmu);
+    if (!L->dead && n) {
+        sse_live_emit(L, is_err, d, n);
+        L->emitted = 1;
+    }
+    pthread_mutex_unlock(&L->wmu);
+}
+
+static void* sse_keepalive(void* a) {
+    sse_live_t* L = a;
+    pthread_mutex_lock(&L->wmu);
+    while (!L->stop) {
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_sec += L->keepalive_s;
+        if (pthread_cond_timedwait(&L->wcv, &L->wmu, &dl) == 0) continue;  // stop (or spurious)
+        if (!L->stop && !L->dead) {
+            if (!L->emitted) {
+                if (write_all(L->r->c->fd, ": keepalive\n\n", 13) < 0) {
+                    L->r->keepalive = 0;
+                    L->dead = 1;
+                }
+            }
+            L->emitted = 0;
+        }
+    }
+    pthread_mutex_unlock(&L->wmu);
+    return NULL;
 }
 
 static void h_exec(rq_t* r, api_session_t* x) {
@@ -807,57 +927,80 @@ static void h_exec(rq_t* r, api_session_t* x) {
     if (!stream) {
         exec_thread(&j);
     } else {
-        pthread_t t;
-        if (pthread_create(&t, NULL, exec_thread, &j) != 0) {
-            sess_release(s, x);
-            respond_error(r, 503, "capacity", "cannot start the command");
-            goto out;
-        }
-        // The engine returns a command's output when the command ends, so what
-        // streams is the lifecycle -- started, output, exit -- plus keepalives so
-        // a long command does not look like a dead connection to a proxy.
+        // #34: live chunks. exec_stream runs on this thread and its callback
+        // emits stdout/stderr events as output arrives; a keepalive thread
+        // comments the quiet stretches so a long command does not look like a
+        // dead connection to a proxy. Without an exec_stream op (an older
+        // engine) this falls back to the at-completion shape: the heads go
+        // out as one event per stream, then the exit event as always.
+        sse_live_t L;
+        memset(&L, 0, sizeof(L));
+        L.r = r;
+        L.b64 = b64;
+        L.keepalive_s = s->cfg.keepalive_seconds;
+        pthread_mutex_init(&L.wmu, NULL);
+        pthread_cond_init(&L.wcv, NULL);
         r->keepalive = 0;
         send_head(r, 200, "text/event-stream", -1, "X-Accel-Buffering: no\r\n");
         char d[200];
         snprintf(d, sizeof(d), "{\"session\":\"%s\",\"request_id\":\"%s\"}", x->id, r->rid);
-        sse_event(r, "started", d);
-        pthread_mutex_lock(&j.mu);
-        while (!j.done) {
-            struct timespec dl;
-            clock_gettime(CLOCK_REALTIME, &dl);
-            dl.tv_sec += s->cfg.keepalive_seconds;
-            if (pthread_cond_timedwait(&j.cv, &j.mu, &dl) != 0 && !j.done) {
-                if (write_all(r->c->fd, ": keepalive\n\n", 13) < 0) break;  // client left; still join below
-            }
+        pthread_mutex_lock(&L.wmu);
+        sse_event_locked(&L, "started", d);
+        pthread_mutex_unlock(&L.wmu);
+        if (L.keepalive_s) {
+            if (pthread_create(&L.kat, NULL, sse_keepalive, &L) == 0) L.kat_started = 1;
+            // else: no keepalives, but the stream is still correct.
         }
-        pthread_mutex_unlock(&j.mu);
-        pthread_join(t, NULL);
-        if (j.rc == SANDBOX_OK) {
-            sse_stream(r, "stdout", j.res.out, j.res.out_len, b64);
-            sse_stream(r, "stderr", j.res.err, j.res.err_len, b64);
-            // The final event carries the totals without re-sending the output.
+        long long t0 = mono_ms();
+        sandbox_exec_result_t res;
+        memset(&res, 0, sizeof(res));
+        sandbox_error_t erc;
+        if (s->eng->exec_stream) {
+            erc = s->eng->exec_stream(h, &j.spec, sse_chunk_cb, &L, &res);
+        } else {
+            erc = s->eng->exec(h, &j.spec, &res);
+            pthread_mutex_lock(&L.wmu);
+            if (erc == SANDBOX_OK && !L.dead) {
+                sse_stream_locked(&L, "stdout", res.out, res.out_len);
+                sse_stream_locked(&L, "stderr", res.err, res.err_len);
+            }
+            pthread_mutex_unlock(&L.wmu);
+        }
+        long long ms = mono_ms() - t0;
+        pthread_mutex_lock(&L.wmu);
+        // The final event carries the totals without re-sending the output.
+        if (erc == SANDBOX_OK && !L.dead) sse_live_flush(&L);
+        L.stop = 1;
+        pthread_cond_broadcast(&L.wcv);
+        pthread_mutex_unlock(&L.wmu);
+        if (L.kat_started) pthread_join(L.kat, NULL);
+        pthread_mutex_lock(&L.wmu);
+        if (erc == SANDBOX_OK) {
             jbuf_t e;
             jb_init(&e);
             jb_fmt(&e, "{\"exit_code\":%d,\"term_signal\":%d,\"timed_out\":%s,\"output_truncated\":%s,\"duration_ms\":%lld,\"stdout_bytes\":%llu,\"stderr_bytes\":%llu}",
-                   j.res.exit_code, j.res.term_signal, j.res.timed_out ? "true" : "false",
-                   j.res.output_truncated ? "true" : "false", j.ms, (unsigned long long)j.res.out_total,
-                   (unsigned long long)j.res.err_total);
-            if (!e.oom) sse_event(r, "exit", e.p);
+                   res.exit_code, res.term_signal, res.timed_out ? "true" : "false",
+                   res.output_truncated ? "true" : "false", ms, (unsigned long long)res.out_total,
+                   (unsigned long long)res.err_total);
+            if (!e.oom && !L.dead) sse_event_locked(&L, "exit", e.p);
             jb_free(&e);
-            s->eng->exec_free(&j.res);
+            s->eng->exec_free(&res);
         } else {
             int st; const char* code;
-            map_err(j.rc, &st, &code);
+            map_err(erc, &st, &code);
             jbuf_t b;
             jb_init(&b);
             jb_raw(&b, "{\"code\":");
             jb_cstr(&b, code);
             jb_raw(&b, ",\"message\":");
-            jb_cstr(&b, sandbox_error_string(j.rc));
+            jb_cstr(&b, sandbox_error_string(erc));
             jb_raw(&b, "}");
-            if (!b.oom) sse_event(r, "error", b.p);
+            if (!b.oom && !L.dead) sse_event_locked(&L, "error", b.p);
             jb_free(&b);
         }
+        pthread_mutex_unlock(&L.wmu);
+        pthread_mutex_destroy(&L.wmu);
+        pthread_cond_destroy(&L.wcv);
         sess_release(s, x);
         pthread_mutex_destroy(&j.mu);
         pthread_cond_destroy(&j.cv);
