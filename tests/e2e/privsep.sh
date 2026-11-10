@@ -117,6 +117,10 @@ metrics_bind = 127.0.0.1
 log_level = info
 EOF
 chmod 0644 "$WORK/engine.conf"
+# The workdir itself must be traversable by the daemon user: mktemp -d makes it
+# 0700 root, which silently broke the daemon (config unreadable -> defaults ->
+# wrong helper socket -> 15 s of retries). The dir holds no secrets.
+chmod 0755 "$WORK"
 # The daemon owns its socket, logs, broker socket and volumes -- nothing else.
 chown -R "$DAEMON_USER:$DAEMON_USER" "$WSROOT"
 touch "$WORK/daemon.log" "$WORK/helper.log"
@@ -144,7 +148,7 @@ for i in $(seq 1 100); do
     kill -0 "$DAEMON_PID" 2>/dev/null || { tail -n 20 "$WORK/daemon.log" >&2; echo "daemon exited during startup" >&2; exit 1; }
     sleep 0.1
 done
-[ -S "$SOCK" ] || { echo "daemon socket never appeared" >&2; exit 1; }
+[ -S "$SOCK" ] || { tail -n 20 "$WORK/daemon.log" >&2; echo "daemon socket never appeared" >&2; exit 1; }
 
 [ "$(ps -o user= -p "$DAEMON_PID" | tr -d ' ')" = "$DAEMON_USER" ] && ok "the daemon runs as $DAEMON_USER" || bad "the daemon runs as $DAEMON_USER"
 [ "$(ps -o user= -p "$HELPER_PID" | tr -d ' ')" = "root" ] && ok "the helper runs as root" || bad "the helper runs as root"

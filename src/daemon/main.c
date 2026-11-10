@@ -240,17 +240,27 @@ int main(int argc, char** argv) {
     config_defaults(&cfg);
 
     const char* config_file = NULL;
+    bool config_explicit = false;
     bool do_validate = false;
     for (int i = 1; i < argc; i++) {
         if ((strcmp(argv[i], "--config") == 0 || strcmp(argv[i], "-c") == 0) &&
             i + 1 < argc) {
             config_file = argv[++i];
+            config_explicit = true;
         }
     }
     if (!config_file) {
         // §10.2: the packaged config lives at $SANDBOX_STATE_DIR/config.
         static const char* def = "/var/lib/sandbox-engine/config/engine.conf";
         if (access(def, R_OK) == 0) config_file = def;
+    }
+    // An explicit --config that cannot be read must fail loudly: silently
+    // running on defaults (wrong template, wrong sockets) once cost a whole
+    // CI debug cycle. The packaged default stays optional as before.
+    if (config_explicit && access(config_file, R_OK) != 0) {
+        fprintf(stderr, "[sandboxd] cannot read --config %s: %s\n", config_file,
+                strerror(errno));
+        return 1;
     }
     if (config_file) {
         config_load_file(&cfg, config_file);
