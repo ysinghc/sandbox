@@ -51,8 +51,16 @@ jobs:
         # no lsmod row but owns /sys/module/<name>, so either counts as present.)
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
-          $SUDO modprobe vsock vsock_loopback vhost_vsock
-          lsmod | grep -E '^(vsock|vhost_vsock)' || true
+          # One modprobe per module: modprobe takes a single module name and
+          # treats further words as parameters, so the old one-liner loaded
+          # only vsock and silently skipped the loopback transport (exit 0).
+          for m in vsock vsock_loopback vhost_vsock; do
+            $SUDO modprobe "$m" || {
+              echo "::error::modprobe ${m} failed with exit $?"
+              exit 1
+            }
+          done
+          lsmod | grep -E '^(vsock|vsock_loopback|vhost_vsock)' || true
           for m in vsock vsock_loopback vhost_vsock; do
             lsmod | grep -q "^${m} " || [ -e "/sys/module/${m}" ] || {
               echo "::error::kernel module ${m} is not loaded after modprobe"
