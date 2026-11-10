@@ -311,11 +311,14 @@ jobs:
         if: ${{ inputs.arch == 'x86_64' }}
         run: |
           SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          # The log lives in /tmp (not the workdir): the next run's checkout
+          # wipes the workdir, which made the first failure of this step
+          # undiagnosable after the fact.
           $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
-                bash tests/e2e/privsep.sh 2>&1 | tee privsep.log
-          grep -q 'ALL PASSED' privsep.log
+                bash tests/e2e/privsep.sh 2>&1 | tee /tmp/privsep-e2e.log
+          grep -q 'ALL PASSED' /tmp/privsep-e2e.log
           for p in 'the daemon runs as sandboxd +PASS' 'the pool warms through the helper +PASS' 'exec reaches the guest +PASS' 'session run 2 reads it back +PASS' 'the session volume is sandboxd-owned after destroy +PASS' 'no Firecracker leaks +PASS'; do
-            grep -Eq "$p" privsep.log || { echo "missing PASS line: $p"; exit 1; }
+            grep -Eq "$p" /tmp/privsep-e2e.log || { echo "missing PASS line: $p"; exit 1; }
           done
 
       - name: HTTP control-plane API (root, #27)
