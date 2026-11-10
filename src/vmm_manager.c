@@ -1106,7 +1106,12 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
             // #9: the clone lives in the workspace store (daemon-writable in
             // both paths), not next to the jail (root-owned when the helper
             // spawns). Either way it is outside the chroot, so the jailed
-            // VMM reaches it only through the bind mount.
+            // VMM reaches it only through the bind mount. The dot prefix
+            // keeps it invisible to the session reaper and disk scans.
+            // The store root may not exist yet (tests, first boot without
+            // tmpfiles); the clone needs its parent. Best-effort: a real
+            // failure surfaces from the clone below.
+            mkdir_recursive(workspace_root(), 0755);
             snprintf(ws_scratch, sizeof(ws_scratch), "%s/.ephemeral-%s.ext4",
                      workspace_root(), vm_id);
             unlink(ws_scratch);
