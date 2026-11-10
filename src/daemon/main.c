@@ -17,6 +17,8 @@
 #include "snapshot_manager.h"
 #include "telemetry.h"
 #include "version.h"
+#include "jailer.h"
+#include "privsep.h"
 #include "vmm_manager.h"
 #include "workspace.h"
 
@@ -286,6 +288,9 @@ int main(int argc, char** argv) {
         else if ((strcmp(a, "--snapshot-root") == 0) && v)
             config_set_key_layer(&cfg, "snapshot_root", argv[++i],
                                  CONFIG_LAYER_CLI);
+        else if ((strcmp(a, "--privileged-socket") == 0) && v)
+            config_set_key_layer(&cfg, "privileged_socket", argv[++i],
+                                 CONFIG_LAYER_CLI);
         else if ((strcmp(a, "--log-level") == 0) && v)
             config_set_key_layer(&cfg, "log_level", argv[++i], CONFIG_LAYER_CLI);
         else if (strcmp(a, "--validate-config") == 0) do_validate = true;
@@ -299,7 +304,7 @@ int main(int argc, char** argv) {
                    "[--allowed-services CSV] [--allowed-uids CSV] "
                    "[--metrics-port N] [--metrics-bind ADDR] "
                    "[--jail-root DIR] [--snapshot-root DIR] "
-                   "[--log-level LEVEL] "
+                   "[--privileged-socket PATH] [--log-level LEVEL] "
                    "[--validate-config] [--version]\n");
             return 0;
         }
@@ -319,6 +324,42 @@ int main(int argc, char** argv) {
     apply_paths_to_env(&cfg);
     if (do_validate) return validate_config(&cfg, config_file);
 
+    // #9: an unprivileged daemon cannot spawn without the helper, so one is
+    // mandatory then (defaulting to the packaged socket); a root daemon with
+    // an explicit socket is a configuration mistake -- the helper only serves
+    // non-root peers -- and fails loudly instead of half-working.
+    const char* priv_sock = cfg.privileged_socket[0] ? cfg.privileged_socket
+                                                     : NULL;
+    if (!priv_sock && geteuid() != 0) priv_sock = PRIVSEP_DEFAULT_SOCK;
+    if (priv_sock && geteuid() == 0) {
+        fprintf(stderr,
+                "[sandboxd] --privileged-socket is set but running as root; "
+                "the helper only serves unprivileged daemons\n");
+        return 1;
+    }
+    int priv_fd = -1;
+    if (priv_sock) {
+        // The helper may still be starting (socket unit ordering is
+        // best-effort across reboots); retry briefly, then fail.
+        for (int i = 0; i < 75; i++) {
+            priv_fd = privsep_connect(priv_sock);
+            if (priv_fd >= 0 && privsep_hello(priv_fd) == 0) break;
+            if (priv_fd >= 0) {
+                close(priv_fd);
+                priv_fd = -1;
+            }
+            usleep(200000);
+        }
+        if (priv_fd < 0) {
+            fprintf(stderr,
+                    "[sandboxd] cannot reach sandbox-privileged at %s: %s\n",
+                    priv_sock, strerror(errno));
+            return 1;
+        }
+        vmm_set_privsep_fd(priv_fd);
+        LOGF(LOG_INFO, "daemon", "privsep", "\"socket\":\"%s\"", priv_sock);
+    }
+
     // #31: a daemon that dies without vmm_destroy (SIGKILL, OOM) leaves its
     // jails behind *with their bind mounts*, and mounts outlive the process.
     // rm_rf then fails EBUSY forever: the workspace reaper cannot free the
@@ -327,9 +368,15 @@ int main(int argc, char** argv) {
     // outlived a previous daemon are detected via /proc and left alone.
     {
         int swept = 0;
-        if (vmm_jail_sweep(vmm_jail_root(), JAIL_SWEEP_MIN_AGE_SECONDS,
-                           &swept) == 0 &&
-            swept > 0) {
+        if (priv_fd >= 0) {
+            uint32_t n = 0;
+            if (privsep_sweep(priv_fd, JAIL_SWEEP_MIN_AGE_SECONDS, &n) == 0)
+                swept = (int)n;
+        } else if (jail_sweep(vmm_jail_root(), JAIL_SWEEP_MIN_AGE_SECONDS,
+                              &swept) != 0) {
+            swept = 0;
+        }
+        if (swept > 0) {
             LOGF(LOG_INFO, "daemon", "jail_sweep", "\"removed\":%d", swept);
         }
     }
@@ -354,14 +401,16 @@ int main(int argc, char** argv) {
          "\"template\":\"%s\",\"pool_size\":%d,\"socket\":\"%s\"",
          cfg.template_name, cfg.pool_size, cfg.socket_path);
 
-    if (network_manager_init() < 0) {
+    // #9: through the helper, nftables and the cgroup hierarchy are its
+    // startup work (an unprivileged daemon could not do either).
+    if (priv_fd < 0 && network_manager_init() < 0) {
         fprintf(stderr, "[sandboxd] network_manager_init failed: %s\n",
                 strerror(errno));
         // Non-fatal: a restore that needs the tap will fail per-VM.
     }
 
     // §10.11: set up the per-VM cgroup hierarchy (best-effort).
-    cgroup_init();
+    if (priv_fd < 0) cgroup_init();
 
     // Phase 10.4: prevent the daemon (and every forked jailer) from ever
     // gaining privileges via execve of setuid/file-cap binaries. Capabilities

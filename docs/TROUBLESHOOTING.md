@@ -38,10 +38,13 @@ The guest readiness markers were not seen and the fallback settle expired. Check
 included in the snapshot.
 
 **uFFD not available.**
-`/dev/userfaultfd` missing and `vm.unprivileged_userfaultfd=0`. The daemon runs
-as root and uses `CAP_SYS_PTRACE` to deliver an ambient capability to the VMM;
-verify the capability is present (`systemctl show sandboxd -p
-CapabilityBoundingSet`) and that the kernel exposes userfaultfd.
+`/dev/userfaultfd` missing and `vm.unprivileged_userfaultfd=0`. The daemon is
+unprivileged since #9 and serves faults in-process, so it needs the sysctl
+(`packaging/sysctl.d/sandbox-engine.conf`; check with
+`cat /proc/sys/vm/unprivileged_userfaultfd`). The *helper* still delivers
+`CAP_SYS_PTRACE` as an ambient capability to the VMM; verify it is present
+(`systemctl show sandbox-privileged -p CapabilityBoundingSet`) and that the
+kernel exposes userfaultfd.
 
 **Firecracker fails to bind its API/uffd socket.**
 Unix sockets cannot be created on some network/9p mounts (`EPERM`). Keep

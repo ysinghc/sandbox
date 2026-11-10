@@ -296,6 +296,20 @@ jobs:
           $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
                 bash tests/e2e/smoke.sh
 
+      - name: Privilege separation e2e (root runs it, #9)
+        # The daemon as the sandboxd user through sandbox-privileged: pool
+        # warmup, exec, destroy, session-volume reattach, jail/cgroup/tap
+        # state, and no privileged residue afterwards.
+        if: ${{ inputs.arch == 'x86_64' }}
+        run: |
+          SUDO=""; command -v sudo >/dev/null 2>&1 && [ "$(id -u)" -ne 0 ] && SUDO=sudo
+          $SUDO env SANDBOX_ROOTFS="${SANDBOX_ROOTFS:-}" SANDBOX_KERNEL="${SANDBOX_KERNEL:-}" \
+                bash tests/e2e/privsep.sh 2>&1 | tee privsep.log
+          grep -q 'ALL PASSED' privsep.log
+          for p in 'the daemon runs as sandboxd +PASS' 'the pool warms through the helper +PASS' 'exec reaches the guest +PASS' 'session run 2 reads it back +PASS' 'the session volume is sandboxd-owned after destroy +PASS' 'no Firecracker leaks +PASS'; do
+            grep -Eq "$p" privsep.log || { echo "missing PASS line: $p"; exit 1; }
+          done
+
       - name: HTTP control-plane API (root, #27)
         # sandbox-api in front of the real daemon: create, exec, files both ways,
         # live SSE (#34, timestamped), idempotency, principal isolation, idle VM

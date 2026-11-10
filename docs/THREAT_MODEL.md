@@ -23,15 +23,17 @@
 ```
   assistant / caller            the guest (UNTRUSTED)             host
   ─────────────────             ──────────────────────            ────────────────────
-  libsandbox / HTTP      ──▶    Firecracker ──▶ guest kernel      sandboxd (root)
-  (Unix socket, SO_PEERCRED)    + agent (root in-guest)           ├─ jailer: chroot,
-                                vsock :5001  ◀── host ──▶           ├─ setuid 65534,
-                                                                    ├─ seccomp,
-                                                                    └─ cgroup v2
+  libsandbox / HTTP      ──▶    Firecracker ──▶ guest kernel      sandboxd (sandboxd, no caps)
+  (Unix socket, SO_PEERCRED)    + agent (root in-guest)           ──▶ sandbox-privileged (root)
+                                vsock :5001  ◀── host ──▶           ├─ jailer: chroot,
+                                (daemon-owned UFFD/vsock)          ├─ setuid 65534,
+                                                                   ├─ seccomp,
+                                                                   ├─ cgroup v2,
+                                                                   └─ tap + nftables
                         broker (own uid)  ──▶  upstream (TLS)
 ```
 
-Three boundaries matter:
+Four boundaries matter:
 
 1. **Guest ↔ host (`/dev/kvm`)** — the strong boundary. Firecracker in a
    `chroot` jail, uid 65534, seccomp-filtered, one cgroup, no `/proc` mounted.
@@ -39,6 +41,12 @@ Three boundaries matter:
    (`169.254.0.0/16` /30 per VM, no NAT). Egress is a *policy*, not a filter.
 3. **Caller ↔ engine daemon** — a Unix socket with `SO_PEERCRED` uid
    allow-listing (`allowed_uids`).
+4. **Daemon ↔ helper (#9)** — a `SOCK_SEQPACKET` socket owned by the daemon
+   uid and gated by `SO_PEERCRED` to exactly that uid. The protocol
+   (`include/privsep.h`) is strictly parsed; the helper re-validates every
+   field, derives tap names/argv/binary/cgroup paths itself, and only chowns
+   files the daemon already owns. A compromised daemon can aim privileged
+   operations at its own files, not at the host.
 
 ## 3. Actors and what they can do
 
@@ -132,10 +140,14 @@ principal (per-user principals wait for #17).
 
 ## 5. Residual risk, ranked
 
-1. **#9 — the daemon is one big root TCB (T4/T5/T15).** Every mitigation above
-   runs inside `sandboxd` (root). Splitting the privileged operations into a
-   small helper is what makes the seccomp/capability surface auditable, and
-   lets the jail move to `pivot_root`.
+1. **The helper is the remaining root TCB (#9, was: the whole daemon).**
+   Privileged operations moved into ~900 lines of `sandbox-privileged` plus
+   the shared validators; the audit surface is now the strict parsers
+   (`test_privsep_parse`), the per-op validators, and the ownership checks on
+   the two writable binds. What is *not* covered: a TOCTOU race if the daemon
+   ever gains write access to the snapshot roots (production invariant: the
+   store is operator-written, daemon-read), and `pivot_root` for the jail
+   (still future work).
 2. **T12 — the broker token is not bound to a VM.** The vsock control channel is
    peer-CID authenticated now, but a token stolen inside one sandbox still
    authorises broker requests from any guest that can present it. Real under

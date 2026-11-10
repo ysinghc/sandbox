@@ -194,8 +194,9 @@ static int store_has(const char* digest) {
     return store_dir(digest, p, sizeof(p)) == 0 && lstat(p, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-// Read-only on disk: the daemon runs as root and ignores modes, but a stray
-// non-root tool (or an unprivileged `rm`) must not be able to edit a template.
+// Read-only on disk: templates are world-readable because the daemon runs
+// unprivileged since #9 and reads the store as such, but a stray non-root
+// tool (or an unprivileged `rm`) must not be able to edit one.
 // The directory itself is locked last, after the move into the store: rename(2)
 // needs write permission on a directory it moves (it rewrites its "..").
 static void freeze_files(const char* dir) {

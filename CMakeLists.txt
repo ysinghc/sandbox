@@ -74,6 +74,7 @@ add_library(sandbox SHARED
     src/cgroup.c
     src/log.c
     src/lifecycle.c
+    src/privsep_client.c
     src/egress_policy.c
     src/telemetry.c
     src/guest_rpc_client.c
@@ -160,6 +161,18 @@ target_link_libraries(sandbox_http_api PUBLIC sandbox sandbox_broker_core pthrea
 add_executable(sandbox-api src/http_api/main.c)
 target_link_libraries(sandbox-api sandbox_http_api)
 
+# Privileged helper (#9). Owns taps, nftables, jails, cgroups and VMM
+# processes for the unprivileged daemon; service.c is a library so the strict
+# request parsers are unit-testable without root.
+add_library(sandbox_privsep_service STATIC
+    src/privileged/service.c
+)
+target_include_directories(sandbox_privsep_service PUBLIC include)
+target_link_libraries(sandbox_privsep_service PUBLIC sandbox)
+
+add_executable(sandbox-privileged src/privileged/main.c)
+target_link_libraries(sandbox-privileged sandbox_privsep_service sandbox)
+
 # CLI tool
 add_executable(sandbox-cli
     src/cli/main.c
@@ -178,7 +191,7 @@ set(SANDBOX_STATE_DIR "/var/lib/sandbox-engine" CACHE PATH "Engine state dir")
 set(SANDBOX_ETC_DIR   "/etc/sandbox-engine"     CACHE PATH "Engine config dir")
 set(SANDBOX_RUN_DIR   "/var/run/sandbox-engine" CACHE PATH "Engine runtime dir")
 
-install(TARGETS sandboxd sandbox-broker sandbox-cli sandbox-api
+install(TARGETS sandboxd sandbox-broker sandbox-cli sandbox-api sandbox-privileged
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(TARGETS sandbox sandbox++
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -188,6 +201,7 @@ install(FILES include/libsandbox.h include/libsandbox.hpp
 # Data/runtime directories (§10.2 step 4).
 install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/jail)
 install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/snapshots)
+install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/workspaces)
 install(DIRECTORY DESTINATION ${SANDBOX_STATE_DIR}/config)
 install(DIRECTORY DESTINATION ${SANDBOX_RUN_DIR})
 
@@ -198,9 +212,18 @@ install(FILES config/engine.conf.d/README
         DESTINATION ${SANDBOX_STATE_DIR}/config/engine.conf.d)
 install(FILES config/credentials.conf.example DESTINATION ${SANDBOX_ETC_DIR})
 
-# systemd unit (§10.3).
+# systemd units (§10.3), incl. the privileged helper (#9).
 install(FILES systemd/sandboxd.service systemd/sandbox-api.service
+        systemd/sandbox-privileged.service
         DESTINATION ${CMAKE_INSTALL_LIBDIR}/systemd/system)
+
+# #9: daemon identity, state ownership, and the userfaultfd knob.
+install(FILES packaging/sysusers.d/sandbox-engine.conf
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/sysusers.d)
+install(FILES packaging/tmpfiles.d/sandbox-engine.conf
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/tmpfiles.d)
+install(FILES packaging/sysctl.d/sandbox-engine.conf
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}/sysctl.d)
 
 # Documentation and license.
 install(FILES README.md LICENSE CHANGELOG.md CONTRIBUTING.md

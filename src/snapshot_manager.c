@@ -130,10 +130,8 @@ int write_manifest(const char* path, const snap_manifest_t* manifest) {
 }
 
 // Full load with validation. Returns 0 and *out_manifest on success.
-int read_manifest(const char* template_name, snap_manifest_t** out_manifest) {
-    if (!template_name || !out_manifest) { errno = EINVAL; return -1; }
-    char path[PATH_MAX];
-    snprintf(path, sizeof(path), "%s/%s/manifest.bin", snapshot_root(), template_name);
+int read_manifest_file(const char* path, snap_manifest_t** out_manifest) {
+    if (!path || !out_manifest) { errno = EINVAL; return -1; }
     int fd = open(path, O_RDONLY);
     if (fd < 0) return -1;
     snap_manifest_t hdr;
@@ -176,6 +174,13 @@ int read_manifest(const char* template_name, snap_manifest_t** out_manifest) {
     }
     *out_manifest = m;
     return 0;
+}
+
+int read_manifest(const char* template_name, snap_manifest_t** out_manifest) {
+    if (!template_name || !out_manifest) { errno = EINVAL; return -1; }
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s/%s/manifest.bin", snapshot_root(), template_name);
+    return read_manifest_file(path, out_manifest);
 }
 
 static uint32_t read_version_at(const char* manifest_path) {

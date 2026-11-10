@@ -29,8 +29,9 @@ target_link_libraries(jailer_probe ${SECCOMP_STATIC_LIB})
 target_link_options(jailer_probe PRIVATE -static)
 # A sanitizer build cannot link a fully-static binary (no sanitizer runtime is
 # available statically), which the probe requires to run inside an empty chroot.
-# It is a tiny seccomp harness, so build it unsanitized in sanitizer builds.
-if(SANDBOX_SANITIZE)
+# It is a tiny seccomp harness, so build it unsanitized in sanitizer builds
+# (address/undefined via SANDBOX_SANITIZE, threads via SANDBOX_TSAN).
+if(SANDBOX_SANITIZE OR SANDBOX_TSAN)
     target_compile_options(jailer_probe PRIVATE -fno-sanitize=all)
     target_link_options(jailer_probe PRIVATE -fno-sanitize=all)
 endif()
@@ -215,6 +216,21 @@ target_include_directories(test_ipc_codec PRIVATE ../include ../src)
 target_link_libraries(test_ipc_codec sandbox)
 add_test(NAME ipc_codec COMMAND test_ipc_codec)
 set_tests_properties(ipc_codec PROPERTIES TIMEOUT 30)
+
+# #9: daemon<->helper boundary contract (validation + client transport against
+# a fake helper; no root, no real sockets).
+add_executable(test_privsep test_privsep.c)
+target_include_directories(test_privsep PRIVATE ../include)
+target_link_libraries(test_privsep sandbox pthread)
+add_test(NAME privsep COMMAND test_privsep)
+set_tests_properties(privsep PROPERTIES TIMEOUT 30)
+
+# #9: the helper's strict parsers and reply builders (no root).
+add_executable(test_privsep_parse test_privsep_parse.c)
+target_include_directories(test_privsep_parse PRIVATE ../include)
+target_link_libraries(test_privsep_parse sandbox_privsep_service)
+add_test(NAME privsep_parse COMMAND test_privsep_parse)
+set_tests_properties(privsep_parse PROPERTIES TIMEOUT 30)
 
 # #31: startup sweep of jails left by a crashed daemon. Needs root: it creates
 # bind mounts and chroots a child to stand in for a live VMM.

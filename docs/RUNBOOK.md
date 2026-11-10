@@ -8,15 +8,19 @@ Operational procedures for a production install. Paths use the CMake defaults
 
 | Unit / process | Binary | Listens / talks to |
 |---|---|---|
-| `sandboxd.service` | `/usr/local/bin/sandboxd` | `engine.sock` (clients), `broker-control.sock` (broker), `:9180` (metrics/health) |
+| `sandboxd.service` | `/usr/local/bin/sandboxd` | `engine.sock` (clients), `broker-control.sock` (broker), `:9180` (metrics/health). Runs as `sandboxd` (no caps) since #9; refuses to start unprivileged without the helper. |
 | `sandbox-api.service` | `/usr/local/bin/sandbox-api` | `/run/sandbox-api/api.sock`, `127.0.0.1:8088` (see [API.md](API.md#http-control-plane-api-27)); exits 75 if the daemon is lost and is restarted by systemd. Its tokens file lives at `/etc/sandbox-engine/api-tokens.conf`; mint one with `sandbox-api new-token NAME`. Add the service uid (and any unix-socket callers) to `allowed_uids` |
 | `mcp-gateway.service` | `/usr/local/bin/mcp-gateway` | `127.0.0.1:8090` behind the operator's TLS terminator (see [MCP.md](MCP.md)); exits nonzero on bad config or an unsafe store/token file. State (OAuth registry, 0600): the `--store` file |
 | `sandbox-broker` | `/usr/local/bin/sandbox-broker` | `0.0.0.0:8080` (guests), `broker-control.sock` (engine) |
-| Firecracker | `/usr/local/bin/firecracker` | spawned per VM by sandboxd, jailed + cgroup-limited |
+| Firecracker | `/usr/local/bin/firecracker` | spawned per VM by sandbox-privileged, jailed + cgroup-limited |
+| `sandbox-privileged.service` | `/usr/local/bin/sandbox-privileged` | `/run/sandbox-privileged/helper.sock` (daemon only, `SO_PEERCRED`-gated). Root; mutual `BindsTo=` with `sandboxd.service`, so restarting either restarts both (a daemon restart reuses `vm-*` ids and the helper must forget its child table). |
 
-State: `/var/lib/sandbox-engine/{jail,snapshots,config}`. Config:
+State: `/var/lib/sandbox-engine/{jail,snapshots,workspaces,config}`. Config:
 `/var/lib/sandbox-engine/config/engine.conf`; credentials (broker only, mode
-0600): `/etc/sandbox-engine/credentials.conf`.
+0600): `/etc/sandbox-engine/credentials.conf`. Identity/ownership/knobs ship
+as `packaging/{sysusers.d,tmpfiles.d,sysctl.d}/sandbox-engine.conf`
+(`sandboxd` user, per-writer directory owners,
+`vm.unprivileged_userfaultfd=1` for the daemon's in-process UFFD handler).
 
 ## 2. Daily checks
 
@@ -129,14 +133,38 @@ the token audience.
 ### Cleaning up after a hard stop / crash
 
 Since #31, restarting the daemon reclaims the jails a previous run could not
-clean up: at startup `vmm_jail_sweep()` walks the jail root, detaches each
-stale jail's bind mounts (with `MNT_DETACH`) and removes the directory. It keeps
+clean up: at startup `jail_sweep()` (via the helper's `SWEEP` op since #9)
+walks the jail root, detaches each stale jail's bind mounts (with
+`MNT_DETACH`) and removes the directory. It keeps
 a jail whose directory is younger than `JAIL_SWEEP_MIN_AGE_SECONDS` (5 s, so a
 jailer that is mid-setup is not raced) and one that still has a process rooted
 in it (a VMM that outlived the daemon is still serving its sandbox; killing it
 would be worse than leaking a directory). Each removal is logged as
 `[jail_sweep] reclaimed stale jail vm-N` and counted in the `jail_sweep` daemon
 log event.
+
+### `sandboxd` cannot reach the helper / exits 75
+
+`cannot reach sandbox-privileged at ...` at startup means the helper unit is
+down or the socket path is wrong: `systemctl status
+sandbox-privileged.service`, then check `privileged_socket`
+(`SANDBOX_PRIVILEGED_SOCKET`, `--privileged-socket`, default
+`/run/sandbox-privileged/helper.sock`). A root daemon with that key set fails
+on purpose -- the helper only serves the unprivileged daemon; unset the key
+for in-process development.
+
+Exit 75 mid-run means the helper connection died (`[vmm] helper connection
+lost during ...`): both units restart together via the mutual `BindsTo=`, and
+live guests keep running but are no longer tracked -- the same orphaning a
+daemon restart always caused. Drain (`systemctl stop sandboxd.service`, which
+stops the helper too), `pkill -9 -x firecracker` if any VMM outlived it, then
+start again; the startup sweep reclaims the rest.
+
+`SPAWN ...: Permission denied`-style failures with the helper up usually mean
+ownership drift: session volumes and ephemeral clones must be `sandboxd`-owned
+(the helper hands them back on `TEARDOWN`; a volume left `nobody`-owned by a
+killed helper fails the next attach closed). `chown sandboxd:sandboxd` the
+file and retry.
 
 So the normal recovery is only:
 

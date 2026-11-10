@@ -63,6 +63,7 @@ integrity before starting.
 | `metrics_port` | `SANDBOX_METRICS_PORT` | `9180` | Metrics/health port. |
 | `metrics_bind` | `SANDBOX_METRICS_BIND` | `0.0.0.0` | Metrics bind address; **empty disables** the listener. |
 | `log_level` | `SANDBOX_LOG_LEVEL` | `info` | Structured log threshold: `debug`, `info`, `warn`, `error`. |
+| `privileged_socket` | `SANDBOX_PRIVILEGED_SOCKET` | *(empty; `/run/sandbox-privileged/helper.sock` when unprivileged)* | #9: `sandbox-privileged` socket. Empty + root = spawn in-process (development, CLI capture); set (or any unprivileged run) = route taps/jails/cgroups/VMMs through the helper. A root daemon with this key set refuses to start. |
 
 ## Create concurrency (§10.8)
 
@@ -93,8 +94,8 @@ victim.
 sandboxd [--config FILE] [--socket PATH] [--broker-control PATH]
          [--template NAME] [--pool-size N] [--allowed-services CSV]
          [--allowed-uids CSV] [--metrics-port N] [--metrics-bind ADDR]
-         [--jail-root DIR] [--snapshot-root DIR] [--log-level LEVEL]
-         [--validate-config] [--version]
+         [--jail-root DIR] [--snapshot-root DIR] [--privileged-socket PATH]
+         [--log-level LEVEL] [--validate-config] [--version]
 ```
 
 ## `sandbox-api` options (#27)

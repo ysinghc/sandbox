@@ -1,6 +1,9 @@
+# SPDX-License-Identifier: GPL-2.0-only
 [Unit]
 Description=Sandbox Engine Daemon
-After=network.target
+After=network.target sandbox-privileged.service
+Requires=sandbox-privileged.service
+BindsTo=sandbox-privileged.service
 
 [Service]
 Type=notify
@@ -11,24 +14,25 @@ RestartSec=5s
 WatchdogSec=30s
 StandardError=journal
 
-# Security hardening (Phase 10.4). The daemon runs as root by design (it must
-# build taps, device nodes, and jailed Firecracker processes per VM at runtime),
-# but it sets PR_SET_NO_NEW_PRIVS in-process and never needs to gain privileges.
+# #9: the daemon is unprivileged. All taps, nftables rules, jails, cgroups,
+# and VMM processes are owned by sandbox-privileged (same lifecycle via the
+# mutual BindsTo); the daemon talks to it over the packaged socket, which an
+# unprivileged daemon uses by default. Root execution stays supported for
+# development: without privileged_socket configured, a root daemon spawns
+# in-process exactly as before.
+User=sandboxd
+Group=sandboxd
 NoNewPrivileges=true
 
-# Keep only the capabilities the runtime actually uses, and drop the bounding set
-# around them. All of these are required: SETPCAP for the jailer's bounding-set
-# drop, NET_ADMIN for the per-VM tap, MKNOD/CHOWN for jail device nodes,
-# SYS_ADMIN/SYS_CHROOT/SETUID/SETGID for chroot+uid drop, SYS_PTRACE so the
-# jailer can raise Firecracker's ambient UFFD cap, DAC_OVERRIDE/FOWNER for
-# root-owned jail paths, KILL for reclaiming VMMs.
-CapabilityBoundingSet=CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT \
-    CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SYS_PTRACE \
-    CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+# Runtime sockets (engine.sock, broker-control.sock).
+RuntimeDirectory=sandbox-engine
+RuntimeDirectoryMode=0755
 
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# Workspaces/volumes/scratch live here, as do the jails the daemon binds its
+# per-VM sockets into (0770 group access) and the snapshot store it reads.
 ReadWritePaths=/var/lib/sandbox-engine /var/run/sandbox-engine
 
 # Resource limits (Phase 11). The pool holds a bounded number of VMs; give the

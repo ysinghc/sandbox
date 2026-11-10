@@ -28,7 +28,8 @@ reclaims every sandbox in that session.
 | IPC server | `src/ipc_server.c` | Client-facing socket; async `Create` worker pool, per-session FIFO dispatch, per-session/uid rate limits, session lifecycle. |
 | Pool manager | `src/pool_manager.c` | Keeps `target_size` warm VMs; bounded queue; hands VMs to `Create`. |
 | VMM manager | `src/vmm_manager.c` | Restores a VM from a template, injects env, waits for guest readiness, places the VMM in its cgroup, tracks pidfd/handles. |
-| Jailer | `src/jailer.c` | Creates the jail, chroots, drops uid/gid, applies seccomp, raises the ambient UFFD capability. |
+| Jailer | `src/jailer.c` | Creates the jail, chroots, drops uid/gid, applies seccomp, raises the ambient UFFD capability. Owns jail teardown and the crash sweep (moved from vmm in #9). |
+| Privileged helper | `src/privileged/main.c`, `src/privileged/service.c` | `sandbox-privileged` (#9): the root half of the daemon. Serves taps, nftables, jail setup, cgroups, and VMM spawn/poll/reap over the `include/privsep.h` protocol; the daemon side is `src/privsep_client.c`. |
 | seccomp | `src/seccomp.c` | Builds/loads the Firecracker syscall allow-list. |
 | UFFD handler | `src/uffd_handler.c`, `src/prefault_worker.c` | Serves memory page faults from the snapshot on restore. |
 | Snapshot manager | `src/snapshot_manager.c`, `src/sha256.c` | Template manifest, atomic publish, integrity verification (`sandbox-cli verify`, `--validate-config`). |
@@ -54,6 +55,42 @@ reclaims every sandbox in that session.
    credential on the host, and only through the broker.
 4. **Host ↔ upstream.** The broker is the only component that possesses
    credentials; it verifies upstream TLS by default.
+5. **Daemon ↔ helper (#9).** A `SOCK_SEQPACKET` socket the helper binds
+   `0700` to the daemon uid, gated again by `SO_PEERCRED`: exactly one peer
+   uid may connect, and every request is re-validated (vm-id charset, path
+   roots, daemon-ownership of writable binds, jailed ids ≠ daemon ids).
+
+## Privilege separation (#9)
+
+`sandboxd` runs as the `sandboxd` user with no capabilities; every operation
+that needs privilege -- tap + nftables (`NET_UP`/`NET_DOWN`), jail setup +
+`spawn_jailed` + teardown (`SPAWN`/`TEARDOWN`), cgroup leaves (inside
+`SPAWN`), VMM status/reaping (`POLL`), the crash sweep (`SWEEP`) -- is served
+by the root helper `sandbox-privileged` over the protocol in
+`include/privsep.h` (8-byte header, strict bodies: NUL strings + little-endian
+integers, no trailing bytes). The wire cannot express a tap name, argv, the
+Firecracker path, or cgroup paths: the helper derives them all, so a
+compromised daemon can only aim privileged operations at its own files.
+
+Consequences of the split:
+
+- The helper is the VMM's parent, so only it can reap; the daemon's crash
+  detection (pidfd + epoll) still fires, and `TEARDOWN` reaps. A dead helper
+  connection fails the daemon fast (exit 75) for a supervised restart.
+- Jails are `0770 jailed-uid:sandboxd` and serial logs `0640`, so the daemon
+  keeps the traverse/read access it had as root; the world stays out. Writable
+  binds (session volumes, ephemeral clones) are chowned back to the daemon on
+  `TEARDOWN`, which is what lets the next attach pass the ownership check.
+- The two units share a lifecycle (mutual `BindsTo=`): a daemon restart
+  reuses `vm-*` ids from `vm-1`, so the helper must forget its child table at
+  the same moment. Restarting either restarts both.
+- A root daemon without `privileged_socket` configured keeps the legacy
+  in-process path (development, CLI template capture); template capture stays
+  root-only via `sandbox-cli`.
+- The snapshot store is operator-written and daemon-read (world-readable
+  files); session workspaces and ephemeral clones live in the daemon-owned
+  workspace store; unprivileged `userfaultfd(2)` needs
+  `vm.unprivileged_userfaultfd=1` (shipped as a sysctl fragment).
 
 ## Create lifecycle (§10.8)
 

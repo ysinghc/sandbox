@@ -7,6 +7,29 @@ and §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## [Unreleased]
 
+### Privilege separation (#9)
+
+- **Unprivileged daemon.** `sandboxd` now runs as the `sandboxd` user with no
+  capabilities; taps, nftables, jails, cgroups, and VMM spawn/poll/reap moved
+  to the root helper `sandbox-privileged` over a `SO_PEERCRED`-gated
+  `SOCK_SEQPACKET` protocol (`include/privsep.h`: `HELLO`, `NET_UP/DOWN`,
+  `SPAWN`, `POLL`, `TEARDOWN`, `SWEEP`). The helper re-validates every field
+  and derives tap names, argv, the Firecracker path, and cgroup paths itself.
+- Jails are `0770 jailed-uid:sandboxd` (serial logs `0640`); writable binds
+  are chowned back to the daemon on teardown so sessions re-attach. The two
+  units share a lifecycle (mutual `BindsTo=`); a dead helper fails the daemon
+  fast (exit 75). New `privileged_socket` key (`SANDBOX_PRIVILEGED_SOCKET`,
+  `--privileged-socket`); a root daemon without it keeps the in-process path,
+  and template capture stays root-only via `sandbox-cli`.
+- Packaging: `systemd/sandbox-privileged.service`, hardened
+  `systemd/sandboxd.service` (`User=sandboxd`), sysusers/tmpfiles/sysctl
+  fragments (`packaging/`; incl. `vm.unprivileged_userfaultfd=1` for the
+  daemon's in-process UFFD handler).
+- Tests: `privsep` (64 checks) + `privsep_parse` (38 checks) run unprivileged
+  on hosted CI; `tests/e2e/privsep.sh` proves the split against the real
+  engine on privileged CI (warmup, exec, destroy, session reattach,
+  jail/cgroup/tap state, no residue).
+
 ### Live exec streaming + volume delete (#34)
 
 - **Streaming exec.** `GuestRequest.stream` asks the daemon for one

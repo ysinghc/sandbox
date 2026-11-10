@@ -62,6 +62,9 @@ snap_manifest_t* build_manifest(const char* memory_path);
 int write_manifest(const char* path, const snap_manifest_t* manifest);
 // Full validated load (mallocs *out_manifest). 0 ok, -1 missing/corrupt.
 int read_manifest(const char* template_name, snap_manifest_t** out_manifest);
+// Same, for an explicit path (#9: the helper reads the manifest sitting next
+// to the vmstate file named in a SPAWN request).
+int read_manifest_file(const char* path, snap_manifest_t** out_manifest);
 uint32_t read_manifest_version(const char* template_name);
 bool snapshot_page_present(const snap_manifest_t* manifest, uint64_t offset);
 // Version check: 1 changed (drained), 0 unchanged, -1 no snapshot.

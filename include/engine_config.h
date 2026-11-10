@@ -42,7 +42,7 @@ typedef struct {
     char value[ENGINE_CONFIG_OVAL_MAX];
 } config_overlay_t;
 
-#define ENGINE_CONFIG_NKEYS 22
+#define ENGINE_CONFIG_NKEYS 23
 
 typedef struct {
     char socket_path[ENGINE_CONFIG_PATH_MAX];
@@ -67,6 +67,10 @@ typedef struct {
     int cgroup_slack_mib;        // memory.max headroom over guest size
     char cgroup_cpu_max[ENGINE_CONFIG_VAL_MAX];  // cpu.max ("max" = unlimited)
     char log_level[16];          // §10.12 debug|info|warn|error
+    // #9: helper socket path. "" = spawn in-process (root only); a path (or
+    // the default when unprivileged) routes taps/jails/cgroups through
+    // sandbox-privileged.
+    char privileged_socket[ENGINE_CONFIG_PATH_MAX];
     // #4: scoped overlays and per-key provenance (config_layer_t).
     config_overlay_t overlays[ENGINE_CONFIG_OVERLAYS_MAX];
     int n_overlays;

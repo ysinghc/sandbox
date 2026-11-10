@@ -5,13 +5,14 @@ installed layout, systemd, credentials, templates, and hardening.
 
 ## 1. Host preparation
 
-- **KVM**: `/dev/kvm` must exist and be usable. Add the operator/service user to
-  the `kvm` group if the daemon is not run as root.
-- **userfaultfd**: either `/dev/userfaultfd` is present, or
-  `vm.unprivileged_userfaultfd=1`. The daemon runs as root, so it holds
-  `CAP_SYS_PTRACE` and can use uffd regardless; the capability is delivered as
-  an *ambient* capability to the jailed VMM because `no_new_privs` makes execve
-  ignore file capabilities.
+- **KVM**: `/dev/kvm` must exist. Only the helper (root) and the jailed VMM
+  touch it; the daemon itself never opens `/dev/kvm` and needs no `kvm` group.
+- **userfaultfd**: `vm.unprivileged_userfaultfd=1` (shipped as
+  `packaging/sysctl.d/sandbox-engine.conf`). The daemon serves page faults
+  in-process as the unprivileged `sandboxd` user, so it cannot rely on a
+  capability; `CAP_SYS_PTRACE` is still delivered as an *ambient* capability
+  to the jailed VMM because `no_new_privs` makes execve ignore file
+  capabilities.
 - **Firecracker**: install it at `/usr/local/bin/firecracker` (or set
   `FIRECRACKER_BIN`).
 - **cgroup v2**: mounted at `/sys/fs/cgroup` (unified hierarchy). Per-VM
@@ -29,18 +30,24 @@ Default layout (with the default prefix `/usr/local`):
 
 | Path | Contents |
 | --- | --- |
-| `/usr/local/bin/sandboxd` | Daemon. |
+| `/usr/local/bin/sandboxd` | Daemon (runs as `sandboxd`, #9). |
+| `/usr/local/bin/sandbox-privileged` | Privileged helper: taps, nftables, jails, cgroups, VMMs (#9). |
 | `/usr/local/bin/sandbox-broker` | Credential broker. |
 | `/usr/local/bin/sandbox-cli` | CLI. |
 | `/usr/local/lib/libsandbox.so` | C client library. |
 | `/usr/local/lib/libsandbox++.so` | C++ client library. |
 | `/usr/local/include/libsandbox.h`, `libsandbox.hpp` | Public headers. |
 | `/var/lib/sandbox-engine/config/engine.conf` | Packaged config (daemon default path). |
-| `/var/lib/sandbox-engine/jail/` | Per-VM jail root. |
-| `/var/lib/sandbox-engine/snapshots/` | Template/snapshot store. |
+| `/var/lib/sandbox-engine/jail/` | Per-VM jail root (helper-written). |
+| `/var/lib/sandbox-engine/snapshots/` | Template/snapshot store (operator-written, daemon-read). |
+| `/var/lib/sandbox-engine/workspaces/` | Session volumes + ephemeral clones (`sandboxd`-owned). |
 | `/var/run/sandbox-engine/` | Runtime socket directory. |
 | `/etc/sandbox-engine/credentials.conf.example` | Credential store template. |
 | `/usr/local/lib/systemd/system/sandboxd.service` | systemd unit. |
+| `/usr/local/lib/systemd/system/sandbox-privileged.service` | Helper unit (mutual `BindsTo=` with the daemon). |
+| `/usr/local/lib/sysusers.d/sandbox-engine.conf` | The `sandboxd` user. |
+| `/usr/local/lib/tmpfiles.d/sandbox-engine.conf` | State directory ownership. |
+| `/usr/local/lib/sysctl.d/sandbox-engine.conf` | `vm.unprivileged_userfaultfd=1`. |
 
 State/config/runtime directories are configurable at build time via
 `SANDBOX_STATE_DIR`, `SANDBOX_ETC_DIR`, and `SANDBOX_RUN_DIR`.
@@ -94,16 +101,24 @@ integrity — that is an integrity failure, not necessarily a config error.
 
 ## 6. Hardening notes
 
-The daemon runs as **root by design**: it builds taps, mknod's jail device
-nodes, chroots, and drops uid per VM at runtime. The systemd unit compensates:
+Since #9 the daemon runs as the unprivileged `sandboxd` user with no
+capabilities; the root work (taps, jail device nodes, chroot, uid drops,
+cgroups, VMM reaping) lives in `sandbox-privileged`, which serves exactly one
+peer uid over a `SO_PEERCRED`-gated socket. The units compensate further:
 
-- `NoNewPrivileges=true`; the daemon also sets `PR_SET_NO_NEW_PRIVS` in-process.
-- A tight `CapabilityBoundingSet` (the capabilities the runtime actually uses).
+- `NoNewPrivileges=true` on both; the daemon also sets `PR_SET_NO_NEW_PRIVS`
+  in-process.
+- The helper keeps a tight `CapabilityBoundingSet` (the capabilities the
+  runtime actually uses); the daemon needs none.
 - `ProtectSystem=strict`, `ProtectHome=true`, `PrivateTmp=true`, and
   `ReadWritePaths=/var/lib/sandbox-engine /var/run/sandbox-engine`.
+- Mutual `BindsTo=`: restarting either unit restarts both, so the helper's
+  child table and the daemon's `vm-*` counter can never disagree.
 
 The jailer additionally applies chroot, an unprivileged uid/gid, a seccomp
-allow-list, and per-VM cgroup limits to each Firecracker process.
+allow-list, and per-VM cgroup limits to each Firecracker process. Jails are
+`0770 jailed-uid:sandboxd` (serial logs `0640`): the daemon keeps traverse and
+read access, the world stays out.
 
 **Deviations & open items** (tracked in §15 of
 [`SYSTEM DESIGN.md`](../SYSTEM%20DESIGN.md) and the issue tracker):

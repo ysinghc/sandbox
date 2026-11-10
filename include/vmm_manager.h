@@ -54,7 +54,16 @@ typedef struct vm_handle_t {
     bool destroyed;
     uint32_t page_faults;
     uint64_t resume_time_ms;
+    // #9: the VMM is the helper's child, not ours: lifecycle (poll/kill/
+    // reap, tap, jail, cgroup) goes over the helper connection instead of
+    // syscalls. Set by vmm_restore when it spawns through privsep.
+    bool privsep;
 } vm_handle_t;
+
+// #9: hand vmm the connected helper fd (daemon startup, after HELLO), or -1
+// for the legacy in-process path (root, tests, CLI capture). Not thread-safe
+// by design: call once before the pool starts.
+void vmm_set_privsep_fd(int fd);
 
 // Restore a VM from the configured template via real Firecracker /snapshot/load.
 vm_handle_t* restore_vm_from_snapshot(void);
@@ -102,8 +111,8 @@ int vmm_jail_path(const char* vm_id, char* out, size_t n);
 // Resolved jail root (SANDBOX_JAIL_ROOT or the packaged default). One
 // definition, so the socket path, the sweep and the VMM cannot disagree.
 const char* vmm_jail_root(void);
-int vmm_jail_sweep(const char* jail_root, unsigned min_age_seconds,
-                   int* removed_out);
+// Crash sweep (#31) lives in jailer.h as jail_sweep() in #9 (the privileged
+// helper owns teardown).
 
 // Restore a template into a new jailed VM; net must already exist (tap device
 // by name, retargeted via the load request's network_overrides). UFFD handler

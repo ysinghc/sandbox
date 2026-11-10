@@ -27,6 +27,7 @@
 #include <unistd.h>
 
 #include "sandbox_fs.h"
+#include "jailer.h"
 #include "vmm_manager.h"
 
 static int failures;
@@ -130,7 +131,7 @@ int main(void) {
     close(ready[0]);
 
     int removed = 0;
-    if (vmm_jail_sweep(root, JAIL_SWEEP_MIN_AGE_SECONDS, &removed) != 0) {
+    if (jail_sweep(root, JAIL_SWEEP_MIN_AGE_SECONDS, &removed) != 0) {
         fprintf(stderr, "FAIL: sweep: %s\n", strerror(errno));
         kill(child, SIGKILL);
         return 1;
@@ -154,7 +155,7 @@ int main(void) {
     waitpid(child, NULL, 0);
     backdate(live, 60);
     removed = 0;
-    if (vmm_jail_sweep(root, JAIL_SWEEP_MIN_AGE_SECONDS, &removed) != 0) {
+    if (jail_sweep(root, JAIL_SWEEP_MIN_AGE_SECONDS, &removed) != 0) {
         fprintf(stderr, "FAIL: second sweep: %s\n", strerror(errno));
         return 1;
     }

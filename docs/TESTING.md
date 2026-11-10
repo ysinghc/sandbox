@@ -58,6 +58,8 @@ directory under `/tmp/sbtest-<builddir>/`. Tests that need it declare
 | `json` | no | no | #27 JSON parser/writer: depth and element bounds, surrogates, invalid UTF-8, escaping. |
 | `http_api` | no | no | #27 `sandbox-api` against an in-memory fake engine over real sockets: auth, determinism, validation, cross-principal 404s, exec (all input/encoding forms, error mapping), idempotency, SSE, files, framing limits, concurrency, unix-socket uid identity, idle reclaim, eviction, TTL expiry, start-up refusals. #34: live SSE chunk events (order, reassembly, multi-byte splits, error shape), DELETE purges the volume (409 on busy with the session intact, 204 when already reaped). Also run under ASan/UBSan/TSan. The real-engine half is `tests/e2e/http_api.sh` (root, CI), incl. a timestamped live-stream assertion and delete-then-re-create-empty. |
 | `cpp_wrap` | no | no | C++ wrapper linkage against the C API. |
+| `privsep` | no | no | #9 daemon↔helper boundary contract: shared validators (vm ids, uids, paths, flags), framing strictness, and the client transport against a fake helper. 64 checks. |
+| `privsep_parse` | no | no | #9 helper-side strict request parsers and reply builders: every truncation, missing terminator, and trailing-garbage shape is refused. 38 checks. |
 
 ## CI
 
@@ -112,6 +114,14 @@ signal into noise.
 > forks (`github.event.pull_request.head.repo.full_name == github.repository`)
 > and only ever runs the owner's own branches. Do not remove that guard: a
 > privileged runner plus an untrusted PR is a root compromise.
+
+`tests/e2e/privsep.sh` (#9) runs the daemon as the `sandboxd` user through the
+real helper: pool warmup, exec, destroy, session-volume reattach (which proves
+the `TEARDOWN` chown-back, since a `nobody`-owned volume would fail the next
+`SPAWN`'s ownership check), jail/serial/tap/cgroup state, and no privileged
+residue. It creates the `sandboxd` user idempotently, sets
+`vm.unprivileged_userfaultfd=1` for the run, and asserts the snapshot store is
+world-readable before starting anything.
 
 ### Registering a runner
 

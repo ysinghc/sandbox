@@ -38,7 +38,8 @@ enum {
     KEY_CGROUP_ENABLE,
     KEY_CGROUP_SLACK_MIB,
     KEY_CGROUP_CPU_MAX,
-    KEY_LOG_LEVEL
+    KEY_LOG_LEVEL,
+    KEY_PRIVILEGED_SOCKET
 };
 
 // Map a key or alias to its canonical id, or -1 when unknown.
@@ -73,6 +74,7 @@ static int config_key_id(const char* key) {
     if (strcmp(key, "cgroup_slack_mib") == 0) return KEY_CGROUP_SLACK_MIB;
     if (strcmp(key, "cgroup_cpu_max") == 0) return KEY_CGROUP_CPU_MAX;
     if (strcmp(key, "log_level") == 0) return KEY_LOG_LEVEL;
+    if (strcmp(key, "privileged_socket") == 0) return KEY_PRIVILEGED_SOCKET;
     return -1;
 }
 
@@ -103,6 +105,7 @@ void config_defaults(engine_config_t* c) {
     c->cgroup_slack_mib = 64;
     snprintf(c->cgroup_cpu_max, sizeof(c->cgroup_cpu_max), "%s", "max");
     snprintf(c->log_level, sizeof(c->log_level), "%s", "info");
+    c->privileged_socket[0] = '\0';  // in-process until configured (#9)
 }
 
 void config_set_key_layer(engine_config_t* c, const char* key, const char* val,
@@ -179,6 +182,10 @@ void config_set_key_layer(engine_config_t* c, const char* key, const char* val,
         break;
     case KEY_LOG_LEVEL:
         snprintf(c->log_level, sizeof(c->log_level), "%s", val);
+        break;
+    case KEY_PRIVILEGED_SOCKET:
+        snprintf(c->privileged_socket, sizeof(c->privileged_socket), "%s",
+                 val);
         break;
     }
     c->key_prov[id] = (signed char)layer;
@@ -490,4 +497,6 @@ void config_apply_env(engine_config_t* c) {
         config_set_key_layer(c, "cgroup_cpu_max", v, CONFIG_LAYER_ENV);
     if ((v = getenv("SANDBOX_LOG_LEVEL")) && *v)
         config_set_key_layer(c, "log_level", v, CONFIG_LAYER_ENV);
+    if ((v = getenv("SANDBOX_PRIVILEGED_SOCKET")) && *v)
+        config_set_key_layer(c, "privileged_socket", v, CONFIG_LAYER_ENV);
 }

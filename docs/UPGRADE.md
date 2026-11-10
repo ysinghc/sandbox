@@ -55,7 +55,22 @@ file omits them, but the packaged file is the reference. Re-validate:
 sandboxd --config /var/lib/sandbox-engine/config/engine.conf --validate-config
 ```
 
-## 4. Rebuild templates (required)
+## 4. Adopt the privilege split (#9, when coming from a root daemon)
+
+Apply the shipped identity/ownership/knobs, then hand the workspace store to
+the daemon user -- volumes created by the old root daemon are root-owned, and
+the helper's ownership check would refuse to attach them:
+
+```sh
+sudo systemd-sysusers packaging/sysusers.d/sandbox-engine.conf
+sudo systemd-tmpfiles --create packaging/tmpfiles.d/sandbox-engine.conf
+sudo sysctl --system   # picks up vm.unprivileged_userfaultfd=1
+sudo chown -R sandboxd:sandboxd /var/lib/sandbox-engine/workspaces
+sudo find /var/lib/sandbox-engine/snapshots ! -perm -o+r | head  # must be empty
+sudo systemctl enable sandbox-privileged.service
+```
+
+## 5. Rebuild templates (required)
 
 Because the manifest format is version-bound, templates must be rebuilt with the
 new binaries from their spec (`sudo bash scripts/build-template.sh templates/<name>`,
@@ -70,7 +85,7 @@ sandbox-cli template verify --name python-agent
 If you skip this step, restores fail the integrity check and `/ready` never
 turns green.
 
-## 5. Start and verify
+## 6. Start and verify
 
 ```sh
 sudo systemctl start sandbox-broker.service
@@ -88,7 +103,7 @@ If you vendored `libsandbox++`/`libsandbox`, rebuild/link clients against the ne
 shared library and redeploy the `.so` alongside clients (the install sets
 `INSTALL_RPATH=$ORIGIN/../lib`).
 
-## 6. Rollback
+## 7. Rollback
 
 Keep the previous binaries and a rebuilt-for-the-old-version template set:
 

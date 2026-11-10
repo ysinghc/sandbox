@@ -6,10 +6,18 @@
 #include <stdint.h>
 #include <sys/types.h>
 
+#define JAIL_ROOT_DEFAULT "/var/lib/sandbox-engine/jail"
+#define FC_BIN_DEFAULT "/usr/local/bin/firecracker"
+
 typedef struct {
     uid_t jailer_uid;       // e.g., 65534
     gid_t jailer_gid;       // e.g., 65534
     const char* cgroup_path;  // cgroup.procs file, or NULL to skip placement
+    // #9: the unprivileged daemon's gid (0 = the daemon runs as root). When
+    // set, the jail dir is 0770 jailed-uid:daemon-gid (instead of 0700) and
+    // the serial log 0640, so the daemon keeps the traverse/read access it
+    // had as root while the world stays locked out by the dir gate.
+    gid_t daemon_gid;
 } jailer_config_t;
 
 // Jail-view path of the writable workspace volume (#23). Fixed because the
@@ -46,5 +54,17 @@ int mount_jail_devices(const char* jail_root);  // legacy bind variant (tests)
 int make_jail_devices(const char* jail_root, uid_t uid, gid_t gid);
 int write_cgroup_procs(const char* cgroup_path, pid_t pid);
 int drop_capabilities(void);
+
+// Firecracker binary to copy into the jail: $FIRECRACKER_BIN or the default.
+const char* jailer_firecracker_bin(void);
+
+// Jail lifecycle (moved from vmm_manager.c in #9: the privileged helper owns
+// teardown, so the code lives with the jailer). Detach unmounts every bind,
+// cleanup detaches and removes, sweep reclaims stale non-live "vm-*" jails
+// older than min_age_seconds (#31).
+void jail_detach(const char* jail_root);
+void jail_cleanup(const char* jail_root);
+int jail_sweep(const char* jail_root, unsigned min_age_seconds,
+               int* removed_out);
 
 #endif // JAILER_H

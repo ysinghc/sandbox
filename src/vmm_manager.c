@@ -15,6 +15,7 @@
 
 #include "cgroup.h"
 #include "jailer.h"
+#include "privsep.h"
 #include "sandbox_fs.h"
 #include "sandbox_seccomp.h"
 #include "snapshot_manager.h"
@@ -43,7 +44,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#define FC_BIN_DEFAULT "/usr/local/bin/firecracker"
 #define FC_API_SOCK_JAILVIEW "/api.sock"
 #define FC_UFFD_SOCK_JAILVIEW "/uffd.sock"
 #define FC_KERNEL_JAILVIEW "/vmlinux"
@@ -73,14 +73,37 @@
 
 static atomic_uint_fast32_t next_id = 1;
 
-static const char* fc_bin(void) {
-    const char* e = getenv("FIRECRACKER_BIN");
-    return (e && *e) ? e : FC_BIN_DEFAULT;
+// #9: the helper connection (daemon startup hands it over after HELLO). -1
+// keeps the legacy in-process path: root daemons, unit tests, and the CLI
+// capture flow never set it.
+static int g_privsep_fd = -1;
+
+void vmm_set_privsep_fd(int fd) {
+    g_privsep_fd = fd;
+}
+
+static bool helper_active(void) {
+    return g_privsep_fd >= 0;
+}
+
+// A dead helper is not a per-VM failure: without it no VM can spawn, die, or
+// be reaped, so fail fast for the supervisor (exit 75, as sandbox-api does
+// when the daemon is lost). Operation errors (EINVAL/ENOENT/EAGAIN/the
+// helper's errno) return to the caller instead.
+static void privsep_fatal_if_transport(const char* op) {
+    int e = errno;
+    if (e == EIO || e == ETIMEDOUT || e == ECONNRESET || e == EBADMSG) {
+        fprintf(stderr,
+                "[vmm] helper connection lost during %s (%s); exiting for a "
+                "restart\n",
+                op, strerror(e));
+        _exit(75);
+    }
 }
 
 const char* vmm_jail_root(void) {
     const char* e = getenv("SANDBOX_JAIL_ROOT");
-    return (e && *e) ? e : "/var/lib/sandbox-engine/jail";
+    return (e && *e) ? e : JAIL_ROOT_DEFAULT;
 }
 
 static const char* jail_parent(void) {
@@ -390,120 +413,8 @@ static int wait_for_file(const char* path, int timeout_ms) {
     return -1;
 }
 
-// Every jail-view path spawn_jailed can have bind-mounted. One list, used by
-// both the destroy path and the crash sweep (#31), so they cannot drift: a path
-// added to the jailer but not here would make rm_rf fail EBUSY forever.
-static const char* const JAIL_BINDS[] = {
-    "/dev/kvm", "/dev/net/tun", "/dev/userfaultfd",
-    "/vmlinux", "/rootfs.ext4", "/vmstate", "/memory.snap",
-    "/workspace.ext4",  // #23: live bind, or rm_rf fails
-    "/out",
-};
-static const size_t JAIL_BINDS_N = sizeof(JAIL_BINDS) / sizeof(JAIL_BINDS[0]);
-
-// Detach (lazily) every mount a jail may hold. Safe on paths that are not
-// mounted: umount2 fails EINVAL and that is ignored.
-static void jail_detach(const char* jail_root) {
-    char p[PATH_MAX];
-    for (size_t i = 0; i < JAIL_BINDS_N; i++) {
-        snprintf(p, sizeof(p), "%s%s", jail_root, JAIL_BINDS[i]);
-        umount2(p, MNT_DETACH);
-    }
-}
-
-// Unmount everything spawn_jailed may have bound, then remove the jail.
-static void jail_cleanup(const char* jail_root) {
-    if (!jail_root || !*jail_root) return;
-    jail_detach(jail_root);
-    // Recursive removal in-process: a shell would interpret metacharacters in
-    // jail_root (see the §12.2 audit note).
-    sandbox_rm_rf(jail_root);
-}
-
-// Is some process still rooted in this jail? The jailer chroots before exec, so
-// a live VMM's /proc/<pid>/root *is* the jail directory; nothing else in the
-// engine is ever chrooted there. This is deliberately not a pidfile: a pidfile
-// goes stale exactly when it matters (the pid is reused, or the daemon died
-// before writing it), and the kernel already knows the truth.
-static bool jail_in_use(const char* jail_real) {
-    DIR* proc = opendir("/proc");
-    if (!proc) return false;  // cannot tell: caller keeps the jail
-    bool in_use = false;
-    struct dirent* de;
-    while (!in_use && (de = readdir(proc)) != NULL) {
-        char* end = NULL;
-        long pid = strtol(de->d_name, &end, 10);
-        if (!end || *end || pid <= 0) continue;
-        char link[64], target[PATH_MAX], real[PATH_MAX];
-        snprintf(link, sizeof(link), "/proc/%ld/root", pid);
-        ssize_t n = readlink(link, target, sizeof(target) - 1);
-        if (n <= 0) continue;
-        target[n] = '\0';
-        // A removed-but-open directory reads back as "<path> (deleted)".
-        char* del = strstr(target, " (deleted)");
-        if (del) *del = '\0';
-        const char* cmp = realpath(target, real) ? real : target;
-        if (strcmp(cmp, jail_real) == 0) in_use = true;
-    }
-    closedir(proc);
-    return in_use;
-}
-
-int vmm_jail_sweep(const char* jail_root, unsigned min_age_seconds,
-                   int* removed_out) {
-    if (removed_out) *removed_out = 0;
-    if (!jail_root || !*jail_root) {
-        errno = EINVAL;
-        return -1;
-    }
-    // Sweep what opendir() will actually see: a relative root would otherwise
-    // never match the absolute path read back from /proc/<pid>/root.
-    char root_real[PATH_MAX];
-    if (!realpath(jail_root, root_real)) return errno == ENOENT ? 0 : -1;
-
-    DIR* d = opendir(root_real);
-    if (!d) return -1;
-
-    int64_t now = (int64_t)time(NULL);
-    int removed = 0, live = 0, young = 0;
-    struct dirent* de;
-    while ((de = readdir(d)) != NULL) {
-        // Only our own VM jails. Anything else in the directory (lost+found, an
-        // operator's file) is not ours to delete.
-        if (strncmp(de->d_name, "vm-", 3) != 0) continue;
-        char path[PATH_MAX];
-        if (snprintf(path, sizeof(path), "%s/%s", root_real, de->d_name) >=
-            (int)sizeof(path))
-            continue;
-        struct stat st;
-        if (lstat(path, &st) < 0 || !S_ISDIR(st.st_mode)) continue;
-        // A jailer may be mid-setup (mounts done, chroot not yet): it is not
-        // rooted in the jail yet but is seconds away from being a live VM.
-        if (min_age_seconds &&
-            now - (int64_t)st.st_mtime < (int64_t)min_age_seconds) {
-            young++;
-            continue;
-        }
-        if (jail_in_use(path)) {
-            live++;
-            continue;
-        }
-        jail_detach(path);
-        if (sandbox_rm_rf(path) == 0) {
-            removed++;
-            fprintf(stderr, "[jail_sweep] reclaimed stale jail %s\n", de->d_name);
-        } else {
-            fprintf(stderr, "[jail_sweep] could not remove %s: %s\n", path,
-                    strerror(errno));
-        }
-    }
-    closedir(d);
-    if (live || young)
-        fprintf(stderr, "[jail_sweep] kept %d live, %d in-flight jail(s)\n",
-                live, young);
-    if (removed_out) *removed_out = removed;
-    return 0;
-}
+// Jail teardown and crash sweep (#31) live in jailer.c in #9 (the privileged
+// helper owns them); vmm keeps calling them for the in-process flows.
 
 int vmm_jail_path(const char* vm_id, char* out, size_t n) {
     if (!vm_id || !*vm_id || !out || n == 0) {
@@ -519,6 +430,38 @@ int vmm_jail_path(const char* vm_id, char* out, size_t n) {
 
 static void cold_fail(vm_handle_t* vm) {
     if (!vm) return;
+    if (vm->privsep) {
+        // The VMM is the helper's child: ask how it died (for the log), then
+        // have the helper kill, reap, and reclaim it. Every error here is
+        // tolerated -- we are already failing, and crash residue is the
+        // startup sweep's job.
+        const char* slash = strrchr(vm->jail_root, '/');
+        const char* id = (slash && slash[1]) ? slash + 1 : vm->jail_root;
+        int state = 0, status = 0, termsig = 0, step = 0;
+        if (privsep_poll(g_privsep_fd, id, &state, &status, &termsig, &step) ==
+            0) {
+            if (state == PRIVSEP_POLL_EXITED && step > 0)
+                fprintf(stderr,
+                        "[cold_fail] helper child died at jail step %d "
+                        "(1=mkdir 2=chown 3=copy 4=xattr 5=dev 6=bind 7=cgrp "
+                        "8=serial 9=chroot 10=chdir 11=caps 12=gid 13=uid "
+                        "14=seccomp 15=execve 16=ambient)\n",
+                        step);
+            else if (state == PRIVSEP_POLL_EXITED && termsig > 0)
+                fprintf(stderr, "[cold_fail] helper child killed by signal %d\n",
+                        termsig);
+            else if (state == PRIVSEP_POLL_EXITED)
+                fprintf(stderr, "[cold_fail] helper child exit code %d\n",
+                        status);
+        } else {
+            privsep_fatal_if_transport("poll");
+        }
+        if (privsep_teardown(g_privsep_fd, id) < 0)
+            privsep_fatal_if_transport("teardown");
+        if (vm->workspace_scratch[0]) unlink(vm->workspace_scratch);
+        free(vm);
+        return;
+    }
     if (vm->vmm_pid > 0) {
         // Try WNOHANG first: child may have already exited with a step code
         // (1-15 = jailer step, 15 = execve failed, >15 = Firecracker itself).
@@ -562,7 +505,7 @@ vm_handle_t* vmm_cold_boot(const void* config, const char* vm_id,
     snprintf(vm->jail_root, sizeof(vm->jail_root), "%s", jail_root);
     snprintf(vm->api_sock_path, sizeof(vm->api_sock_path), "%s/api.sock", jail_root);
 
-    jail_files_t files = { .firecracker_bin = fc_bin(),
+    jail_files_t files = { .firecracker_bin = jailer_firecracker_bin(),
                            .kernel_path = cfg->kernel_path,
                            .rootfs_path = cfg->rootfs_path,
                            .snap_state_src = NULL, .snap_mem_src = NULL,
@@ -966,6 +909,27 @@ int vmm_destroy(vm_handle_t* vm) {
         errno = EINVAL;
         return -1;
     }
+    if (vm->privsep) {
+        // The helper owns the child, the tap, the jail, and the cgroup. A
+        // NOT_FOUND here is fine (a crashed helper forgot the VM, or destroy
+        // runs twice); only a dead connection is fatal.
+        if (vm->session_key[0]) vmm_flush_workspace(vm);
+        const char* slash = strrchr(vm->jail_root, '/');
+        const char* id = (slash && slash[1]) ? slash + 1 : vm->jail_root;
+        if (privsep_teardown(g_privsep_fd, id) < 0)
+            privsep_fatal_if_transport("teardown");
+        uffd_stop(vm);
+        if (vm->has_net) {
+            if (privsep_net_down(g_privsep_fd, id) < 0)
+                privsep_fatal_if_transport("net_down");
+            vm->has_net = false;
+        }
+        vm->vmm_pid = -1;
+        if (vm->workspace_scratch[0]) unlink(vm->workspace_scratch);
+        if (vm->session_key[0]) workspace_release(vm->session_key);
+        free(vm);
+        return 0;
+    }
     if (vm->vmm_pid > 0) {
         // #23: a session volume must be durable before the guest is killed (see
         // vmm_flush_workspace). Only sessions have one to lose.
@@ -1094,54 +1058,34 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     vm->sandbox_id = atomic_fetch_add(&next_id, 1);
     vm->vmm_pid = -1;
     vm->uffd_fd = -1;
+    vm->privsep = helper_active();
     char jail_root[PATH_MAX];
     snprintf(jail_root, sizeof(jail_root), "%s/%s", jail_parent(), vm_id);
     snprintf(vm->jail_root, sizeof(vm->jail_root), "%s", jail_root);
     snprintf(vm->api_sock_path, sizeof(vm->api_sock_path), "%s/api.sock", jail_root);
     char uds_host[PATH_MAX];
     snprintf(uds_host, sizeof(uds_host), "%s/uffd.sock", jail_root);
-    // A previous run killed before vmm_destroy can leave a stale jail whose
-    // api.sock Firecracker cannot rebind (connect then fails ECONNREFUSED
-    // forever, and wait_for_file passes on the stale file). Clear it first.
-    jail_cleanup(jail_root);
-    // 0700: the jail holds the per-VM vsock UDS (env injection channel); only
-    // root and the jailed uid may traverse it (Phase 10.3).
-    if (mkdir_recursive(jail_root, 0700) < 0) {
-        free(manifest);
-        free(vm);
-        return NULL;
+    if (!vm->privsep) {
+        // A previous run killed before vmm_destroy can leave a stale jail
+        // whose api.sock Firecracker cannot rebind (connect then fails
+        // ECONNREFUSED forever, and wait_for_file passes on the stale file).
+        // Clear it first. (Through the helper, SPAWN does this.)
+        jail_cleanup(jail_root);
+        // 0700: the jail holds the per-VM vsock UDS (env injection channel);
+        // only root and the jailed uid may traverse it (Phase 10.3).
+        if (mkdir_recursive(jail_root, 0700) < 0) {
+            free(manifest);
+            free(vm);
+            return NULL;
+        }
     }
     uint64_t t_prep = now_ms();
+    // The UFFD handler socket is bound after the spawn, once the jail exists
+    // in both paths (the helper creates it during SPAWN). Faults only start
+    // at /snapshot/load, so "listening before load" still holds.
+    int listen_fd = -1;
 
-    // Handler UDS: listening before load so no fault is ever unhandled.
-    int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (listen_fd < 0) {
-        free(manifest);
-        free(vm);
-        return NULL;
-    }
-    struct sockaddr_un uaddr;
-    memset(&uaddr, 0, sizeof(uaddr));
-    uaddr.sun_family = AF_UNIX;
-    snprintf(uaddr.sun_path, sizeof(uaddr.sun_path), "%s", uds_host);
-    unlink(uds_host);
-    if (bind(listen_fd, (struct sockaddr*)&uaddr, sizeof(uaddr)) < 0 ||
-        listen(listen_fd, 1) < 0) {
-        close(listen_fd);
-        free(manifest);
-        free(vm);
-        return NULL;
-    }
-    // Firecracker connects as the jailed uid; the socket lives in the jail.
-    if (chmod(uds_host, 0777) < 0) {
-        close(listen_fd);
-        free(manifest);
-        free(vm);
-        return NULL;
-    }
-    uint64_t t_listen = now_ms();
-
-    jail_files_t files = { .firecracker_bin = fc_bin(), .kernel_path = NULL,
+    jail_files_t files = { .firecracker_bin = jailer_firecracker_bin(), .kernel_path = NULL,
                            .rootfs_path = NULL, .snap_state_src = state_src,
                            .snap_mem_src = mem_src, .out_dir = NULL };
     // Rootfs backing must exist at the same jail path as at capture time.
@@ -1159,12 +1103,16 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         if (workspace_image) {
             files.workspace_path = workspace_image;
         } else {
-            snprintf(ws_scratch, sizeof(ws_scratch), "%s.workspace.ext4", jail_root);
+            // #9: the clone lives in the workspace store (daemon-writable in
+            // both paths), not next to the jail (root-owned when the helper
+            // spawns). Either way it is outside the chroot, so the jailed
+            // VMM reaches it only through the bind mount.
+            snprintf(ws_scratch, sizeof(ws_scratch), "%s/.ephemeral-%s.ext4",
+                     workspace_root(), vm_id);
             unlink(ws_scratch);
             if (workspace_clone(ws_base, ws_scratch) < 0) {
                 fprintf(stderr, "[vmm_restore] cannot clone workspace base %s: %s\n",
                         ws_base, strerror(errno));
-                close(listen_fd);
                 free(manifest);
                 free(vm);
                 return NULL;
@@ -1179,8 +1127,9 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
     snprintf(serial, sizeof(serial), "%s/serial.log", jail_root);
     // §10.11: per-VM cgroup (memory/CPU limits + OOM isolation). The jailer
     // writes cgroup.procs before chroot, so the VMM lands in its own group.
+    // (Through the helper, SPAWN derives the same limits from the manifest.)
     char cg_procs[PATH_MAX] = "";
-    if (cgroup_enabled()) {
+    if (!vm->privsep && cgroup_enabled()) {
         cgroup_limits_t clim;
         memset(&clim, 0, sizeof(clim));
         uint64_t mem_mib = manifest->guest_mem_size / (1024 * 1024);
@@ -1198,37 +1147,104 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
                      vm->cgroup_dir);
         }
     }
-    jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
-                             .cgroup_path = cg_procs[0] ? cg_procs : NULL };
-    char* argv[8];
-    int ai = 0;
-    argv[ai++] = (char*)"/firecracker";
-    argv[ai++] = (char*)"--api-sock"; argv[ai++] = (char*)"/api.sock";
-    argv[ai++] = (char*)"--id"; argv[ai++] = (char*)vm_id;
-    argv[ai++] = (char*)"--no-seccomp";
-    if (pci_enabled()) argv[ai++] = (char*)"--enable-pci";
-    argv[ai++] = NULL;
-    bool seccomp = getenv("SANDBOX_FC_SECCOMP") == NULL ||
-                   strcmp(getenv("SANDBOX_FC_SECCOMP"), "0") != 0;
-    pid_t pid = spawn_jailed(jail_root, &jcfg, "/firecracker", argv, true, seccomp,
-                             &files, serial);
-    if (pid <= 0) {
-        close(listen_fd);
-        free(manifest);
-        free(vm);
-        return NULL;
+    pid_t pid = -1;
+    if (vm->privsep) {
+        // The helper builds the identical argv, jail, and cgroup from these
+        // fields; the wire carries no tap name, binary path, or cgroup
+        // (all derived helper-side), and the jailed identity must differ
+        // from the daemon's (enforced on both ends).
+        uint32_t sflags = 0;
+        if (getenv("SANDBOX_FC_SECCOMP") == NULL ||
+            strcmp(getenv("SANDBOX_FC_SECCOMP"), "0") != 0)
+            sflags |= PRIVSEP_SPAWN_SECCOMP;
+        if (pci_enabled()) sflags |= PRIVSEP_SPAWN_PCI;
+        privsep_spawn_args_t sargs = {
+            .vm_id = vm_id,
+            .jailer_uid = (uint32_t)jailer_uid(),
+            .jailer_gid = (uint32_t)jailer_gid(),
+            .flags = sflags,
+            .kernel = files.kernel_path,
+            .rootfs = files.rootfs_path,
+            .vmstate = files.snap_state_src,
+            .mem = files.snap_mem_src,
+            .workspace = files.workspace_path,
+            .outdir = files.out_dir,
+            .serial = serial,
+        };
+        int jail_step = 0;
+        if (privsep_spawn(g_privsep_fd, &sargs, snapshot_parent(),
+                          workspace_root(), jail_parent(), &pid,
+                          &jail_step) < 0) {
+            int e = errno;
+            privsep_fatal_if_transport("spawn");
+            fprintf(stderr, "[vmm_restore] helper SPAWN %s: %s\n", vm_id,
+                    strerror(e));
+            free(manifest);
+            free(vm);
+            errno = e;
+            return NULL;
+        }
+    } else {
+        jailer_config_t jcfg = { .jailer_uid = jailer_uid(), .jailer_gid = jailer_gid(),
+                                 .cgroup_path = cg_procs[0] ? cg_procs : NULL };
+        char* argv[8];
+        int ai = 0;
+        argv[ai++] = (char*)"/firecracker";
+        argv[ai++] = (char*)"--api-sock"; argv[ai++] = (char*)"/api.sock";
+        argv[ai++] = (char*)"--id"; argv[ai++] = (char*)vm_id;
+        argv[ai++] = (char*)"--no-seccomp";
+        if (pci_enabled()) argv[ai++] = (char*)"--enable-pci";
+        argv[ai++] = NULL;
+        bool seccomp = getenv("SANDBOX_FC_SECCOMP") == NULL ||
+                       strcmp(getenv("SANDBOX_FC_SECCOMP"), "0") != 0;
+        pid = spawn_jailed(jail_root, &jcfg, "/firecracker", argv, true, seccomp,
+                           &files, serial);
+        if (pid <= 0) {
+            free(manifest);
+            free(vm);
+            return NULL;
+        }
     }
     uint64_t t_spawn = now_ms();
     vm->vmm_pid = pid;
     if (wait_for_file(vm->api_sock_path, FC_FILE_WAIT_MS) < 0) {
         fprintf(stderr, "[vmm_restore] FAIL: wait_for_file(%s) errno=%d\n", vm->api_sock_path, errno);
-        close(listen_fd);
         cold_fail(vm);
         free(manifest);
         return NULL;
     }
     uint64_t t_sock = now_ms();
     fprintf(stderr, "[vmm_restore] api.sock ready: %s\n", vm->api_sock_path);
+
+    // Handler UDS: listening before load so no fault is ever unhandled. Bound
+    // here (not before the spawn) so the jail exists in both paths; faults
+    // only start at /snapshot/load below.
+    listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        cold_fail(vm);
+        free(manifest);
+        return NULL;
+    }
+    struct sockaddr_un uaddr;
+    memset(&uaddr, 0, sizeof(uaddr));
+    uaddr.sun_family = AF_UNIX;
+    snprintf(uaddr.sun_path, sizeof(uaddr.sun_path), "%s", uds_host);
+    unlink(uds_host);
+    if (bind(listen_fd, (struct sockaddr*)&uaddr, sizeof(uaddr)) < 0 ||
+        listen(listen_fd, 1) < 0) {
+        close(listen_fd);
+        cold_fail(vm);
+        free(manifest);
+        return NULL;
+    }
+    // Firecracker connects as the jailed uid; the socket lives in the jail.
+    if (chmod(uds_host, 0777) < 0) {
+        close(listen_fd);
+        cold_fail(vm);
+        free(manifest);
+        return NULL;
+    }
+    uint64_t t_listen = now_ms();
 
     // Firecracker faults on guest memory *during* /snapshot/load (it writes
     // boot/device state into the registered region and blocks in the kernel on
@@ -1296,14 +1312,14 @@ vm_handle_t* vmm_restore(const char* template_name, const char* vm_id,
         return NULL;
     }
     uint64_t t_resume = now_ms();
-    fprintf(stderr, "[vmm_restore] time total=%lums prep=%lums listen=%lums "
-                    "spawn=%lums sock=%lums load=%lums resume=%lums\n",
+    fprintf(stderr, "[vmm_restore] time total=%lums prep=%lums spawn=%lums "
+                    "sock=%lums listen=%lums load=%lums resume=%lums\n",
             (unsigned long)(t_resume - t_enter),
             (unsigned long)(t_prep - t_enter),
-            (unsigned long)(t_listen - t_prep),
-            (unsigned long)(t_spawn - t_listen),
+            (unsigned long)(t_spawn - t_prep),
             (unsigned long)(t_sock - t_spawn),
-            (unsigned long)(t_load - t_sock),
+            (unsigned long)(t_listen - t_sock),
+            (unsigned long)(t_load - t_listen),
             (unsigned long)(t_resume - t_load));
     return vm;
 }
@@ -1341,12 +1357,27 @@ vm_handle_t* restore_vm_with_workspace(const char* workspace_image) {
     uint64_t t_net0 = now_ms();
     vm_network_t net;
     memset(&net, 0, sizeof(net));
-    if (network_setup(vm_id, &net) < 0) return NULL;
+    net.tap_fd = -1;
+    if (helper_active()) {
+        uint32_t host_ip = 0;
+        if (privsep_net_up(g_privsep_fd, vm_id, net.tap_name,
+                           sizeof(net.tap_name), &host_ip, &net.guest_ip) < 0) {
+            privsep_fatal_if_transport("net_up");
+            return NULL;
+        }
+    } else if (network_setup(vm_id, &net) < 0) {
+        return NULL;
+    }
     uint64_t t_net = now_ms();
     vm_handle_t* vm = vmm_restore(g_template, vm_id, net.tap_name, net.guest_ip,
                                   workspace_image);
     if (!vm) {
-        network_cleanup(&net);
+        if (helper_active()) {
+            if (privsep_net_down(g_privsep_fd, vm_id) < 0)
+                privsep_fatal_if_transport("net_down");
+        } else {
+            network_cleanup(&net);
+        }
         return NULL;
     }
     uint64_t t_done = now_ms();

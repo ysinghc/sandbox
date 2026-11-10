@@ -37,6 +37,7 @@ int main(void) {
     CHECK(c.jailer_uid == 65534 && c.jailer_gid == 65534, "default jailer ids");
     CHECK(c.metrics_port == 9180, "default metrics port");
     CHECK_STR(c.metrics_bind, "0.0.0.0", "default metrics bind");
+    CHECK_STR(c.privileged_socket, "", "default privileged_socket");
 
     // 2. A synthetic file with [sections], comments and every key.
     const char* tmp = "/tmp/sbtest-config-XXXXXX";
@@ -70,6 +71,7 @@ int main(void) {
         "[paths]\n"
         "jail_root = /var/j\n"
         "snapshot_root = /var/s\n"
+        "privileged_socket = /run/p.sock\n"
         "[metrics]\n"
         "metrics_port = 9090\n"
         "metrics_bind = 0.0.0.0\n"
@@ -100,6 +102,7 @@ int main(void) {
     CHECK_STR(c.allowed_services, "a.example, b.example", "file allowed_services");
     CHECK_STR(c.jail_root, "/var/j", "file jail_root");
     CHECK_STR(c.snapshot_root, "/var/s", "file snapshot_root");
+    CHECK_STR(c.privileged_socket, "/run/p.sock", "file privileged_socket");
     CHECK(c.metrics_port == 9090, "file metrics_port");
     CHECK_STR(c.metrics_bind, "0.0.0.0", "file metrics_bind");
 
@@ -131,11 +134,14 @@ int main(void) {
     config_defaults(&c);
     setenv("SANDBOX_POOL_SIZE", "3", 1);
     setenv("SANDBOX_TEMPLATE", "envtmpl", 1);
+    setenv("SANDBOX_PRIVILEGED_SOCKET", "/run/e.sock", 1);
     config_apply_env(&c);
     CHECK(c.pool_size == 3, "env pool_size");
     CHECK_STR(c.template_name, "envtmpl", "env template");
+    CHECK_STR(c.privileged_socket, "/run/e.sock", "env privileged_socket");
     unsetenv("SANDBOX_POOL_SIZE");
     unsetenv("SANDBOX_TEMPLATE");
+    unsetenv("SANDBOX_PRIVILEGED_SOCKET");
 
     // 5. conf.d drop-ins: base < drop-ins, later files win in byte order.
     char dir_template[] = "/tmp/sbtest-confdir-XXXXXX";

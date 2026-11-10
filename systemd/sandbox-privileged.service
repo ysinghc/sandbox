@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# sandbox-privileged (#9): the root half of the daemon. Owns taps, nftables
+# rules, jail setup/teardown, cgroups, and VMM processes for the unprivileged
+# sandboxd, over a SOCK_SEQPACKET socket that only the daemon uid may use.
+#
+# The two units live and die together (mutual BindsTo with sandboxd.service):
+# a daemon restart reuses vm ids from vm-1, so the helper must forget its
+# child table at the same moment, and a dead helper leaves the daemon unable
+# to spawn, kill, or reap.
+[Unit]
+Description=Sandbox Engine Privileged Helper
+After=network.target
+BindsTo=sandboxd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sandbox-privileged --daemon-user sandboxd
+Restart=on-failure
+RestartSec=5s
+StandardError=journal
+
+# Root by design (taps, mounts, chroot, uid transitions, kill/reap), but the
+# process never execs anything except the jailed Firecracker it spawns, and it
+# serves exactly one peer uid.
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_SETPCAP CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_CHROOT \
+    CAP_MKNOD CAP_CHOWN CAP_SETUID CAP_SETGID CAP_SYS_PTRACE \
+    CAP_DAC_OVERRIDE CAP_FOWNER CAP_KILL
+
+# The helper socket; mode 0700 root-owned, then chown'd to the daemon uid by
+# the helper itself at startup.
+RuntimeDirectory=sandbox-privileged
+RuntimeDirectoryMode=0755
+
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/sandbox-engine /sys/fs/cgroup
+
+[Install]
+WantedBy=multi-user.target
