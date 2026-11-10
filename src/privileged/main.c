@@ -492,6 +492,13 @@ static void serve(int conn, const helper_config_t* cfg) {
     static uint8_t in[PRIVSEP_MAX_MSG];
     static uint8_t out[PRIVSEP_MAX_MSG];
     for (;;) {
+        // The daemon holds this connection for its whole lifetime, so reaping
+        // cannot wait for the accept loop: drain exits between RPCs (the flag
+        // test is free when nothing died).
+        while (g_sigchld) {
+            g_sigchld = 0;
+            reap_children();
+        }
         struct iovec iov = { in, sizeof(in) };
         struct msghdr mh;
         memset(&mh, 0, sizeof(mh));
@@ -659,8 +666,9 @@ int main(int argc, char** argv) {
             (unsigned)cfg.daemon_uid, cfg.daemon_user, cfg.jail_root);
     for (;;) {
         // Reap between connections; a connection's own waiters (POLL,
-        // TEARDOWN) reap inside serve().
-        if (g_sigchld) {
+        // TEARDOWN) reap inside serve(). The loop (not an if) closes the
+        // flag race: a death during the reap re-arms and is collected too.
+        while (g_sigchld) {
             g_sigchld = 0;
             reap_children();
         }
