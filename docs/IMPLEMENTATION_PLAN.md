@@ -341,8 +341,10 @@ and pickled/untrusted guest input (prompt injection).
 ### #2 — Chroot-escape regression test
 `src/jailer.c` uses `chroot()` + `chdir("/")` (**not** `pivot_root`, C2). Test
 `tests/e2e/chroot_escape.sh` (root): assert a `..` traversal stays at `/`, and
-assert the fd-based escape also fails once #9 reduces the inherited fd set.
-Document that `pivot_root` is the stronger primitive and evaluate it in #9.
+assert the fd-based escape also fails. (#9 landed without changing fd
+inheritance — the VMM now inherits the helper's smaller fd set instead of the
+daemon's — and without evaluating `pivot_root`; both remain open, and
+`pivot_root` is still the stronger primitive.)
 
 ### #3 — Reject unsafe `credentials.conf` mode/ownership
 The load path is `src/broker/credentials.c` (`credentials_load`) reached from
@@ -569,11 +571,12 @@ Done     #31 crash-left jails: startup sweep, liveness via /proc/<pid>/root, pri
          ctest jail_sweep green on x86_64 *and* aarch64
 Done     #12 request correlation: request_id echoed, per-session create serialization
          removed for id-carrying requests, libsandbox reader thread, ctest ipc_codec
-Next     #32 Debian guest image + /workspace — the visible milestone; everything below
-         is easier to judge once the guest is a real userland
-         → #24 guest RPC (exec/files) → #7 broker streaming → #26 egress policy
-         → #25 template pipeline → #27 control-plane API → #28 MCP gateway
-         → #4 config layer → #17, #9, #11, #13, #14, #15, #18, #16
+Done     #32 Debian guest image + /workspace · #24 guest RPC (exec/files) ·
+         #7 broker streaming · #26 egress policy · #25 template pipeline ·
+         #27 control-plane API · #28 MCP gateway · #4 config layer ·
+         #34 live exec streaming + volume delete
+Next     #9 privilege separation (landed; awaiting the green privileged run),
+         then #17 multi-tenant isolation → #11 quotas → #13, #14, #15, #18, #16
 Done     #33 pin a current guest kernel (6.18.54, digest-checked): CI fetches it per
          run instead of using the runner's 4.14; VMGenID reseed verified on restore
 Deferred #30 ARM milestone: guest-local vsock (CONFIG_VSOCKETS_LOOPBACK is off in

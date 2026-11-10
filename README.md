@@ -60,13 +60,18 @@ latency dominate. Sandbox Engine front-loads that work:
                                           | protobuf over AF_UNIX
                                           v
             +-------------------------------------------------------------+
- daemon     |  sandboxd                                                    |
+ daemon     |  sandboxd (unprivileged `sandboxd` user, no caps)          |
             |   - IPC server (async Create worker pool, per-session FIFO)  |
             |   - pool manager (warm VMs, bounded depth)                   |
-            |   - vmm manager   (restore, env inject, cgroup placement)    |
-            |   - jailer        (chroot + seccomp + uid drop)              |
+            |   - vmm manager   (restore via helper, env inject)           |
             |   - uffd handler  (demand paging from the snapshot)          |
             |   - vsock + telemetry (/health /ready /metrics)             |
+            +----------------------------+--------------------------------+
+                   | privsep RPC (SO_PEERCRED-gated socket)
+                   v
+ helper     |  sandbox-privileged (root)                                   |
+            |   - tap/nftables, jail setup (chroot+seccomp+uid drop),      |
+            |     cgroup placement, VMM spawn/reap/sweep                  |
             +------+--------------------------+---------------------------+
                    | restore/jail             | validate tokens
                    v                          v
@@ -86,7 +91,10 @@ Trust boundaries and the full component/behavior model live in
 - **Linux, x86_64 or aarch64** with **KVM** (`/dev/kvm`) and
   **userfaultfd** (`/dev/userfaultfd` or `vm.unprivileged_userfaultfd=1`).
   Verified on Ubuntu 24.04 (aarch64, Raspberry Pi 5).
-- **Root** for the daemon (it creates taps, device nodes, cgroups, and jails).
+- An unprivileged **`sandboxd` user** for the daemon, plus the root helper
+  **`sandbox-privileged`** (it creates taps, device nodes, cgroups, and jails
+  over a `SO_PEERCRED`-gated socket; see `privileged_socket`). A root daemon
+  without `privileged_socket` keeps the legacy in-process path for development.
 - Build dependencies:
   - a C11/C++17 toolchain (`gcc`/`clang`), `cmake >= 3.20`
   - `libprotobuf-dev`, `protobuf-compiler`, `libprotoc-dev`
@@ -120,8 +128,8 @@ sudo -E env SANDBOX_SNAPSHOT_ROOT=/var/lib/sandbox-engine/snapshots \
   build/tests/make_template
 sudo sandbox-cli verify --template e2e
 
-# 4. Start the daemon and the broker
-sudo systemctl enable --now sandboxd
+# 4. Start the daemon, its privileged helper, and the broker
+sudo systemctl enable --now sandboxd sandbox-privileged
 sudo sandbox-broker &
 
 # 5. Create a sandbox (the CLI holds the session open until Ctrl-C)
@@ -177,7 +185,8 @@ Full API, wire protocol, and broker behavior: [`docs/API.md`](docs/API.md).
 
 | Tool | Purpose |
 | --- | --- |
-| `sandboxd` | The daemon. `--config FILE`, `--socket PATH`, `--validate-config`, `--version`. |
+| `sandboxd` | The daemon (unprivileged `sandboxd` user). `--config FILE`, `--socket PATH`, `--privileged-socket PATH`, `--validate-config`, `--version`. |
+| `sandbox-privileged` | Root helper serving taps/nftables/jails/cgroups/VMM spawn+reap to the daemon (`--daemon-user`, `--socket`); same lifecycle as `sandboxd` via mutual `BindsTo=`. |
 | `sandbox-cli` | `run --template NAME [--socket PATH] [--memory MiB] [--vcpus N] [--wait MS]`; `verify --template NAME`. |
 | `sandbox-broker` | Credential-injecting HTTPS proxy for guests (separate process/uid). |
 
@@ -217,12 +226,11 @@ broker, pool, cgroups, snapshot integrity, structured logging, metrics, and CLI
 are implemented and covered by the test suite (see `docs/TESTING.md`). The
 privileged tests (jailer, seccomp, real VM restore, vsock IPC, cgroup, nftables)
 now run in CI on a self-hosted KVM host rather than being skipped, and the job
-fails if any of them skips. Items still open — hierarchical config, aarch64
-arch-timer restore, workspace/TTL, and the V2 hardening backlog (privilege
-separation, per-tenant quotas) — are tracked in
-[`docs/IMPLEMENTATION_LOG.md`](docs/IMPLEMENTATION_LOG.md), the issue tracker,
-and §12.2/§13 of the design. Deviations from the original design are recorded in
-§15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
+fails if any of them skips. The daemon is unprivileged since #9 (privilege
+separation via `sandbox-privileged`). Items still open — per-tenant quotas
+(#11), the V2 backlog (#13–#18), and ARM (#30, deferred) — are tracked in
+the issue tracker and §12.2/§13 of the design. Deviations from the original
+design are recorded in §15 of [`SYSTEM DESIGN.md`](SYSTEM%20DESIGN.md).
 
 ## License
 

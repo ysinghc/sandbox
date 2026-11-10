@@ -104,7 +104,7 @@ by hand). Per architecture (`<arch>` is `x86_64` or `aarch64`):
 |---|---|
 | `sandbox-engine-<ver>-linux-<arch>.tar.gz` | staged install tree (the "zip") |
 | `sandbox-engine-<ver>-linux-<arch>-bin.tar.gz` | bare binaries + shared libraries |
-| `sandboxd-linux-<arch>`, `sandbox-cli-linux-<arch>`, … | standalone binaries |
+| `sandboxd-linux-<arch>`, `sandbox-privileged-linux-<arch>`, `sandbox-cli-linux-<arch>`, … | standalone binaries (the helper plus its units and `packaging/{sysusers,tmpfiles,sysctl}.d` files ship in the staged tree) |
 | `*.sha256` | checksums for the two archives |
 
 aarch64 assets are built **natively** on `ubuntu-24.04-arm` — there is no

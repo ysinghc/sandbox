@@ -90,7 +90,9 @@ digests, sizes) is metadata and is not part of the identity.
 
 - **Immutable.** A published directory is never modified; it is made read-only,
   and `sandbox-cli template verify --name <name|digest>` re-hashes every payload and
-  checks the directory really holds the digest it is filed under.
+  checks the directory really holds the digest it is filed under. It must stay
+  world-readable: the store is operator-written and daemon-read, and the
+  unprivileged `sandboxd` user restores from it.
 - **Content-addressed.** Publishing content that is already stored does not store
   it again.
 - **Atomic.** The name the daemon opens is a symlink. Publish and rollback

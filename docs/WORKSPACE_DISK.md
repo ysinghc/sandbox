@@ -53,7 +53,9 @@ Where the implementation deviates, and why:
 4. **The jail-view constant name changed.** `WORKSPACE_JAILVIEW` no longer exists;
    the jail path is `JAIL_WORKSPACE_PATH` in `include/jailer.h`, and
    `include/workspace.h` deals only in host paths. The jailer chowns the volume at
-   bind time, so `workspace_chown()` was deleted.
+   bind time, so `workspace_chown()` was deleted. Under #9 the helper performs
+   both directions: chown to the jailed uid at setup, chown back to the daemon
+   on `TEARDOWN` (which is what lets the next attach pass the ownership check).
 
 5. **Session identity and layout.** The registry keys a session by
    `sha256_hex(session_key)` (`session_key` is 1–127 printable bytes without `"`
@@ -72,9 +74,11 @@ Where the implementation deviates, and why:
 
 7. **A warm-pool VM cannot use a session volume, and does not (§3.2).** A pool
    member is restored at provisioning time, before any request exists, so it binds
-   a per-VM *scratch* clone of the base as its volume. A request that names a
-   session key bypasses the pool and restores on purpose
-   (`restore_vm_with_workspace()`); an exclusive-use lease
+   a per-VM *scratch* clone of the base as its volume. The scratch clone lives at
+   `<workspace_root>/.ephemeral-<vm>.ext4` (sibling of the session dirs, outside
+   the chroot); the dot prefix keeps it invisible to `workspace_reap()` and the
+   disk scans. A request that names a session key bypasses the pool and restores
+   on purpose (`restore_vm_with_workspace()`); an exclusive-use lease
    (`workspace_lease()`/`workspace_release()`) prevents two VMs writing one image.
 
 8. **ext4 is supported first-class, not just as a fallback (§6).** The FUSE-free
@@ -433,9 +437,12 @@ void workspace_expire(const char *session_id)
 |---|---|---|---|
 | `/var/lib/sandbox-engine/snapshots/` | rw, bind-mount capable | btrfs | Template store; base images live here |
 | `/var/lib/sandbox-engine/workspaces/` | rw, bind-mount capable | btrfs/xfs with reflink | Session workspace images; reflink = instant clone |
-| `/var/lib/sandbox-engine/jail/` | rw, bind-mount, dev-node capable | any | Jail roots; needs `MS_BIND`, `/dev/kvm`, `/dev/net/tun` |
+| `/var/lib/sandbox-engine/jail/` | rw, bind-mount, dev-node capable | any | Jail roots; needs `MS_BIND`, `/dev/kvm`, `/dev/net/tun` (performed by `sandbox-privileged`, not the daemon) |
 
 **Setup (operator runs once, as root):**
+
+Packaged installs get the directories from `tmpfiles.d/sandbox-engine.conf`;
+the btrfs steps below are still manual.
 
 ```bash
 # Option A: dedicated btrfs volume (recommended for production)
@@ -509,6 +516,6 @@ $ sandbox-cli session destroy ses_01jdf3xp
 |---|---|---|
 | Delta snapshot of workspace (dirty pages only) | M5 #15 | Combine with content-addressed store for deduplication |
 | Per-tenant quota enforcement (`df` or btrfs project quotas) | M4 #11 | Block writes when quota exceeded; surface via API |
-| Encrypted workspaces (dm-crypt per session) | M4+ | Key derived from session token; requires privilege-sep daemon (#9) |
+| Encrypted workspaces (dm-crypt per session) | M4+ | Key derived from session token; unblocked by #9 (privsep helper now owns devices/mounts) — needs a key-distribution design |
 | Workspace pre-warming (pre-clone N images into a pool) | M5 | Amortises sparse-copy cost on non-reflink hosts |
 

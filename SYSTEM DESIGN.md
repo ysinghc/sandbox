@@ -1461,12 +1461,15 @@ authoritative.
   pseudocode places cgroup after chroot, which cannot work (`/sys/fs/cgroup`
   unreachable post-chroot).
 - There is **no separate jailer binary** (§2.2's "spawns Jailer binary" is
-  conceptual). `spawn_jailed()` is an in-daemon `fork()`; the forked child does
-  the jail setup and then directly `execve`s `/firecracker`. Cgroup placement is
-  `write_cgroup_procs(cgroup_path, getpid())` into a caller-provided
-  `cgroup.procs`; since Phase 12 (§15.14) `vmm_restore` creates the per-VM leaf
-  and passes its path, so each Firecracker runs inside
-  `<root>/sandboxd/active/<vm-id>/`.
+  conceptual). `spawn_jailed()` is an in-process `fork()`; the forked child does
+  the jail setup and then directly `execve`s `/firecracker`. Since #9 (§15.17)
+  the fork happens in whichever process holds privilege: `sandbox-privileged`
+  when the daemon is unprivileged, the daemon itself on the legacy root path.
+  Cgroup placement is `write_cgroup_procs(cgroup_path, getpid())` into a
+  caller-provided `cgroup.procs`; since Phase 12 (§15.14) the spawner creates
+  the per-VM leaf and passes its path (`vmm_restore` on the root path, the
+  helper's SPAWN from the manifest next to the vmstate file otherwise), so each
+  Firecracker runs inside `<root>/sandboxd/active/<vm-id>/`.
 - `drop_capabilities()` retains `CAP_SETUID`/`CAP_SETGID` (required by the
   later setuid/setgid per LLD order) plus `CAP_SYS_PTRACE` (Firecracker UFFD
   creation gate where `unprivileged_userfaultfd=0`; `ptrace()` itself stays
@@ -1482,7 +1485,12 @@ authoritative.
   for `CAP_SETFCAP` and any dependence on a writable/capable jail fs.
 - The per-VM jail directory is created `0700` (owner = jailed uid) so the vsock
   injection UDS underneath it is reachable only by root and the VMM (§15.12).
+  Since #9 (§15.17), when a daemon gid is configured the dir is `0770`
+  jailed-uid:daemon-gid instead, so the unprivileged daemon keeps traverse
+  access; the world stays out either way.
 - `serial.log` is opened `0600` (was `0644`) — it can carry guest console output.
+  Since #9 it is `0640` jailed-uid:daemon-gid when a daemon gid is configured,
+  so the daemon can still read it.
 - Devices are fresh `mknod` + `chown` nodes (`/dev/kvm`, `/dev/net/tun`,
   optionally `/dev/userfaultfd`), NOT LLD bind-mounts (bind preserves
   root-only modes). `mount_jail_devices()` remains only for tests.
@@ -2000,15 +2008,15 @@ authoritative.
   after `setuid` (verified: `CapAmb`/effective/permitted = `0x80000` at uid
   65534).
 - **Secret hygiene.** Guest agent echoes env **key names only** to serial;
-  `/tmp/sandbox-env` is `0600`; `serial.log` is opened `0600`; the jail dir is
-  `0700`.
-- **Deferred (§15.12 non-goals).** Privilege *separation* (a privileged setup
-  helper + unprivileged event loop) is not done: the daemon must keep
-  `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_MKNOD`/`CAP_CHOWN`/`CAP_SETUID`/
-  `CAP_SETGID`/`CAP_SYS_CHROOT` to create taps, device nodes and jailers at
-  runtime, so a blanket capability drop would break per-VM provisioning.
-  `no_new_privs` + uid allowlist + name validation + no-shell nftables are the
-  Phase-10 subset. vsock payload HMAC and per-tenant quotas remain V2.
+  `/tmp/sandbox-env` is `0600`; `serial.log` is opened `0600` (`0640` with the
+  daemon group since #9); the jail dir is `0700` (`0770` with the daemon group
+  since #9).
+- **Privilege separation is done (#9, §15.17)** — this bullet used to defer it.
+  The daemon runs as the `sandboxd` user with no capabilities; taps, device
+  nodes, jailers, cgroups, and VMM reaping moved to `sandbox-privileged`,
+  which keeps the `CAP_NET_ADMIN`/`CAP_SYS_ADMIN`/`CAP_MKNOD`/`CAP_CHOWN`/
+  `CAP_SETUID`/`CAP_SETGID`/`CAP_SYS_CHROOT` set the daemon used to need.
+  vsock payload HMAC and per-tenant quotas remain V2.
 
 ### 15.13 Phase 11 — Config & Packaging Correctness (§10)
 - **Config parser recognises every packaged key.** Previously the daemon
@@ -2044,7 +2052,8 @@ authoritative.
 - **Unit resource limits.** `LimitNOFILE=65536`, `TasksMax=512`; capability
   set tightened to the runtime minimum (§15.12) including `CAP_SETPCAP`
   (needed by the jailer's bounding-set drop) and `CAP_SYS_PTRACE` (ambient UFFD
-  cap).
+  cap). Since #9 (§15.17) the daemon unit carries none of these
+  (`User=sandboxd`, no caps); the bounding set moved to the helper unit.
 
 ### 15.14 Phase 12 — Reliability (§10.8–§10.11)
 - **Async `Create` (§10.8).** The epoll loop no longer runs the pool restore
@@ -2207,3 +2216,52 @@ Two capture-time behaviours had to be handled explicitly.
   layout after restore are not reproducible in the strict sense.
 - *Host fingerprint.* A restored guest sees the host CPU model and kernel
   versions the template was captured on, not the machine it runs on.
+
+### 15.17 Privilege separation (#9; supersedes §2.2's rootful daemon)
+
+The daemon runs as the `sandboxd` user with no capabilities. Everything in §2.2
+that required privilege — tap + nftables, jail setup + `spawn_jailed`, cgroup
+leaves, VMM kill/reap, the crash sweep — is served by `sandbox-privileged`, a
+root helper speaking the strict `SOCK_SEQPACKET` protocol in
+`include/privsep.h` (`HELLO`, `NET_UP`/`NET_DOWN`, `SPAWN`, `POLL`,
+`TEARDOWN`, `SWEEP`). The helper binds its socket `0700` to the daemon uid and
+gates every connection by `SO_PEERCRED` to exactly that uid; it re-validates
+every request field (vm-id charset, path roots, daemon-ownership of the two
+writable binds, jailed ids ≠ daemon ids) and derives tap names, argv, the
+Firecracker path, and cgroup paths itself, so the wire cannot aim privileged
+operations at anything but the daemon's own files.
+
+Consequences recorded here because they change earlier sections' claims:
+
+- §2.2's privilege flow now starts at the helper: the daemon's
+  `restore_vm_with_workspace`/`vmm_restore`/`vmm_destroy` call
+  `src/privsep_client.c` instead of syscalls when a helper fd is configured
+  (`privileged_socket` key / `SANDBOX_PRIVILEGED_SOCKET` / `--privileged-socket`;
+  an unprivileged daemon defaults to `/run/sandbox-privileged/helper.sock`).
+  Jail teardown and the crash sweep moved from `src/vmm_manager.c` to
+  `src/jailer.c` (`jail_detach`/`jail_cleanup`/`jail_sweep`); the UFFD handler
+  socket is bound after the spawn (faults start at `/snapshot/load`, so the
+  invariant holds); ephemeral workspace clones moved from
+  `<jail>.workspace.ext4` to `<workspace_root>/.ephemeral-<vm>.ext4`.
+- Jails are `0770` jailed-uid:daemon-gid and serial logs `0640` when a daemon
+  gid is configured (§15.3, §15.12); `TEARDOWN` chowns writable binds back to
+  the daemon so the next attach passes the ownership check.
+- The helper is the VMM's parent, so only it reaps (opportunistically on
+  `SIGCHLD` plus `POLL`/`TEARDOWN`); daemon crash detection via pidfd+epoll
+  still fires. A dead helper connection fails the daemon fast (exit 75, as
+  `sandbox-api` does when the daemon is lost); the units share a lifecycle
+  (mutual `BindsTo=`), because a daemon restart reuses `vm-*` ids and the
+  helper must forget its child table at the same moment.
+- Deployment (§10): the daemon unit runs `User=sandboxd` with no capabilities;
+  the helper unit keeps the bounding set. Identity, state ownership, and
+  `vm.unprivileged_userfaultfd=1` (required: the daemon serves faults
+  in-process, unprivileged) ship as
+  `packaging/{sysusers.d,tmpfiles.d,sysctl.d}/sandbox-engine.conf`. The
+  snapshot store is operator-written and daemon-read (world-readable; template
+  files frozen `0444`).
+- Deliberately unchanged: template capture stays root-only via `sandbox-cli`
+  (`vmm_cold_boot` is in-process only); a root daemon without
+  `privileged_socket` keeps the legacy in-process path; guest-restart orphaning
+  on daemon restart is identical to before. `pivot_root` for the jail remains
+  future work, as does closing the TOCTOU note in `THREAT_MODEL.md` §5 if the
+  daemon ever gains write access to the snapshot roots.
