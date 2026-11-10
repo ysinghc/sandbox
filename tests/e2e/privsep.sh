@@ -17,7 +17,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "${SCRIPT_DIR}/../..}" && pwd)"
+REPO_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BUILD_DIR="${SANDBOX_BUILD_DIR:-${REPO_DIR}/build}"
 SANDBOXD="${BUILD_DIR}/sandboxd"
 HELPER="${BUILD_DIR}/sandbox-privileged"
@@ -32,7 +32,7 @@ KEEP=0
 for f in "$SANDBOXD" "$HELPER" "$CLI" "$MAKE_TEMPLATE" "$FC_BIN"; do
     [ -x "$f" ] || { echo "missing $f" >&2; exit 1; }
 done
-command -v curl >/dev/null && command -v setpriv >/dev/null || { echo "curl and setpriv are required" >&2; exit 1; }
+command -v curl >/dev/null && command -v setpriv >/dev/null && command -v python3 >/dev/null || { echo "curl, setpriv and python3 are required" >&2; exit 1; }
 [ -c /dev/kvm ] || { echo "/dev/kvm not present" >&2; exit 1; }
 
 # The jail mknods /dev/kvm: it needs a filesystem that permits device nodes.
@@ -66,7 +66,7 @@ free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0)
 
 # ── users and kernel knobs ──────────────────────────────────────────────────
 if ! id "$DAEMON_USER" >/dev/null 2>&1; then
-    useradd -r -M -s /usr/sbin/nologin "$DAEMON_USER" || { echo "cannot create $DAEMON_USER" >&2; exit 1; }
+    useradd -r -M -U -s /usr/sbin/nologin "$DAEMON_USER" || { echo "cannot create $DAEMON_USER" >&2; exit 1; }
 fi
 [ "$(id -u "$DAEMON_USER")" -ne 0 ] || { echo "$DAEMON_USER is uid 0?!" >&2; exit 1; }
 # The daemon serves page faults in-process; unprivileged userfaultfd needs this.
@@ -176,8 +176,11 @@ grep -q 'NET_UP' "$WORK/helper.log" && grep -q 'SPAWN' "$WORK/helper.log" \
     && ok "the helper served NET_UP and SPAWN" || bad "the helper served NET_UP and SPAWN"
 
 # ── provision, exec, destroy through the helper ─────────────────────────────
-out="$("$CLI" run --template "$TEMPLATE" --socket "$SOCK" --exec 'echo helper-e2e-ok' 2>"$WORK/cli.log")"
-[ "$out" = "helper-e2e-ok" ] && ok "exec reaches the guest" || { bad "exec reaches the guest"; tail -n 20 "$WORK/cli.log" >&2; }
+# (CLI stdout is {"event":"created"} + the command's bytes + {"event":"exec"}:
+# match the bytes and the zero exit, not the whole stream.)
+out="$("$CLI" run --template "$TEMPLATE" --socket "$SOCK" --exec 'echo helper-e2e-ok' 2>"$WORK/cli.log")"; cli_rc=$?
+echo "$out" | grep -q 'helper-e2e-ok' && echo "$out" | grep -q '"exit_code":0' && [ "$cli_rc" = 0 ] \
+    && ok "exec reaches the guest" || { bad "exec reaches the guest"; echo "$out" | tail -n 5 >&2; tail -n 20 "$WORK/cli.log" >&2; }
 grep -q 'TEARDOWN' "$WORK/helper.log" && grep -q 'NET_DOWN' "$WORK/helper.log" \
     && ok "the helper served TEARDOWN and NET_DOWN" || bad "the helper served TEARDOWN and NET_DOWN"
 
@@ -186,13 +189,25 @@ grep -q 'TEARDOWN' "$WORK/helper.log" && grep -q 'NET_DOWN' "$WORK/helper.log" \
     --exec 'echo persisted-9 > /workspace/marker' >"$WORK/sess1.log" 2>&1 \
     && ok "session run 1 writes /workspace/marker" || { bad "session run 1 writes /workspace/marker"; tail -n 20 "$WORK/sess1.log" >&2; }
 out2="$("$CLI" run --template "$TEMPLATE" --socket "$SOCK" --session-key privsep9 \
-    --exec 'cat /workspace/marker' 2>"$WORK/sess2.log")"
-[ "$out2" = "persisted-9" ] && ok "session run 2 reads it back" || { bad "session run 2 reads it back"; tail -n 20 "$WORK/sess2.log" >&2; }
-vol="$(find "$WSROOT" -name '*.ext4' | head -n 1)"
+    --exec 'cat /workspace/marker' 2>"$WORK/sess2.log")"; cli2_rc=$?
+echo "$out2" | grep -q 'persisted-9' && echo "$out2" | grep -q '"exit_code":0' && [ "$cli2_rc" = 0 ] \
+    && ok "session run 2 reads it back" || { bad "session run 2 reads it back"; echo "$out2" | tail -n 5 >&2; tail -n 20 "$WORK/sess2.log" >&2; }
+vol="$(find "$WSROOT" -name 'workspace.ext4' | head -n 1)"
 [ -n "$vol" ] && [ "$(stat -c '%U' "$vol")" = "$DAEMON_USER" ] \
     && ok "the session volume is $DAEMON_USER-owned after destroy" || bad "the session volume is $DAEMON_USER-owned after destroy"
 
-# ── nothing privileged leaks ────────────────────────────────────────────────
+# ── shutdown, then nothing privileged may leak ──────────────────────────────
+# The daemon traps SIGTERM and destroys its pool (each destroy a TEARDOWN +
+# NET_DOWN through the helper), so stop it first and the helper second; only
+# then must taps and VMMs be gone. (The EXIT trap stays armed for leftovers.)
+kill "$DAEMON_PID" 2>/dev/null
+for i in $(seq 1 100); do kill -0 "$DAEMON_PID" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$DAEMON_PID" 2>/dev/null || true
+kill "$HELPER_PID" 2>/dev/null
+for i in $(seq 1 100); do kill -0 "$HELPER_PID" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$HELPER_PID" 2>/dev/null || true
+sleep 0.5
+DAEMON_PID=""; HELPER_PID=""
 left_taps="$(ip -o link show 2>/dev/null | grep -c 'tap-vm-' || true)"
 [ "$left_taps" = "0" ] && ok "no taps leak" || bad "no taps leak ($left_taps left)"
 left_fc="$(pgrep -x -c firecracker || true)"
